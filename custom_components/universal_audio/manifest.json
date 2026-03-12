@@ -1,0 +1,15 @@
+{
+  "domain": "universal_audio",
+  "name": "Universal Audio Apollo",
+  "codeowners": [
+    "@noiseheroes-lab"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/noiseheroes-lab/ha-custom-components/blob/main/custom_components/universal_audio/README.md",
+  "iot_class": "local_push",
+  "requirements": [],
+  "version": "1.0.0",
+  "issue_tracker": "https://github.com/noiseheroes-lab/ha-custom-components/issues",
+  "homeassistant": "2024.1.0"
+}

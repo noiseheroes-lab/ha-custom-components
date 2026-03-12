@@ -1,0 +1,17 @@
+{
+  "domain": "dreame_h15pro",
+  "name": "Dreame H15 Pro",
+  "codeowners": [
+    "@noiseheroes-lab"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/noiseheroes-lab/ha-custom-components/blob/main/custom_components/dreame_h15pro/README.md",
+  "iot_class": "cloud_polling",
+  "requirements": [
+    "pyjwt>=2.0.0"
+  ],
+  "version": "2.0.0",
+  "issue_tracker": "https://github.com/noiseheroes-lab/ha-custom-components/issues",
+  "homeassistant": "2024.1.0"
+}

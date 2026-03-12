@@ -1,0 +1,14 @@
+{
+  "domain": "octopus_energy_italy",
+  "name": "Octopus Energy Italy",
+  "version": "1.0.0",
+  "codeowners": ["@noiseheroes-lab"],
+  "config_flow": true,
+  "documentation": "https://github.com/noiseheroes-lab/ha-custom-components/blob/main/custom_components/octopus_energy_italy/README.md",
+  "homeassistant": "2024.1.0",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/noiseheroes-lab/ha-custom-components/issues",
+  "requirements": ["requests>=2.31.0"],
+  "dependencies": [],
+  "after_dependencies": ["energy"]
+}

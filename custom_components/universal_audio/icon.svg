@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <!-- Background -->
+  <rect width="256" height="256" rx="48" fill="#1A202C"/>
+
+  <!-- Apollo interface body -->
+  <rect x="48" y="80" width="160" height="96" rx="12" fill="#2D3748"/>
+  <rect x="56" y="88" width="144" height="80" rx="8" fill="#1A202C"/>
+
+  <!-- Main monitor knob -->
+  <circle cx="128" cy="128" r="28" fill="#4A5568"/>
+  <circle cx="128" cy="128" r="22" fill="#2D3748"/>
+  <circle cx="128" cy="128" r="14" fill="#E2E8F0"/>
+  <!-- Knob indicator -->
+  <line x1="128" y1="114" x2="128" y2="122" stroke="#1A202C" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Small knobs row -->
+  <circle cx="82" cy="128" r="12" fill="#4A5568"/>
+  <circle cx="82" cy="128" r="8" fill="#2D3748"/>
+  <circle cx="82" cy="128" r="4" fill="#CBD5E0"/>
+
+  <circle cx="174" cy="128" r="12" fill="#4A5568"/>
+  <circle cx="174" cy="128" r="8" fill="#2D3748"/>
+  <circle cx="174" cy="128" r="4" fill="#CBD5E0"/>
+
+  <!-- VU meters -->
+  <rect x="68" y="96" width="6" height="20" rx="3" fill="#48BB78"/>
+  <rect x="78" y="100" width="6" height="16" rx="3" fill="#48BB78"/>
+  <rect x="162" y="96" width="6" height="20" rx="3" fill="#48BB78"/>
+  <rect x="172" y="100" width="6" height="16" rx="3" fill="#48BB78"/>
+
+  <!-- UA logo area -->
+  <rect x="106" y="158" width="44" height="12" rx="4" fill="#4A5568"/>
+  <text x="128" y="168" font-family="sans-serif" font-size="9" font-weight="bold" fill="#E2E8F0" text-anchor="middle" letter-spacing="2">UA</text>
+
+  <!-- Thunderbolt ports -->
+  <rect x="60" y="162" width="16" height="8" rx="2" fill="#4A5568"/>
+  <rect x="180" y="162" width="16" height="8" rx="2" fill="#4A5568"/>
+
+  <!-- Audio waveform decoration -->
+  <path d="M48 208 Q64 192 80 208 Q96 224 112 208 Q128 192 144 208 Q160 224 176 208 Q192 192 208 208" stroke="#4299E1" stroke-width="4" stroke-linecap="round" fill="none" opacity="0.6"/>
+</svg>

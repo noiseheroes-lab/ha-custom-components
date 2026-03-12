@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Octopus Energy Italy",
+        "description": "Enter the credentials for your [Octopus Energy Italy account]({portal_url}).",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        },
+        "data_description": {
+          "email": "The email address used to log in to octopusenergy.it",
+          "password": "Your Octopus Energy Italy password"
+        }
+      },
+      "account": {
+        "title": "Select account",
+        "description": "Multiple accounts found. Please select which one to monitor.",
+        "data": {
+          "account_number": "Account"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password. Please check your credentials.",
+      "cannot_connect": "Could not connect to the Octopus Energy API. Check your internet connection.",
+      "no_accounts": "No active accounts found for this user.",
+      "unknown": "Unexpected error. Please try again."
+    },
+    "abort": {
+      "already_configured": "This account is already configured."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "electricity_yesterday_kwh": { "name": "Electricity Yesterday" },
+      "electricity_monthly_kwh": { "name": "Electricity This Month" },
+      "electricity_yearly_kwh": { "name": "Electricity This Year" },
+      "electricity_rate": { "name": "Electricity Rate" },
+      "electricity_standing_charge": { "name": "Electricity Standing Charge" },
+      "gas_monthly_smc": { "name": "Gas This Month" },
+      "gas_yearly_smc": { "name": "Gas This Year" },
+      "gas_rate": { "name": "Gas Rate" },
+      "gas_standing_charge": { "name": "Gas Standing Charge" },
+      "account_balance": { "name": "Account Balance" }
+    }
+  }
+}

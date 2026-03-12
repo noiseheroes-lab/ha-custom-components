@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <!-- Background -->
+  <rect width="256" height="256" rx="48" fill="#2B6CB0"/>
+
+  <!-- Robot vacuum body (top view) -->
+  <circle cx="128" cy="120" r="72" fill="white"/>
+
+  <!-- Bumper strip -->
+  <path d="M68 90 A72 72 0 0 1 188 90" stroke="#2B6CB0" stroke-width="10" fill="none" stroke-linecap="round"/>
+
+  <!-- Brush bar -->
+  <rect x="86" y="148" width="84" height="12" rx="6" fill="#2B6CB0"/>
+
+  <!-- Sensor lens -->
+  <circle cx="128" cy="96" r="14" fill="#2B6CB0"/>
+  <circle cx="128" cy="96" r="8" fill="white"/>
+  <circle cx="128" cy="96" r="4" fill="#90CDF4"/>
+
+  <!-- Side brush indicators -->
+  <circle cx="86" cy="148" r="8" fill="#2B6CB0"/>
+  <circle cx="170" cy="148" r="8" fill="#2B6CB0"/>
+
+  <!-- Battery / status indicator -->
+  <rect x="112" y="118" width="32" height="14" rx="4" fill="#2B6CB0" opacity="0.3"/>
+  <rect x="114" y="120" width="20" height="10" rx="3" fill="#48BB78"/>
+
+  <!-- Water tank line -->
+  <rect x="100" y="136" width="56" height="6" rx="3" fill="#90CDF4" opacity="0.6"/>
+
+  <!-- Wheel arcs -->
+  <path d="M60 114 A10 10 0 0 0 60 134" stroke="#2B6CB0" stroke-width="8" stroke-linecap="round" fill="none"/>
+  <path d="M196 114 A10 10 0 0 1 196 134" stroke="#2B6CB0" stroke-width="8" stroke-linecap="round" fill="none"/>
+</svg>

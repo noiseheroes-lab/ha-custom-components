@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Dreame H15 Pro",
+        "description": "Enter your Dreame OAuth refresh token. You can obtain this from the DreameHome app using the extraction tool.",
+        "data": {
+          "refresh_token": "Refresh Token"
+        }
+      },
+      "select_device": {
+        "title": "Select Device",
+        "description": "Choose the device to add.",
+        "data": {
+          "device_did": "Device"
+        }
+      }
+    },
+    "error": {
+      "auth_failed": "Authentication failed. Check your refresh token.",
+      "no_devices": "No devices found on your account.",
+      "connection_error": "Could not connect to Dreame Cloud."
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  }
+}

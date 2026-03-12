@@ -1,0 +1,43 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Vimar Intercom",
+        "description": "Add the Vimar Elvox video intercom. SIP credentials are built-in."
+      }
+    }
+  },
+  "entity": {
+    "camera": {
+      "videocitofono": {
+        "name": "Video Intercom"
+      }
+    },
+    "lock": {
+      "serratura": {
+        "name": "Door Lock"
+      }
+    },
+    "button": {
+      "chiama": {
+        "name": "Call"
+      },
+      "riaggancia": {
+        "name": "Hang Up"
+      }
+    },
+    "event": {
+      "campanello": {
+        "name": "Doorbell"
+      }
+    },
+    "binary_sensor": {
+      "registrazione_sip": {
+        "name": "SIP Registration"
+      },
+      "in_chiamata": {
+        "name": "In Call"
+      }
+    }
+  }
+}

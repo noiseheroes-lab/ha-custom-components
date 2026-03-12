@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Universal Audio Apollo",
+        "description": "Enter the IP of the Mac running UA Console.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "device_index": "Device index",
+          "output_index": "Monitor output index"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to UA Console — is it running?"
+    }
+  }
+}

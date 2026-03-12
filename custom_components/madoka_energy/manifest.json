@@ -1,0 +1,22 @@
+{
+  "domain": "madoka_energy",
+  "name": "Daikin Madoka Energy",
+  "codeowners": [
+    "@noiseheroes-lab"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/noiseheroes-lab/ha-custom-components/blob/main/custom_components/madoka_energy/README.md",
+  "iot_class": "local_polling",
+  "requirements": [
+    "bleak>=0.21.0"
+  ],
+  "version": "0.1.0",
+  "bluetooth": [
+    {
+      "service_uuid": "2141e110-213a-11e6-b67b-9e71128cae77"
+    }
+  ],
+  "issue_tracker": "https://github.com/noiseheroes-lab/ha-custom-components/issues",
+  "homeassistant": "2024.1.0"
+}

@@ -1,0 +1,18 @@
+{
+  "domain": "vimar_intercom",
+  "name": "Vimar Intercom",
+  "version": "1.3.0",
+  "config_flow": true,
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "requirements": [],
+  "dependencies": [
+    "ffmpeg"
+  ],
+  "codeowners": [
+    "@noiseheroes-lab"
+  ],
+  "documentation": "https://github.com/noiseheroes-lab/ha-custom-components/blob/main/custom_components/vimar_intercom/README.md",
+  "issue_tracker": "https://github.com/noiseheroes-lab/ha-custom-components/issues",
+  "homeassistant": "2024.1.0"
+}

@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Octopus Energy Italy",
+        "description": "Inserisci le credenziali del tuo [account Octopus Energy Italy]({portal_url}).",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        },
+        "data_description": {
+          "email": "L'indirizzo email usato per accedere a octopusenergy.it",
+          "password": "La tua password Octopus Energy Italy"
+        }
+      },
+      "account": {
+        "title": "Seleziona account",
+        "description": "Sono stati trovati più account. Seleziona quello da monitorare.",
+        "data": {
+          "account_number": "Account"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Email o password non valide. Controlla le credenziali.",
+      "cannot_connect": "Impossibile connettersi all'API di Octopus Energy. Verifica la connessione internet.",
+      "no_accounts": "Nessun account attivo trovato per questo utente.",
+      "unknown": "Errore imprevisto. Riprova."
+    },
+    "abort": {
+      "already_configured": "Questo account è già configurato."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "electricity_yesterday_kwh": { "name": "Luce Ieri" },
+      "electricity_monthly_kwh": { "name": "Luce Questo Mese" },
+      "electricity_yearly_kwh": { "name": "Luce Quest'Anno" },
+      "electricity_rate": { "name": "Tariffa Luce" },
+      "electricity_standing_charge": { "name": "Quota Fissa Luce" },
+      "gas_monthly_smc": { "name": "Gas Questo Mese" },
+      "gas_yearly_smc": { "name": "Gas Quest'Anno" },
+      "gas_rate": { "name": "Tariffa Gas" },
+      "gas_standing_charge": { "name": "Quota Fissa Gas" },
+      "account_balance": { "name": "Saldo Account" }
+    }
+  }
+}

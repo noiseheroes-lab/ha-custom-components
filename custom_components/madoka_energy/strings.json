@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Daikin Madoka Energy",
+        "description": "Select your Madoka BRC1H thermostat or enter its MAC address.",
+        "data": {
+          "device_address": "Device address"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Confirm Madoka Device",
+        "description": "Confirm setup for {name}"
+      }
+    },
+    "error": {
+      "no_devices_found": "No Madoka devices found nearby. Enter MAC address manually."
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  }
+}

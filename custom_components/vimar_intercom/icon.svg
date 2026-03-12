@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <!-- Background -->
+  <rect width="256" height="256" rx="48" fill="#2D3748"/>
+
+  <!-- Intercom panel body -->
+  <rect x="64" y="52" width="128" height="152" rx="16" fill="white"/>
+  <rect x="72" y="60" width="112" height="136" rx="10" fill="#4A5568"/>
+
+  <!-- Camera lens -->
+  <circle cx="128" cy="96" r="26" fill="#2D3748"/>
+  <circle cx="128" cy="96" r="18" fill="#1A202C"/>
+  <circle cx="128" cy="96" r="10" fill="#4299E1" opacity="0.6"/>
+  <circle cx="123" cy="91" r="4" fill="white" opacity="0.5"/>
+
+  <!-- Camera housing ring -->
+  <circle cx="128" cy="96" r="26" stroke="#718096" stroke-width="3" fill="none"/>
+
+  <!-- Speaker grille -->
+  <rect x="88" y="134" width="80" height="4" rx="2" fill="#718096"/>
+  <rect x="88" y="143" width="80" height="4" rx="2" fill="#718096"/>
+  <rect x="88" y="152" width="80" height="4" rx="2" fill="#718096"/>
+
+  <!-- Doorbell button -->
+  <circle cx="128" cy="178" r="12" fill="#F6E05E"/>
+  <circle cx="128" cy="178" r="8" fill="#ECC94B"/>
+
+  <!-- Signal waves (SIP/connectivity) -->
+  <path d="M52 88 Q44 96 52 104" stroke="#4299E1" stroke-width="5" stroke-linecap="round" fill="none"/>
+  <path d="M44 80 Q30 96 44 112" stroke="#4299E1" stroke-width="5" stroke-linecap="round" fill="none" opacity="0.6"/>
+</svg>

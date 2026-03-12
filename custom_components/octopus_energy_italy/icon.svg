@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <!-- Background -->
+  <rect width="256" height="256" rx="48" fill="#F35C2B"/>
+
+  <!-- Octopus head -->
+  <ellipse cx="128" cy="108" rx="52" ry="46" fill="white"/>
+
+  <!-- Eyes -->
+  <circle cx="112" cy="100" r="10" fill="#F35C2B"/>
+  <circle cx="144" cy="100" r="10" fill="#F35C2B"/>
+  <circle cx="114" cy="98" r="4" fill="white"/>
+  <circle cx="146" cy="98" r="4" fill="white"/>
+
+  <!-- Tentacles (8) -->
+  <path d="M90 140 Q72 158 68 178 Q64 196 76 196 Q88 196 90 178 Q92 162 100 152" stroke="white" stroke-width="10" stroke-linecap="round" fill="none"/>
+  <path d="M106 150 Q100 174 104 194 Q108 210 120 208 Q130 206 126 188 Q122 172 118 156" stroke="white" stroke-width="10" stroke-linecap="round" fill="none"/>
+  <path d="M128 154 Q128 178 134 196 Q140 212 152 208 Q162 204 156 186 Q150 170 144 156" stroke="white" stroke-width="10" stroke-linecap="round" fill="none"/>
+  <path d="M148 148 Q164 164 170 184 Q176 200 164 202 Q152 204 148 186 Q144 170 142 154" stroke="white" stroke-width="10" stroke-linecap="round" fill="none"/>
+  <path d="M166 136 Q186 148 192 168 Q196 184 184 186 Q172 186 168 170 Q164 156 158 144" stroke="white" stroke-width="10" stroke-linecap="round" fill="none"/>
+  <path d="M84 132 Q64 140 58 160 Q54 176 66 178 Q78 178 82 164 Q86 150 90 140" stroke="white" stroke-width="10" stroke-linecap="round" fill="none"/>
+
+  <!-- Lightning bolt (energy) -->
+  <path d="M134 68 L122 92 L132 92 L118 120 L148 88 L136 88 Z" fill="#F35C2B"/>
+</svg>

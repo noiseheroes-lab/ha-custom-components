@@ -1,0 +1,23 @@
+self_clean:
+  name: Autopulizia
+  description: Start self-cleaning cycle
+  target:
+    entity:
+      integration: dreame_h15pro
+      domain: vacuum
+
+start_drying:
+  name: Asciugatura
+  description: Start drying cycle
+  target:
+    entity:
+      integration: dreame_h15pro
+      domain: vacuum
+
+start_vacuum:
+  name: Aspirazione
+  description: Start vacuum-only mode
+  target:
+    entity:
+      integration: dreame_h15pro
+      domain: vacuum

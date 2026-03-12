@@ -1,0 +1,43 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Vimar Intercom",
+        "description": "Aggiungi il videocitofono Vimar Elvox. Le credenziali SIP sono integrate."
+      }
+    }
+  },
+  "entity": {
+    "camera": {
+      "videocitofono": {
+        "name": "Videocitofono"
+      }
+    },
+    "lock": {
+      "serratura": {
+        "name": "Serratura"
+      }
+    },
+    "button": {
+      "chiama": {
+        "name": "Chiama"
+      },
+      "riaggancia": {
+        "name": "Riaggancia"
+      }
+    },
+    "event": {
+      "campanello": {
+        "name": "Campanello"
+      }
+    },
+    "binary_sensor": {
+      "registrazione_sip": {
+        "name": "Registrazione SIP"
+      },
+      "in_chiamata": {
+        "name": "In Chiamata"
+      }
+    }
+  }
+}
