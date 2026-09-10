@@ -1634,7 +1634,9 @@ def get_local_ip():
 
 - [ ] **Step 4: Do the same for `media_handler.py`**
 
-Replace the `from .const import (...)` port imports with the same `CFG` / `configure` pattern, and substitute `RTP_AUDIO_PORT` → `CFG.rtp_audio_port`, `RTP_VIDEO_PORT` → `CFG.rtp_video_port`, `FFMPEG_AV_VIDEO_PORT` → `CFG.av_video_port`, `FFMPEG_AV_AUDIO_PORT` → `CFG.av_audio_port`.
+Replace the `from .const import (...)` port imports with the same `CFG` / `configure` pattern, and substitute `RTP_AUDIO_PORT` → `CFG.rtp_audio_port`, `RTP_VIDEO_PORT` → `CFG.rtp_video_port`, `FFMPEG_AV_AUDIO_PORT` → `CFG.av_audio_port`.
+
+**Also delete `av_video_port`** from `RuntimeConfig` in `runtime.py`, along with the `AV_VIDEO_PORT_OFFSET` constant and the `av_video_port=` argument in `build_runtime_config`. Task 3 added it to mirror the old `FFMPEG_AV_VIDEO_PORT`, but video no longer travels over UDP to ffmpeg: Task 12 feeds it through ffmpeg's stdin, and the SDP written above declares audio only. Leaving it would be a dead field whose value (base + 12000) collides with the old MJPEG port rather than the AV video port, which is exactly the kind of thing that misleads the next reader. `FFMPEG_AV_VIDEO_PORT` disappears from `const.py` in step 1 either way.
 
 Also move the AV SDP file out of `/tmp` and into the Home Assistant config directory is **not** required — but the fixed path `/tmp/intercom_av.sdp` collides between installations on one host. Change `_create_av_sdp` to use `tempfile`:
 
