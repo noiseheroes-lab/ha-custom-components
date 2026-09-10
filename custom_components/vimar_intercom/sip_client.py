@@ -15,6 +15,7 @@ from . import media_handler as media
 from .runtime import RuntimeConfig
 from .sip_parser import (
     ParsedMessage,
+    call_id_key,
     granted_expiry,
     header_params,
     parse_message,
@@ -81,15 +82,16 @@ incoming_requests: asyncio.Queue = None
 def _open_transaction(branch: str, seq: int, method: str, call_id: str) -> str:
     """Register a transaction and return its key."""
     key = transaction_key(branch, seq, method)
-    pending_transactions[key] = asyncio.Queue()
-    pending_transactions.setdefault(f"cid:{call_id}", pending_transactions[key])
+    queue: asyncio.Queue = asyncio.Queue()
+    pending_transactions[key] = queue
+    pending_transactions[call_id_key(call_id, seq, method)] = queue
     return key
 
 
-def _close_transaction(key: str, call_id: str) -> None:
+def _close_transaction(key: str, call_id: str, seq: int, method: str) -> None:
     """Forget a transaction and its Call-ID fallback."""
     pending_transactions.pop(key, None)
-    pending_transactions.pop(f"cid:{call_id}", None)
+    pending_transactions.pop(call_id_key(call_id, seq, method), None)
 
 
 def set_state_callback(cb):
@@ -331,7 +333,8 @@ async def reader_task():
                 await incoming_requests.put(raw)
 
 
-async def _wait_final(key: str, call_id: str, timeout: float = 15) -> list[str]:
+async def _wait_final(key: str, call_id: str, seq: int, method: str,
+                       timeout: float = 15) -> list[str]:
     """Collect responses for one transaction until a final one arrives."""
     queue = pending_transactions.get(key)
     if queue is None:
@@ -352,7 +355,7 @@ async def _wait_final(key: str, call_id: str, timeout: float = 15) -> list[str]:
             if msg.code is not None and msg.code >= 200:
                 break
     finally:
-        _close_transaction(key, call_id)
+        _close_transaction(key, call_id, seq, method)
     return results
 
 
@@ -476,7 +479,7 @@ async def do_register():
     seq = _next_cseq()
     key = _open_transaction(branch, seq, "REGISTER", cid)
     await send(_msg(branch, seq))
-    responses = await _wait_final(key, cid)
+    responses = await _wait_final(key, cid, seq, "REGISTER")
 
     for raw in responses:
         msg = parse_message(raw)
@@ -489,7 +492,7 @@ async def do_register():
             seq2 = _next_cseq()
             key2 = _open_transaction(branch2, seq2, "REGISTER", cid)
             await send(_msg(branch2, seq2, auth=auth))
-            for raw2 in await _wait_final(key2, cid):
+            for raw2 in await _wait_final(key2, cid, seq2, "REGISTER"):
                 msg2 = parse_message(raw2)
                 if msg2.code == 200:
                     expiry = granted_expiry(msg2, CFG.sip_user, 3600)
@@ -539,7 +542,7 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
     seq = _next_cseq()
     key = _open_transaction(branch, seq, "MESSAGE", cid)
     await send(_msg(branch, seq))
-    for raw in await _wait_final(key, cid, timeout=15):
+    for raw in await _wait_final(key, cid, seq, "MESSAGE", timeout=15):
         msg = parse_message(raw)
         _LOGGER.info("do_system_message: response %s for %s", msg.code, target_uri)
         if msg.code and msg.code < 200:
@@ -553,7 +556,7 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
             seq2 = _next_cseq()
             key2 = _open_transaction(branch2, seq2, "MESSAGE", cid)
             await send(_msg(branch2, seq2, auth=auth))
-            for raw2 in await _wait_final(key2, cid, timeout=15):
+            for raw2 in await _wait_final(key2, cid, seq2, "MESSAGE", timeout=15):
                 msg2 = parse_message(raw2)
                 _LOGGER.info("do_system_message: auth response %s for %s", msg2.code, target_uri)
                 if msg2.code and 200 <= msg2.code < 300:
@@ -638,73 +641,78 @@ async def do_call(target=None):
     queue = pending_transactions[key]
     deadline = time.monotonic() + 45
 
-    while time.monotonic() < deadline:
-        try:
-            raw = await asyncio.wait_for(queue.get(), timeout=3)
-        except asyncio.TimeoutError:
-            continue
+    # A raise anywhere below (parse_sdp, media.setup_media,
+    # send_keyframe_request, _make_auth) must not strand the transaction
+    # that is open at that moment — close whichever one is current on
+    # every exit. The authenticated-retry branch closes the first
+    # transaction itself before opening the second, so each transaction
+    # this call opens is still closed exactly once.
+    try:
+        while time.monotonic() < deadline:
+            try:
+                raw = await asyncio.wait_for(queue.get(), timeout=3)
+            except asyncio.TimeoutError:
+                continue
 
-        msg = parse_message(raw)
-        ttag = tag_of(msg.headers.get("to", ""))
-        _LOGGER.debug("do_call: response %s (body=%dB)", msg.code, len(msg.body) if msg.body else 0)
+            msg = parse_message(raw)
+            ttag = tag_of(msg.headers.get("to", ""))
+            _LOGGER.debug("do_call: response %s (body=%dB)", msg.code, len(msg.body) if msg.body else 0)
 
-        if msg.code in (100, 180, 183):
-            if msg.code == 183 and msg.body:
-                call_state["remote_sdp"] = parse_sdp(msg.body)
-            continue
+            if msg.code in (100, 180, 183):
+                if msg.code == 183 and msg.body:
+                    call_state["remote_sdp"] = parse_sdp(msg.body)
+                continue
 
-        if msg.code in (401, 407):
-            await send(_ack(ttag, cur_seq))
-            ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
-            if not ch:
-                _close_transaction(key, cid)
+            if msg.code in (401, 407):
+                await send(_ack(ttag, cur_seq))
+                ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
+                if not ch:
+                    _set_calling(False)
+                    return False, f"Auth vuoto ({msg.code})"
+                auth = _make_auth("INVITE", target_uri, ch)
+                _close_transaction(key, cid, cur_seq, "INVITE")
+                branch = _gen()
+                cur_seq = _next_cseq()
+                key = _open_transaction(branch, cur_seq, "INVITE", cid)
+                queue = pending_transactions[key]
+                await send(_inv(branch, cur_seq, auth=auth))
+                continue
+
+            if 200 <= msg.code < 300:
+                call_state["to_tag"] = ttag
+                raw_contact = msg.headers.get("contact", "")
+                if "<" in raw_contact and ">" in raw_contact:
+                    call_state["remote_contact"] = raw_contact[raw_contact.index("<")+1:raw_contact.index(">")]
+                else:
+                    call_state["remote_contact"] = raw_contact
+                await send(_ack(ttag, cur_seq))
+
+                if msg.body:
+                    remote = parse_sdp(msg.body)
+                    call_state["remote_sdp"] = remote
+                    _LOGGER.info("SDP: audio=%s video=%s", remote.get('audio', {}), remote.get('video', {}))
+                    await media.setup_media(remote, _local_crypto_key, _local_video_crypto_key)
+
+                _set_in_call(True)
                 _set_calling(False)
-                return False, f"Auth vuoto ({msg.code})"
-            auth = _make_auth("INVITE", target_uri, ch)
-            _close_transaction(key, cid)
-            branch = _gen()
-            cur_seq = _next_cseq()
-            key = _open_transaction(branch, cur_seq, "INVITE", cid)
-            queue = pending_transactions[key]
-            await send(_inv(branch, cur_seq, auth=auth))
-            continue
+                await broadcast("call_started", "Connesso!")
+                # Request keyframe immediately — no delay
+                await send_keyframe_request()
+                return True, "Connesso!"
 
-        if 200 <= msg.code < 300:
-            call_state["to_tag"] = ttag
-            raw_contact = msg.headers.get("contact", "")
-            if "<" in raw_contact and ">" in raw_contact:
-                call_state["remote_contact"] = raw_contact[raw_contact.index("<")+1:raw_contact.index(">")]
-            else:
-                call_state["remote_contact"] = raw_contact
-            await send(_ack(ttag, cur_seq))
+            if msg.code >= 300:
+                _LOGGER.error("INVITE rejected: %d", msg.code)
+                await send(_ack(ttag, cur_seq))
+                _set_calling(False)
+                reason = (msg.start_line.split(" ", 2)[2]
+                          if msg.start_line.count(" ") >= 2 else str(msg.code))
+                return False, f"{msg.code} {reason}"
 
-            if msg.body:
-                remote = parse_sdp(msg.body)
-                call_state["remote_sdp"] = remote
-                _LOGGER.info("SDP: audio=%s video=%s", remote.get('audio', {}), remote.get('video', {}))
-                await media.setup_media(remote, _local_crypto_key, _local_video_crypto_key)
-
-            _set_in_call(True)
-            _set_calling(False)
-            await broadcast("call_started", "Connesso!")
-            # Request keyframe immediately — no delay
-            await send_keyframe_request()
-            _close_transaction(key, cid)
-            return True, "Connesso!"
-
-        if msg.code >= 300:
-            _LOGGER.error("INVITE rejected: %d", msg.code)
-            await send(_ack(ttag, cur_seq))
-            _close_transaction(key, cid)
-            _set_calling(False)
-            reason = (msg.start_line.split(" ", 2)[2]
-                      if msg.start_line.count(" ") >= 2 else str(msg.code))
-            return False, f"{msg.code} {reason}"
-
-    _close_transaction(key, cid)
-    _set_calling(False)
-    _LOGGER.error("INVITE timeout (45s) for %s", target_uri)
-    return False, "Timeout (45s)"
+        _set_calling(False)
+        _LOGGER.error("INVITE timeout (45s) for %s", target_uri)
+        return False, "Timeout (45s)"
+    finally:
+        _close_transaction(key, cid, cur_seq, "INVITE")
 
 
 async def send_keyframe_request():
@@ -765,7 +773,7 @@ async def do_hangup():
            f"Content-Length: 0\r\n\r\n")
     key = _open_transaction(branch, seq, "BYE", cid)
     await send(bye)
-    await _wait_final(key, cid, timeout=5)
+    await _wait_final(key, cid, seq, "BYE", timeout=5)
 
     _set_in_call(False)
     call_state.update(call_id=None, from_tag=None, to_tag=None,
@@ -809,7 +817,7 @@ async def do_options(target=None):
     seq = _next_cseq()
     key = _open_transaction(branch, seq, "OPTIONS", cid)
     await send(_msg(branch, seq))
-    for raw in await _wait_final(key, cid):
+    for raw in await _wait_final(key, cid, seq, "OPTIONS"):
         msg = parse_message(raw)
         if msg.code and msg.code < 200:
             continue
@@ -822,7 +830,7 @@ async def do_options(target=None):
             seq2 = _next_cseq()
             key2 = _open_transaction(branch2, seq2, "OPTIONS", cid)
             await send(_msg(branch2, seq2, auth=auth))
-            for raw2 in await _wait_final(key2, cid):
+            for raw2 in await _wait_final(key2, cid, seq2, "OPTIONS"):
                 msg2 = parse_message(raw2)
                 if msg2.code and 200 <= msg2.code < 300:
                     return True, f"OK: {msg2.code}"

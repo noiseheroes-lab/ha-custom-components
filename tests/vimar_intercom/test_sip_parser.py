@@ -85,13 +85,30 @@ def test_transaction_key_is_stable():
 def test_response_keys_prefer_branch_and_cseq_over_call_id():
     keys = sp.response_keys(sp.parse_message(REGISTER_200))
     assert keys[0] == "z9hG4bKabc123|7|REGISTER"
-    assert keys[-1] == "cid:reg-deadbeef"
+    assert keys[-1] == "cid:reg-deadbeef|7|REGISTER"
 
 
 def test_response_keys_fall_back_to_call_id_without_a_branch():
     raw = REGISTER_200.replace(";branch=z9hG4bKabc123", "")
     keys = sp.response_keys(sp.parse_message(raw))
-    assert keys == ["cid:reg-deadbeef"]
+    assert keys == ["cid:reg-deadbeef|7|REGISTER"]
+
+
+def test_call_id_fallback_separates_a_retry_from_its_original():
+    # A REGISTER and its authenticated retry share a Call-ID. If the
+    # fallback key did not carry the CSeq, a late response to the first
+    # would be delivered to the second and accepted as its final answer.
+    first = sp.response_keys(sp.parse_message(
+        REGISTER_200.replace(";branch=z9hG4bKabc123", "")))
+    retry = sp.response_keys(sp.parse_message(
+        REGISTER_200.replace(";branch=z9hG4bKabc123", "")
+                    .replace("CSeq: 7", "CSeq: 8")))
+    assert first != retry
+
+
+def test_response_keys_are_empty_without_a_parseable_cseq():
+    raw = REGISTER_200.replace("CSeq: 7 REGISTER", "CSeq: nonsense")
+    assert sp.response_keys(sp.parse_message(raw)) == []
 
 
 def test_two_transactions_on_one_call_id_get_different_keys():

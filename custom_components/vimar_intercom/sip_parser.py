@@ -106,7 +106,9 @@ def response_keys(msg: ParsedMessage) -> list[str]:
     A response carries the branch and CSeq of the request it answers, so
     that pair identifies the transaction even when several transactions
     share a Call-ID. The Call-ID key stays as a fallback for peers that
-    do not echo the branch.
+    do not echo the branch. A response with no parseable CSeq yields no
+    keys at all: it is unroutable, and being unroutable is correct —
+    misrouting it is the bug.
     """
     keys: list[str] = []
     branch = via_branch(msg.headers)
@@ -114,9 +116,21 @@ def response_keys(msg: ParsedMessage) -> list[str]:
     if branch and seq is not None:
         keys.append(transaction_key(branch, seq, method))
     call_id = msg.headers.get("call-id", "")
-    if call_id:
-        keys.append(f"cid:{call_id}")
+    if call_id and seq is not None:
+        keys.append(call_id_key(call_id, seq, method))
     return keys
+
+
+def call_id_key(call_id: str, seq: int | None, method: str) -> str:
+    """Fallback key for a peer that does not echo our branch.
+
+    The CSeq is part of the key on purpose. A REGISTER and its
+    authenticated retry share a Call-ID, so a bare `cid:` key would let a
+    late or duplicated response from the first transaction be delivered
+    to the second and accepted as its final response — discarding the
+    real one. Including the CSeq makes the two keys distinct.
+    """
+    return f"cid:{call_id}|{seq}|{method}"
 
 
 def tag_of(header_value: str) -> str:
