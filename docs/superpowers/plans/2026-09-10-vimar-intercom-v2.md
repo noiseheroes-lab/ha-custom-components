@@ -2237,7 +2237,7 @@ async def _wait_final(
     return results
 ```
 
-7. Every operation (`do_register`, `do_system_message`, `do_call`, `do_options`, `do_connect_profiles`, `do_hangup`) must now generate its branch **before** sending, open the transaction with it, send, then wait. Pattern:
+7. Every SIP operation (`do_register`, `do_system_message`, `do_call`, `do_options`, `do_hangup`) must now generate its branch **before** sending. `do_connect_profiles` is not one of them: it is a plain HTTPS call with no SIP transaction, open the transaction with it, send, then wait. Pattern:
 
 ```python
     branch = _gen()
