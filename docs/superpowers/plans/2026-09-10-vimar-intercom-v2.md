@@ -718,6 +718,9 @@ DEFAULT_LOCAL_SIP_PORT = 5060
 DEFAULT_GROUP_ID = "21"
 DEFAULT_PANELS = "55001"
 DEFAULT_DOOR_COMMAND = "OPEN_2F"
+# Sent to the door relay group while a call is up: opens the relay of the
+# panel that is calling, whichever one it is.
+DOOR_COMMAND_CURRENT = "OPEN_CURRENT"
 DEFAULT_RTP_PORT_BASE = 7200
 DEFAULT_REGISTER_EXPIRY = 3600
 ```
@@ -2572,7 +2575,28 @@ In `hub`, change the `registered` property to `return sip.is_registered()` and a
         sip.request_reconnect()
 ```
 
-- [ ] **Step 8: Verify**
+- [ ] **Step 8: Release the `calling` flag on every exit from `do_call`**
+
+Task 6 wrapped `do_call`'s body in `try/finally` to stop it stranding a
+transaction, but the `finally` only closes the transaction. `_set_calling(True)`
+runs at the top of `do_call`, and on an exception path nothing clears it — so
+`calling` stays `True` and every later call is refused with "Already in a call"
+until Home Assistant restarts. Add the reset to the same `finally`:
+
+```python
+    finally:
+        _close_transaction(key, cid, seq, "INVITE")
+        if not in_call:
+            _set_calling(False)
+```
+
+The `if not in_call` guard matters: on the success path the call is up and
+`calling` has already been cleared by the normal transition, so clearing it
+again is harmless — but reading the flag rather than assuming keeps the two
+paths from fighting. Verify by reading every `return` and `raise` path out of
+`do_call` and confirming none leaves `calling` set without a call.
+
+- [ ] **Step 9: Verify**
 
 ```bash
 python3 -m compileall -q custom_components/vimar_intercom && echo COMPILE_OK
@@ -2581,7 +2605,7 @@ grep -n "All reconnect attempts failed\|delays = \[2, 4, 8, 16, 32\]" custom_com
 ```
 Expected: `COMPILE_OK`, all tests pass, `BOUNDED RECONNECT GONE`
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add custom_components/vimar_intercom tests/vimar_intercom/test_backoff.py
@@ -2854,8 +2878,15 @@ Add an `extra_state_attributes` to the registration sensor so a user can see why
 ```bash
 python3 -m compileall -q custom_components/vimar_intercom && echo COMPILE_OK
 python3 -m pytest -q
+grep -rn "60001\|55001\|55002" custom_components/vimar_intercom/*.py || echo "NO HARDCODED EXTENSIONS"
 ```
-Expected: `COMPILE_OK`, all tests pass
+Expected: `COMPILE_OK`, all tests pass, `NO HARDCODED EXTENSIONS`.
+
+That grep matters: the snapshot's `button.py` called extension `60001` for the
+inner panel, which is simply wrong — the maintainer's deployment corrects it to
+`55002` — and `55001`/`55002` are one particular plant's addresses, not
+protocol constants. Driving the buttons from `hub.config.panels` removes all
+three. If the grep still finds one, an entity is still hardcoded.
 
 - [ ] **Step 6: Commit**
 
@@ -2884,8 +2915,9 @@ Replaces the deleted push notification with the contract the spec defines: an HA
 - Modify: `custom_components/vimar_intercom/sip_client.py`
 
 **Interfaces:**
-- Consumes: `const.EVENT_RING`.
+- Consumes: `const.EVENT_RING`, `const.DOOR_COMMAND_CURRENT`.
 - Produces:
+  - `runtime.RuntimeConfig.door_uri` — `sip:<group_id>@<domain>`, the door relay group taken from the QR.
   - `hub.set_hass(hass, entry_id: str)` — the hub needs the bus and the entry id.
   - Bus event `vimar_intercom_ring` with `{"panel", "panel_name", "entry_id"}`.
   - `hub.register_ring_callback(cb)` now passes the caller's panel address: `cb(panel_address: str)`.
@@ -2964,7 +2996,63 @@ and:
 
 Remove the HomeKit sentence from the class docstring and use the shared `_device_info` helper.
 
-- [ ] **Step 3: Rewrite `lock.py` for configured panels**
+- [ ] **Step 3: Open doors through the relay group from the QR**
+
+This replaces the door strategy the public snapshot shipped with, which was
+never the one that works well. Three sources agree on the right one: the
+maintainer's production deployment, the reverse-engineering decoder
+(`decode-vimar-qr.py`, which prints `Target: sip:{gid}@{domain}` and
+`Body: OPEN_CURRENT`), and the captured SIP session. The door target is the
+**GID from the QR**, not a panel address — which means door opening needs no
+configuration at all, where the snapshot's version required the user to guess
+their panel's extension.
+
+First add to `RuntimeConfig` in `runtime.py`, beside `panel_uri`:
+
+```python
+    @property
+    def door_uri(self) -> str:
+        """The door relay group, taken from the QR's GID field."""
+        return f"sip:{self.group_id}@{self.sip_domain}"
+```
+
+Then replace the head of `hub.async_door` — everything down to but not
+including the `_LOGGER.debug(...)` line — with:
+
+```python
+    async def async_door(
+        self, target: str | None = None, command: str | None = None
+    ) -> tuple[bool, str]:
+        """Open a door, the way the Vimar app itself does.
+
+        Three cases:
+
+        - An explicit target: OPEN_CURRENT to that panel, for plants with
+          more than one entrance.
+        - During a call: OPEN_CURRENT to the door relay group, which opens
+          the relay of whichever panel is calling.
+        - Otherwise: the configured door command, OPEN_2F by default, to
+          the door relay group — the main entrance.
+
+        The relay group comes from the QR, so the common case needs no
+        configuration.
+        """
+        if target:
+            uri = self._cfg.panel_uri(target)
+            body = command or DOOR_COMMAND_CURRENT
+        elif sip.in_call:
+            uri = self._cfg.door_uri
+            body = command or DOOR_COMMAND_CURRENT
+        else:
+            uri = self._cfg.door_uri
+            body = command or self._cfg.door_command
+```
+
+Import `DOOR_COMMAND_CURRENT` from `.const`. The retry-after-re-register block
+below stays exactly as it is; only the target selection changes. Adjust the
+`_LOGGER.debug` line to log `uri` and `body` rather than an address.
+
+- [ ] **Step 4: Rewrite `lock.py` — one door, no configuration**
 
 ```python
 async def async_setup_entry(
@@ -2972,15 +3060,22 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create one lock per configured entrance panel."""
+    """Create the door lock.
+
+    One entity, addressing the relay group from the QR. That is the door
+    a Vimar system has by default, and it works without the user
+    configuring anything. Plants with a second entrance reach it through
+    the per-panel door buttons.
+    """
     hub = hass.data[DOMAIN][entry.entry_id]["hub"]
-    async_add_entities([
-        VimarIntercomLock(hub, entry.entry_id, panel)
-        for panel in hub.config.panels
-    ])
+    async_add_entities([VimarIntercomLock(hub, entry.entry_id)])
 ```
 
-The class takes `panel` instead of `key`/`name`/`door_target`/`door_command`, sets `_attr_has_entity_name = True`, `_attr_translation_key = "door"`, `_attr_name = panel.name`, `_attr_unique_id = f"{entry_id}_lock_{panel.address}"`, and calls `self._hub.async_door(target=self._panel.address)` with the command coming from `hub.config.door_command`. Delete the HomeKit sentence from the docstring; replace it with:
+The class drops `key`/`name`/`door_target`/`door_command` entirely. It sets
+`_attr_has_entity_name = True`, `_attr_translation_key = "door"`,
+`_attr_unique_id = f"{entry_id}_lock"`, and `async_unlock` calls
+`self._hub.async_door()` with no arguments, letting the hub choose
+OPEN_CURRENT or OPEN_2F by whether a call is up. Delete the HomeKit sentence from the docstring; replace it with:
 
 ```python
     """A door release, modelled as a lock.
@@ -2991,11 +3086,11 @@ The class takes `panel` instead of `key`/`name`/`door_target`/`door_command`, se
     """
 ```
 
-- [ ] **Step 4: Make the incoming INVITE log English**
+- [ ] **Step 5: Make the incoming INVITE log English**
 
 In `sip_client.handle_incoming_invite`, replace `await broadcast("ring", f"Chiamata da: {caller_uri}")` with `await broadcast("ring", f"Incoming call from {caller_uri}")`, and in `do_answer_incoming` replace `"Risposto!"` with `"Answered"` and `"Nessuna chiamata in arrivo"` with `"No incoming call"`.
 
-- [ ] **Step 5: Verify**
+- [ ] **Step 6: Verify**
 
 ```bash
 python3 -m compileall -q custom_components/vimar_intercom && echo COMPILE_OK
@@ -3003,7 +3098,7 @@ grep -rn "vimar_intercom_ring" custom_components/vimar_intercom/
 ```
 Expected: `COMPILE_OK`, and `EVENT_RING` defined in `const.py` and fired in `hub.py`
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add custom_components/vimar_intercom
@@ -3178,7 +3273,7 @@ Sections, in this order, all in English, no mention of any private app:
    |---|---|---|
    | `camera.vimar_intercom_intercom` | camera | Opening the stream places a call to the panel |
    | `event.vimar_intercom_doorbell` | event | Event type `ring`, attribute `panel` |
-   | `lock.vimar_intercom_<panel>` | lock | Unlock pulses the door release; re-locks itself |
+   | `lock.vimar_intercom_door` | lock | Unlock opens the main entrance; re-locks itself. Needs no configuration — it addresses the relay group from your QR code |
    | `button.vimar_intercom_call_<panel>` | button | Call that panel |
    | `button.vimar_intercom_open_<panel>` | button | Open that panel's door |
    | `button.vimar_intercom_answer` / `_hangup` | button | Answer or end a call |
@@ -3221,7 +3316,7 @@ automation:
 10. **Troubleshooting.**
    - *Registration stays off* — check the host can reach the proxy shown in the sensor's attributes; press the Reconnect button; the integration retries forever, so a repair issue after five minutes means the panel or the network, not Home Assistant.
    - *No video* — video only flows inside a call, so the camera is black until something opens the stream; check `ffmpeg` is present; check the RTP base port is not firewalled.
-   - *Door does not open* — confirm the panel address in the options; some plants use a different command than `OPEN_2F`.
+   - *Door does not open* — the lock addresses the relay group from your QR code, so it should work untouched. While a call is up it opens the relay of the panel that is calling; otherwise it sends the configured door command, `OPEN_2F` by default. Some plants want a different command — change it in the options. For a second entrance, use that panel's door button.
    - *More detail in the log*:
 
 ```yaml
