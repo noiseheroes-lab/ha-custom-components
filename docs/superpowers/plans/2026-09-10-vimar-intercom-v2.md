@@ -3672,8 +3672,11 @@ async def start_av_ffmpeg():
             cmd, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as err:
+        # Clean up the SDP we just wrote: this is the one exit path that
+        # never reaches stop_av_ffmpeg.
         _LOGGER.error("Could not start ffmpeg: %s", err)
         av_ffmpeg_proc = None
+        _cleanup_av_sdp()
         return
 
     asyncio.create_task(_read_av_ffmpeg_stderr())
@@ -3715,6 +3718,12 @@ async def stop_av_ffmpeg():
         av_ffmpeg_proc = None
         _LOGGER.info("AV pipeline stopped")
 
+    _cleanup_av_sdp()
+
+
+def _cleanup_av_sdp() -> None:
+    """Remove the temporary SDP file, if one is still on disk."""
+    global _av_sdp_path
     if _av_sdp_path:
         try:
             os.unlink(_av_sdp_path)
