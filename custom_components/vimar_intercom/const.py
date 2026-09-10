@@ -20,6 +20,26 @@ SIP_ROUTE = "ipvdes.vimar.cloud"
 USER_AGENT = ("TOGA_Googlesdk_gphone64_arm64_Android34"
               "/1.0|AppVer:2.4.0|ProtVer:1.0|")
 
+# Push-notification contact parameters the Vimar cloud expects in the
+# REGISTER Contact header. These are protocol constants, not credentials —
+# the token itself is generated per installation and stored in the entry.
+PN_APP_ID = "toga-prod"
+PN_TYPE = "firebase"
+MY_NAME = "Home Assistant"
+
+# Identity fields the Vimar cloud protocol requires on REGISTER, MESSAGE
+# and INVITE (Mobile-IMEI header, +sip.instance URN). Not real hardware
+# identifiers — placeholders, since this integration does not run on a
+# physical device with its own IMEI.
+DEVICE_IMEI = "REDACTED_DEVICE_IMEI"
+DEVICE_UUID = DEVICE_IMEI
+
+# VoIP push token for the REGISTER Contact header. Left empty: this
+# integration no longer sends mobile push notifications. SIP registration
+# works the same without it — sip_client.py falls back to a shorter
+# Contact expiry and omits the pn-tok Contact params.
+PN_TOKEN = ""
+
 INTERCOM = f"sip:55001@{SIP_DOMAIN}"
 
 # ─── Door targets (from Tab5S rubrica ACTUATOR_LIST) ─────────────
@@ -39,22 +59,6 @@ FFMPEG_VIDEO_PORT = 19200       # MJPEG ffmpeg reads video here
 FFMPEG_AV_VIDEO_PORT = 19201    # AV ffmpeg reads video here
 FFMPEG_AV_AUDIO_PORT = 19202    # AV ffmpeg reads audio here
 
-# ─── Push Notifications / Identity ───────────────────────────────
-PN_APP_ID = "toga-prod"
-PN_TYPE = "firebase"
-PN_TOKEN = ("REDACTED_FIREBASE_TOKEN_PART1"
-            "REDACTED_FIREBASE_TOKEN_PART2")
-DEVICE_IMEI = "REDACTED_DEVICE_IMEI"
-DEVICE_UUID = DEVICE_IMEI
-MY_NAME = "Home Assistant"
-
 # ─── Local Tab5S ─────────────────────────────────────────────────
 LOCAL_PROXY = "192.168.X.X"
 LOCAL_SIP_PORT = 5060
-
-# ─── APNs VoIP Push ─────────────────────────────────────────────
-APNS_KEY_PATH = os.path.join(SCRIPT_DIR, "AuthKey.p8")  # .p8 from Apple Developer Portal
-APNS_KEY_ID = "YOUR_APNS_KEY_ID"
-APNS_TEAM_ID = "YOUR_APNS_TEAM_ID"
-APNS_BUNDLE_ID = "noiseheroes.Home"
-APNS_SANDBOX = True    # True for development, False for production

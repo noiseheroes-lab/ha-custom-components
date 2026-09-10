@@ -351,7 +351,7 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         Ensures SPS→PPS→IDR ordering: if IDR arrives before SPS+PPS,
         buffer it and emit after both parameter sets are received.
         """
-        if not nal_data or not ws_send_bytes or not self._nal_queue:
+        if not nal_data or not self._nal_queue:
             return
         nal_type = nal_data[0] & 0x1F if nal_data else 0
         self._nal_count += 1
@@ -417,15 +417,16 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                 pass
 
     async def _nal_sender(self):
-        """Drain NAL queue and send via WebSocket in order."""
+        """Drain the ordered NAL queue.
+
+        No consumer is wired up yet: Task 12 replaces this whole path
+        with a registry of media consumers (e.g. the camera platform).
+        """
         try:
             while True:
                 msg = await self._nal_queue.get()
-                if ws_send_bytes:
-                    try:
-                        await ws_send_bytes(msg)
-                    except Exception:
-                        pass
+                # No consumer registered yet — see docstring.
+                continue
         except asyncio.CancelledError:
             pass
 
@@ -443,7 +444,6 @@ audio_proto: RTPAudioProtocol | None = None
 video_proto: RTPVideoProtocol | None = None
 av_ffmpeg_proc = None
 _stun_task = None
-_audio_task = None
 
 
 # ─── Transport setup ────────────────────────────────────────────────
@@ -469,7 +469,7 @@ async def setup_transports():
 
 async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=None):
     """Start media after SIP call established. Called by sip.py."""
-    global _stun_task, _audio_task
+    global _stun_task
     audio = remote_sdp.get("audio", {})
     video = remote_sdp.get("video", {})
     remote_ip = remote_sdp.get("conn", "")
@@ -518,20 +518,13 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         _stun_task.cancel()
     _stun_task = asyncio.create_task(_stun_keepalive())
 
-    if _audio_task:
-        _audio_task.cancel()
-    _audio_task = asyncio.create_task(_audio_broadcast())
-
 
 async def stop_media():
     """Stop all media. Called on hangup/bye."""
-    global _stun_task, _audio_task
+    global _stun_task
     if _stun_task:
         _stun_task.cancel()
         _stun_task = None
-    if _audio_task:
-        _audio_task.cancel()
-        _audio_task = None
     if audio_proto:
         audio_proto.remote_addr = None
         audio_proto.pkt_count = 0
@@ -582,33 +575,6 @@ async def _stun_keepalive():
                 video_proto.send_stun()
     except asyncio.CancelledError:
         pass
-
-
-# ─── Audio broadcast ────────────────────────────────────────────────
-
-# ws_send_bytes: set by main.py — async fn(data) to send binary to all clients
-ws_send_bytes = None
-
-
-async def _audio_broadcast():
-    """Forward decoded PCM to browser via WebSocket."""
-    try:
-        while True:
-            if not audio_proto:
-                await asyncio.sleep(0.5)
-                continue
-            try:
-                pcm = await asyncio.wait_for(
-                    audio_proto.audio_buffer.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-            if ws_send_bytes:
-                await ws_send_bytes(b'\x01' + pcm)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        _LOGGER.error("Audio broadcast error: %s", e)
-
 
 
 # (ffmpeg video pipeline removed — H.264 NALs sent directly from RTPVideoProtocol)

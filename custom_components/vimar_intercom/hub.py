@@ -6,7 +6,6 @@ from collections.abc import Callable
 
 from . import sip_client as sip
 from . import media_handler as media
-from . import push_sender
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,17 +21,12 @@ class VimarIntercomHub:
         self._running = False
         self._ring_callbacks: list[Callable] = []
         self._state_callbacks: list[Callable] = []
-        self._ws_broadcast_fn: Callable | None = None
-        self._has_ws_clients: Callable | None = None
         self._stream_viewers = 0
         self._hangup_task: asyncio.Task | None = None
         self._call_timeout_task: asyncio.Task | None = None
         self._keyframe_task: asyncio.Task | None = None
         self._auto_called = False
         self._auto_call_target: str | None = None
-
-    def set_ws_broadcast(self, fn: Callable):
-        self._ws_broadcast_fn = fn
 
     @property
     def registered(self) -> bool:
@@ -72,14 +66,6 @@ class VimarIntercomHub:
                 cb()
             except Exception:
                 _LOGGER.exception("State callback error")
-        # Notify WS clients of state change
-        if self._ws_broadcast_fn:
-            import asyncio
-            asyncio.ensure_future(self._ws_broadcast_fn({
-                "type": "state",
-                "registered": sip.registered,
-                "in_call": sip.in_call,
-            }))
 
     async def stream_opened(self, target: str | None = None):
         self._stream_viewers += 1
@@ -90,12 +76,6 @@ class VimarIntercomHub:
             self._hangup_task = None
 
         if sip.in_call or sip.calling:
-            return
-
-        # Don't auto-call when iOS app WS clients are connected —
-        # the app sends the call action explicitly via WebSocket.
-        if self._has_ws_clients and self._has_ws_clients():
-            _LOGGER.info("Stream opened but WS clients connected — skipping auto-call")
             return
 
         if sip.registered:
@@ -305,24 +285,8 @@ class VimarIntercomHub:
         return results
 
     async def _handle_broadcast(self, msg_type, msg):
+        """React to a SIP-layer event."""
         _LOGGER.debug("[%s] %s", msg_type, msg)
-
-        if msg_type in ("ring", "ring_ended", "call_started", "call_ended", "registered", "error"):
-            # Don't broadcast "ring" to WS clients if we initiated the call
-            if msg_type == "ring" and (self._auto_called or sip.in_call or sip.calling):
-                pass  # Will be handled below (suppress + decline)
-            elif self._ws_broadcast_fn:
-                try:
-                    payload = {
-                        "type": msg_type, "msg": msg,
-                        "registered": sip.registered, "in_call": sip.in_call,
-                    }
-                    # Include caller URI so clients can identify which panel is ringing
-                    if msg_type == "ring" and sip.pending_incoming.get("caller_uri"):
-                        payload["caller_uri"] = sip.pending_incoming["caller_uri"]
-                    await self._ws_broadcast_fn(payload)
-                except Exception:
-                    _LOGGER.exception("WS broadcast error")
 
         if msg_type == "call_started":
             self._start_call_timeout()
@@ -332,12 +296,13 @@ class VimarIntercomHub:
             self._cancel_keyframe_loop()
 
         if msg_type == "ring":
-            # If we initiated the call (tap to view / auto-call), the Tab5S
-            # sends an INVITE back to us. Suppress ring + push — this is NOT
-            # a doorbell ring, just the PBX echoing our outgoing call.
+            # When we placed the call ourselves the panel INVITEs us back.
+            # That is the PBX echoing our own call, not a doorbell press.
             if self._auto_called or sip.in_call or sip.calling:
-                _LOGGER.info("Suppressing ring — we initiated this call (auto_called=%s, in_call=%s, calling=%s)",
-                             self._auto_called, sip.in_call, sip.calling)
+                _LOGGER.debug(
+                    "Suppressing ring: call initiated locally "
+                    "(auto_called=%s, in_call=%s, calling=%s)",
+                    self._auto_called, sip.in_call, sip.calling)
                 asyncio.create_task(sip.do_decline_incoming())
                 return
 
@@ -346,16 +311,6 @@ class VimarIntercomHub:
                     cb()
                 except Exception:
                     _LOGGER.exception("Ring callback error")
-
-            # Send VoIP push to wake iOS devices
-            sender = push_sender.get_sender()
-            if sender:
-                caller = sip.pending_incoming.get("caller_uri", "55001")
-                # Extract SIP user from URI (e.g. "sip:55001@domain" → "55001")
-                if "@" in caller:
-                    caller = caller.split("@")[0].replace("sip:", "")
-                panel = "esterna"  # TODO: detect panel from caller
-                asyncio.create_task(sender.send_voip_push(caller=caller, panel=panel))
 
     async def _auto_startup(self):
         await asyncio.sleep(2)

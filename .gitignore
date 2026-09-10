@@ -6,3 +6,10 @@ __pycache__/
 
 # Subagent-driven-development scratch workspace
 .superpowers/
+
+# Secrets — never commit
+AuthKey*.p8
+push_tokens.json
+*.pem.key
+secrets.yaml
+.pytest_cache/
