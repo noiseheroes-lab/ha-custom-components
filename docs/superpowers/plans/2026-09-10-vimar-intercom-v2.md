@@ -3754,13 +3754,23 @@ class VimarIntercomCamera(Camera):
         """The camera is always available; the stream starts on demand."""
         return True
 
+    @property
+    def use_stream_for_stills(self) -> bool:
+        """Take stills from the stream.
+
+        The panel sends H.264, never JPEG, so there is no still image to
+        fetch. Without this, Home Assistant would call `camera_image` and
+        get NotImplementedError for every snapshot and dashboard preview.
+        """
+        return True
+
     async def stream_source(self) -> str | None:
         """Signed URL of the MPEG-TS stream."""
         signed = async_sign_path(self.hass, AV_PATH, SIGNATURE_LIFETIME)
         return f"{get_url(self.hass, prefer_external=False)}{signed}"
 ```
 
-`async_camera_image` and `handle_async_mjpeg_stream` are deliberately gone: with `CameraEntityFeature.STREAM` and a working `stream_source`, Home Assistant produces still images from the stream itself.
+`async_camera_image` and `handle_async_mjpeg_stream` are deliberately gone. Home Assistant's `async_get_image` branches on `use_stream_for_stills`: when it is `True` it pulls a frame from the stream, and when it is `False` — the default — it calls `camera_image`, which is not implemented here and raises. Verified against Home Assistant 2026.9.1 in `homeassistant/components/camera/__init__.py`.
 
 - [ ] **Step 2: Verify the import path of `async_sign_path`**
 
@@ -3778,7 +3788,7 @@ grep -rn "requires_auth" custom_components/vimar_intercom/
 ```
 Expected: `CAMERA_OK`, and every `requires_auth` line reads `requires_auth = True`
 
-If `homeassistant.components.http.auth.async_sign_path` does not exist in the target HA version, import it from `homeassistant.components.http` instead; the reviewer must confirm against the installed HA before approving.
+**Verified against Home Assistant 2026.9.1:** `async_sign_path` lives at `homeassistant.components.http.auth` with the signature `(hass, path, expiration, *, refresh_token_id=None, use_content_user=False) -> str`. It is **not** re-exported from `homeassistant.components.http`, so import it from `.auth` exactly as written above. Also verified present: `CameraEntityFeature.STREAM`, `Camera.use_stream_for_stills`, `homeassistant.helpers.network.get_url`, `homeassistant.helpers.entity.EntityCategory`, `homeassistant.helpers.issue_registry`, and the `ConfigFlow` helpers `_get_reconfigure_entry`, `_abort_if_unique_id_mismatch` and `async_update_reload_and_abort` used in Task 4.
 
 - [ ] **Step 3: Re-run the full definition of done**
 
@@ -3811,7 +3821,7 @@ Stated plainly, because the definition of done in the spec assumes a live system
 - **The live account can carry only one SIP registration.** Registering a second client with the same credentials deregisters the first and takes the intercom in a real house offline. **No task in this plan may run the component against the live Vimar account.** Anyone tempted to "just try it" must stop and ask.
 - **A fresh install on a clean Home Assistant** (§12.3) and **the ten-minute network outage** (§12.4) therefore cannot be exercised while implementing. They belong to the validation session described below.
 - **`hassfest` and HACS validation can be run locally** with the Docker commands in Task 11, step 6. Docker is installed on this machine but the daemon is not running by default: start Docker Desktop first. If it cannot be started, report that rather than marking the check passed.
-- **The camera path** (Task 13) depends on `async_sign_path` being importable at the location used and on Home Assistant's `stream` component accepting a signed internal URL. It is the least certain part of the plan, which is why it is built last and documented as unverified.
+- **The camera path** (Task 13). Its imports are no longer a guess: `async_sign_path`, `CameraEntityFeature.STREAM` and `use_stream_for_stills` were all verified present in Home Assistant 2026.9.1 while this plan was being executed. What remains unverified is behavioural — whether the `stream` component's ffmpeg opens a signed internal URL, and whether the MPEG-TS the panel produces decodes cleanly. That needs the validation session.
 - **The proxy host derivation** (`CPROXY`, defaulting to `ipvdes.vimar.cloud`) is inferred from the existing `SIP_SNI`/`SIP_ROUTE` constants. If registration fails against a real panel, the options flow's SIP proxy port and the `prefer_local` switch are the intended escape hatches, and `runtime.build_runtime_config` is the place to correct it.
 
 ### The validation session
