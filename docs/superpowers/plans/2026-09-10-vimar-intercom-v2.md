@@ -834,13 +834,11 @@ def test_options_override_transport_and_panels():
         {
             "sip_port": 5061,
             "panels": "55001:Gate,55002:Door",
-            "prefer_local": True,
             "rtp_port_base": 8000,
             "door_command": "OPEN_1F",
         },
     )
     assert cfg.proxy_port == 5061
-    assert cfg.prefer_local is True
     assert [p.name for p in cfg.panels] == ["Gate", "Door"]
     assert cfg.rtp_audio_port == 8000
     assert cfg.rtp_video_port == 10000
@@ -854,6 +852,19 @@ def test_prefer_local_switches_the_proxy_host():
     assert cfg.proxy_port == 5060
     # The SNI and Route still name the cloud, which is what the cert covers.
     assert cfg.sni == "ipvdes.vimar.cloud"
+
+
+def test_prefer_local_ignores_the_cloud_proxy_port():
+    # sip_port configures the cloud proxy. The options flow always
+    # persists it, so honouring it locally would send a saved 7042 at a
+    # panel that listens on 5060 — breaking the very user who turned
+    # prefer_local on.
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(QR_FIELDS),
+        {"prefer_local": True, "sip_port": 7042},
+    )
+    assert cfg.proxy_host == "192.0.2.10"
+    assert cfg.proxy_port == 5060
 
 
 def test_prefer_local_is_ignored_without_a_local_proxy():
@@ -1044,6 +1055,10 @@ def build_runtime_config(
     prefer_local = bool(options.get(CONF_PREFER_LOCAL, False)) and bool(local_proxy)
 
     if prefer_local:
+        # The panel's own SIP port is fixed by the device. CONF_SIP_PORT
+        # configures the cloud proxy only: the options flow always
+        # persists it, so applying it here would aim a saved cloud port
+        # at the local panel.
         proxy_host = local_proxy
         proxy_port = DEFAULT_LOCAL_SIP_PORT
     else:
@@ -1083,7 +1098,7 @@ def build_runtime_config(
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `python3 -m pytest tests/vimar_intercom/test_runtime.py -q`
-Expected: PASS, 14 passed
+Expected: PASS, 15 passed
 
 - [ ] **Step 6: Commit**
 
@@ -1372,7 +1387,7 @@ def _summary_placeholders(data: dict[str, Any]) -> dict[str, str]:
           "panels": "Panel addresses",
           "door_command": "Door open command",
           "prefer_local": "Prefer the panel on the local network",
-          "sip_port": "SIP proxy port",
+          "sip_port": "Cloud SIP proxy port",
           "rtp_port_base": "RTP base port"
         }
       }
@@ -1433,7 +1448,7 @@ Same structure, Italian values. Key phrases:
 - `abort.wrong_panel`: `"Questo codice QR appartiene a un altro posto esterno. Rimuovi prima la voce esistente."`
 - `abort.reconfigure_successful`: `"Credenziali aggiornate."`
 - `options.init.title`: `"Opzioni Videocitofono Vimar"`
-- `options.init.data`: `panels` → `"Indirizzi dei posti esterni"`, `door_command` → `"Comando di apertura porta"`, `prefer_local` → `"Preferisci il posto esterno sulla rete locale"`, `sip_port` → `"Porta del proxy SIP"`, `rtp_port_base` → `"Porta RTP di base"`
+- `options.init.data`: `panels` → `"Indirizzi dei posti esterni"`, `door_command` → `"Comando di apertura porta"`, `prefer_local` → `"Preferisci il posto esterno sulla rete locale"`, `sip_port` → `"Porta del proxy SIP cloud"`, `rtp_port_base` → `"Porta RTP di base"`
 - `options.error.invalid_panels`: `"Gli indirizzi devono essere interni SIP numerici, separati da virgola."`
 - Entity names: `intercom` → `"Videocitofono"`, `door` → `"Porta"`, `call` → `"Chiama"`, `answer` → `"Rispondi"`, `hang_up` → `"Riaggancia"`, `open_door` → `"Apri porta"`, `reconnect` → `"Riconnetti"`, `doorbell` → `"Campanello"`, `sip_registration` → `"Registrazione SIP"`, `in_call` → `"In chiamata"`
 - `issues.registration_down.title`: `"Il videocitofono Vimar non è registrato"`
@@ -3103,7 +3118,7 @@ automation:
           filename: "/media/doorbell_{{ now().timestamp() | int }}.jpg"
 ```
 
-8. **Options.** Panel addresses (with the `address:Name` syntax and how to find them: they are printed on the panel's address label and shown in the Vimar View address book), door open command, prefer local panel, SIP proxy port, RTP base port.
+8. **Options.** Panel addresses (with the `address:Name` syntax and how to find them: they are printed on the panel's address label and shown in the Vimar View address book), door open command, prefer local panel, cloud SIP proxy port (it does not apply when the local panel is preferred — that port is fixed by the device), RTP base port.
 9. **Limitations.** State each plainly:
    - **You can see and hear the door; you cannot speak back.** Audio from the panel is carried in the camera stream. Home Assistant does not send audio to the panel, and has no two-way voice interface for cameras. Call and Answer control the call, they do not open a conversation.
    - **One Vimar system per Home Assistant installation.** The integration declares `single_config_entry`.
