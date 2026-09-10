@@ -3030,7 +3030,32 @@ grep -rn "do_door\|send_audio" custom_components/vimar_intercom/
 Delete only what that grep shows to be unreferenced. If either has acquired a
 caller, leave it and say so.
 
-- [ ] **Step 3: Fix the log levels**
+- [ ] **Step 3: Derive the cloud host in `do_connect_profiles`**
+
+`do_connect_profiles` posts to a hardcoded `https://ipvdes.vimar.cloud/eipvdesUtils/`.
+Task 5's substitution table missed it, so it is the last hardcoded installation
+value in the component — an installation whose `CPROXY` differs would talk to
+the wrong host. Derive it from the entry:
+
+```python
+    base_url = f"https://{CFG.route}/eipvdesUtils"
+
+    def _call(endpoint):
+        return req_lib.post(
+            f"{base_url}/{endpoint}",
+            json=body,
+            auth=req_lib.auth.HTTPDigestAuth(username, CFG.push_token),
+            headers={"Accept": "application/json"}, timeout=15)
+```
+
+Its Italian return strings are covered by step 1: `"Profilo connesso"` becomes
+`"Profile connected"`, `"No FCM token"` stays as it is.
+
+Note: `requests` is used here through `run_in_executor`. That is not a new
+dependency — `requests` is a declared Home Assistant core dependency — so leave
+the library alone.
+
+- [ ] **Step 4: Fix the log levels**
 
 Apply throughout:
 
@@ -3057,7 +3082,7 @@ _LOGGER.debug("Sending %s to %s", body_text, target_uri)
 _LOGGER.debug("Stream opened (%d viewers)", self._stream_viewers)
 ```
 
-- [ ] **Step 4: Verify the sweep**
+- [ ] **Step 5: Verify the sweep**
 
 ```bash
 grep -rniE "chiamata|registrat[oa]|serratur|citofon|portone|targa|rubrica|fallit|errore|apert|campanell|già|nessun|risposto" custom_components/vimar_intercom/*.py || echo "NO ITALIAN IN CODE"
@@ -3067,7 +3092,7 @@ python3 -m pytest -q
 ```
 Expected: `NO ITALIAN IN CODE`, `NO FORCED LOG LEVEL`, `COMPILE_OK`, tests pass
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add custom_components/vimar_intercom
