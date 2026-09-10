@@ -38,7 +38,7 @@ class VimarIntercomHub:
 
     @property
     def registered(self) -> bool:
-        return sip.registered
+        return sip.is_registered()
 
     @property
     def in_call(self) -> bool:
@@ -191,12 +191,11 @@ class VimarIntercomHub:
         await media.setup_transports()
         _LOGGER.info("RTP transports ready")
 
-        await sip.connect()
-
-        self._tasks.append(asyncio.create_task(sip.reader_task()))
+        # The supervisor makes its own first connection attempt; connecting
+        # here too would leak that first socket the moment the supervisor
+        # opens its own.
+        self._tasks.append(asyncio.create_task(sip.connection_supervisor()))
         self._tasks.append(asyncio.create_task(sip.request_processor()))
-        self._tasks.append(asyncio.create_task(self._auto_startup()))
-        self._tasks.append(asyncio.create_task(self._keepalive_loop()))
         self._running = True
 
     async def async_stop(self):
@@ -216,6 +215,11 @@ class VimarIntercomHub:
             except Exception:
                 pass
         _LOGGER.info("Hub stopped")
+
+    async def async_reconnect(self) -> None:
+        """Force the SIP connection to be rebuilt."""
+        _LOGGER.info("Manual reconnect requested")
+        sip.request_reconnect()
 
     async def async_call(self, target: str | None = None) -> tuple[bool, str]:
         self._auto_called = False
@@ -314,31 +318,3 @@ class VimarIntercomHub:
                     cb()
                 except Exception:
                     _LOGGER.exception("Ring callback error")
-
-    async def _auto_startup(self):
-        await asyncio.sleep(2)
-        try:
-            _LOGGER.info("Auto startup: registering SIP...")
-            ok = await sip.do_register()
-            _LOGGER.info("Auto startup: register result=%s", ok)
-            if ok:
-                await asyncio.sleep(1)
-                try:
-                    ok2, msg2 = await sip.do_connect_profiles()
-                    _LOGGER.info("connectProfiles: ok=%s msg=%s", ok2, msg2)
-                except Exception as e:
-                    _LOGGER.error("connectProfiles error: %s", e)
-            else:
-                _LOGGER.error("SIP registration failed")
-        except Exception as e:
-            _LOGGER.error("Auto startup error: %s", e, exc_info=True)
-
-    async def _keepalive_loop(self):
-        while self._running:
-            await asyncio.sleep(120)
-            if sip.registered:
-                try:
-                    ok = await sip.do_register()
-                    _LOGGER.debug("Keepalive: %s", "OK" if ok else "FAILED")
-                except Exception as e:
-                    _LOGGER.error("Keepalive error: %s", e)

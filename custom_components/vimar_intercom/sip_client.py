@@ -12,6 +12,7 @@ import logging
 
 from . import const as C
 from . import media_handler as media
+from .backoff import reconnect_delay
 from .runtime import RuntimeConfig
 from .sip_parser import (
     ParsedMessage,
@@ -66,6 +67,18 @@ calling = False
 cseq_counter = 0
 local_tag = None
 MY_IP = None
+
+# Registration lifetime, tracked so `is_registered()` reflects what the
+# registrar actually granted rather than a flag that only ever moves
+# forward. Both are `None` while there is no live registration.
+registration_expiry: float | None = None
+registered_since: float | None = None
+_reregister_task: asyncio.Task | None = None
+
+# Set by connection_supervisor() on each connection attempt; used by
+# request_reconnect() to interrupt a blocked read immediately instead of
+# waiting for the socket to notice on its own.
+_connection_lost: asyncio.Event | None = None
 
 # State change callback — hub sets this to notify entities
 _state_change_callback = None
@@ -126,6 +139,13 @@ def _set_in_call(val: bool):
 def _set_calling(val: bool):
     global calling
     calling = val
+
+
+def is_registered() -> bool:
+    """True only while a registration granted by the registrar is valid."""
+    if not registered or registration_expiry is None:
+        return False
+    return time.monotonic() < registration_expiry
 
 
 def get_local_ip():
@@ -220,35 +240,6 @@ async def connect():
     _LOGGER.info("SIP TLS connected")
 
 
-async def reconnect():
-    """Reconnect TLS with exponential backoff."""
-    global reader, writer
-    _set_registered(False)
-    delays = [2, 4, 8, 16, 32]
-    for attempt, delay in enumerate(delays, 1):
-        _LOGGER.warning("SIP reconnect attempt %d/%d in %ds...", attempt, len(delays), delay)
-        await asyncio.sleep(delay)
-        try:
-            if writer:
-                try:
-                    writer.close()
-                except Exception:
-                    pass
-            await connect()
-            _LOGGER.info("SIP reconnected, re-registering...")
-            ok = await do_register()
-            if ok:
-                try:
-                    await do_connect_profiles()
-                except Exception:
-                    pass
-                return True
-        except Exception as e:
-            _LOGGER.error("Reconnect attempt %d failed: %s", attempt, e)
-    _LOGGER.error("All reconnect attempts failed")
-    return False
-
-
 async def send(msg: str):
     first_line = msg.split("\r\n", 1)[0]
     _LOGGER.debug("[SIP >>>] %s", first_line)
@@ -261,76 +252,123 @@ async def send(msg: str):
         raise
 
 
-# ─── Reader task ────────────────────────────────────────────────────
+# ─── Connection supervisor ──────────────────────────────────────────
 
-async def reader_task():
+def request_reconnect() -> None:
+    """Ask the supervisor to tear down and rebuild the connection."""
+    if _connection_lost is not None:
+        _connection_lost.set()
+    if writer is not None:
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001 - closing a dead socket may raise
+            pass
+
+
+async def connection_supervisor() -> None:
+    """Keep the SIP connection up forever, with jittered backoff.
+
+    Never gives up: DNS failures, TCP failures and refused registrations
+    are all treated the same way. The eleven-day outage this replaces
+    began as a transient DNS failure that the old five-attempt reconnect
+    could not ride out.
+    """
+    global _connection_lost
+    _connection_lost = asyncio.Event()
+    attempt = 0
+
+    try:
+        while True:
+            try:
+                await connect()
+                if not await do_register():
+                    raise ConnectionError("registration was refused")
+                attempt = 0
+                try:
+                    await do_connect_profiles()
+                except Exception as err:  # noqa: BLE001 - optional, never fatal
+                    # A plant that rejects connectProfiles is still usable:
+                    # the registration is what matters. Failing here would
+                    # spin the supervisor forever on a healthy connection.
+                    _LOGGER.warning("connectProfiles failed (%s); continuing", err)
+                await _reader_loop()
+                raise ConnectionError("connection closed by the server")
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - any failure means retry
+                _set_registered(False)
+                _cancel_reregister()
+                attempt += 1
+                delay = reconnect_delay(attempt)
+                _LOGGER.warning(
+                    "SIP connection unavailable (%s); retrying in %.0fs "
+                    "(attempt %d)", err, delay, attempt)
+                await asyncio.sleep(delay)
+    finally:
+        # The supervisor only ever exits via cancellation (hub.async_stop
+        # tearing the task down for HA unload). Without this, a pending
+        # re-register task scheduled by _accept_registration would keep
+        # sleeping past shutdown and then reconnect on its own — an
+        # orphaned connection outliving the integration it belongs to.
+        _cancel_reregister()
+
+
+async def _reader_loop() -> None:
+    """Read and dispatch SIP messages until the connection ends."""
+    _connection_lost.clear()
     buf = b""
-    while True:
+    while not _connection_lost.is_set():
         try:
             chunk = await asyncio.wait_for(reader.read(8192), timeout=30)
-            if not chunk:
-                _LOGGER.warning("SIP connection closed by server, reconnecting...")
-                await reconnect()
-                buf = b""
-                continue
-            buf += chunk
         except asyncio.TimeoutError:
-            # Send CRLF keepalive (RFC 5626) to prevent proxy from
-            # considering TLS connection stale
-            try:
-                async with lock:
-                    writer.write(b"\r\n\r\n")
-                    await writer.drain()
-            except Exception:
-                _LOGGER.warning("CRLF keepalive failed, reconnecting...")
-                await reconnect()
-                buf = b""
+            # RFC 5626 CRLF keepalive, so the proxy does not drop us.
+            async with lock:
+                writer.write(b"\r\n\r\n")
+                await writer.drain()
             continue
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _LOGGER.error("SIP reader error: %s, reconnecting...", e)
-            try:
-                await reconnect()
-            except Exception as re:
-                _LOGGER.error("Reconnect failed: %s", re)
-            buf = b""
-            await asyncio.sleep(2)
-            continue
+        if not chunk:
+            return
+        buf += chunk
+        buf = await _dispatch_buffer(buf)
 
-        while b"\r\n\r\n" in buf:
-            hdr_end = buf.index(b"\r\n\r\n") + 4
-            hdr_text = buf[:hdr_end].decode(errors="replace")
-            cl = 0
-            for line in hdr_text.split("\r\n"):
-                if line.lower().startswith("content-length:"):
-                    try:
-                        cl = int(line.split(":", 1)[1].strip())
-                    except ValueError:
-                        pass
-            total = hdr_end + cl
-            if len(buf) < total:
-                break
-            raw = buf[:total].decode(errors="replace")
-            buf = buf[total:]
 
-            msg = parse_message(raw)
-            _LOGGER.debug("[SIP <<<] %s", msg.start_line)
+async def _dispatch_buffer(buf: bytes) -> bytes:
+    """Parse complete SIP messages out of `buf`, dispatch them, and
+    return the unconsumed remainder."""
+    while b"\r\n\r\n" in buf:
+        hdr_end = buf.index(b"\r\n\r\n") + 4
+        hdr_text = buf[:hdr_end].decode(errors="replace")
+        cl = 0
+        for line in hdr_text.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try:
+                    cl = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+        total = hdr_end + cl
+        if len(buf) < total:
+            break
+        raw = buf[:total].decode(errors="replace")
+        buf = buf[total:]
 
-            if msg.code is not None:
-                queue = None
-                for key in response_keys(msg):
-                    queue = pending_transactions.get(key)
-                    if queue is not None:
-                        break
+        msg = parse_message(raw)
+        _LOGGER.debug("[SIP <<<] %s", msg.start_line)
+
+        if msg.code is not None:
+            queue = None
+            for key in response_keys(msg):
+                queue = pending_transactions.get(key)
                 if queue is not None:
-                    await queue.put(raw)
-                else:
-                    _LOGGER.debug(
-                        "Response %d matched no open transaction (%s)",
-                        msg.code, msg.start_line)
-            elif msg.method is not None:
-                await incoming_requests.put(raw)
+                    break
+            if queue is not None:
+                await queue.put(raw)
+            else:
+                _LOGGER.debug(
+                    "Response %d matched no open transaction (%s)",
+                    msg.code, msg.start_line)
+        elif msg.method is not None:
+            await incoming_requests.put(raw)
+    return buf
 
 
 async def _wait_final(key: str, call_id: str, seq: int, method: str,
@@ -436,6 +474,51 @@ def parse_sdp(sdp_text):
 
 # ─── Operations ─────────────────────────────────────────────────────
 
+REGISTER_EXPIRY_SAFETY = 0.5  # re-register at half the granted lifetime
+
+
+def _accept_registration(msg: ParsedMessage) -> None:
+    """Record a successful registration and schedule the refresh."""
+    global registration_expiry, registered_since
+    granted = granted_expiry(msg, CFG.sip_user, C.DEFAULT_REGISTER_EXPIRY)
+    now = time.monotonic()
+    registration_expiry = now + granted
+    registered_since = now
+    _set_registered(True)
+    _LOGGER.info("SIP registered for %ds", granted)
+    _schedule_reregister(granted * REGISTER_EXPIRY_SAFETY)
+
+
+def _schedule_reregister(delay: float) -> None:
+    """Re-register before the current registration expires."""
+    global _reregister_task
+    _cancel_reregister()
+    _reregister_task = asyncio.create_task(_reregister_after(delay))
+
+
+def _cancel_reregister() -> None:
+    global _reregister_task, registration_expiry, registered_since
+    if _reregister_task is not None:
+        _reregister_task.cancel()
+        _reregister_task = None
+    registration_expiry = None
+    registered_since = None
+
+
+async def _reregister_after(delay: float) -> None:
+    """Sleep, then refresh the registration; reconnect if it fails."""
+    try:
+        await asyncio.sleep(delay)
+        if not await do_register():
+            _LOGGER.warning("Registration refresh failed; reconnecting")
+            request_reconnect()
+    except asyncio.CancelledError:
+        pass
+    except Exception as err:  # noqa: BLE001 - any failure means reconnect
+        _LOGGER.warning("Registration refresh error (%s); reconnecting", err)
+        request_reconnect()
+
+
 async def do_register():
     if not writer or writer.is_closing():
         await connect()
@@ -495,15 +578,11 @@ async def do_register():
             for raw2 in await _wait_final(key2, cid, seq2, "REGISTER"):
                 msg2 = parse_message(raw2)
                 if msg2.code == 200:
-                    expiry = granted_expiry(msg2, CFG.sip_user, 3600)
-                    _set_registered(True)
-                    _LOGGER.info("SIP registered successfully (expires=%ds)", expiry)
+                    _accept_registration(msg2)
                     return True
             return False
         elif msg.code == 200:
-            expiry = granted_expiry(msg, CFG.sip_user, 3600)
-            _set_registered(True)
-            _LOGGER.info("SIP registered successfully (expires=%ds)", expiry)
+            _accept_registration(msg)
             return True
     return False
 
@@ -581,73 +660,79 @@ async def do_call(target=None):
         return False, "Già in chiamata"
 
     _set_calling(True)
-    target_uri = target or CFG.panel_uri(CFG.default_panel.address)
-    _LOGGER.info("do_call: target=%s", target_uri)
-    ftag = _gen("")
+    key: str | None = None
+    cur_seq: int | None = None
     cid = _gen("call-")
-    sdp = build_sdp()
-    call_state["call_id"] = cid
-    call_state["from_tag"] = ftag
-    call_state["original_target"] = target_uri
 
-    vimar_callid = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
-
-    def _inv(branch, seq, auth=None):
-        m = (f"INVITE {target_uri} SIP/2.0\r\n"
-             f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
-             f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
-             f"Max-Forwards: 70\r\n"
-             f"To: <{target_uri}>\r\n"
-             f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
-             f"Call-ID: {cid}\r\n"
-             f"CSeq: {seq} INVITE\r\n"
-             f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>"
-             f';+sip.instance="<urn:uuid:{CFG.device_uuid}>"\r\n'
-             f"User-Agent: {CFG.user_agent}\r\n"
-             f"Supported: replaces,outbound,gruu,timer\r\n"
-             f"Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,NOTIFY,INFO,MESSAGE,UPDATE\r\n"
-             f"Session-Expires: 600;refresher=uas\r\n"
-             f"Min-SE: 90\r\n")
-        if auth:
-            m += f"Proxy-Authorization: {auth}\r\n"
-        m += (f"Mobile-IMEI: {CFG.device_id}\r\n"
-              f"MyName: {C.MY_NAME}\r\n"
-              f"X-Call-ID: {vimar_callid}\r\n"
-              f"Content-Type: application/sdp\r\n"
-              f"Content-Length: {len(sdp)}\r\n\r\n{sdp}")
-        return m
-
-    def _ack(to_tag, seq):
-        branch = _gen()
-        to_hdr = f"<{target_uri}>"
-        if to_tag:
-            to_hdr += f";tag={to_tag}"
-        return (f"ACK {target_uri} SIP/2.0\r\n"
-                f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
-                f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
-                f"Max-Forwards: 70\r\n"
-                f"To: {to_hdr}\r\n"
-                f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
-                f"Call-ID: {cid}\r\n"
-                f"CSeq: {seq} ACK\r\n"
-                f"Content-Length: 0\r\n\r\n")
-
-    branch = _gen()
-    cur_seq = _next_cseq()
-    key = _open_transaction(branch, cur_seq, "INVITE", cid)
-    await send(_inv(branch, cur_seq))
-    await broadcast("log", "INVITE inviato...")
-
-    queue = pending_transactions[key]
-    deadline = time.monotonic() + 45
-
-    # A raise anywhere below (parse_sdp, media.setup_media,
-    # send_keyframe_request, _make_auth) must not strand the transaction
-    # that is open at that moment — close whichever one is current on
-    # every exit. The authenticated-retry branch closes the first
-    # transaction itself before opening the second, so each transaction
-    # this call opens is still closed exactly once.
+    # Everything from here on runs with `calling` already set and, once
+    # the transaction is opened below, a transaction pending too. A raise
+    # anywhere in this block (build_sdp, send, broadcast, parse_sdp,
+    # media.setup_media, send_keyframe_request, _make_auth) must not
+    # strand either one — the finally below closes whichever transaction
+    # is current and always clears `calling` unless a call is now up. The
+    # authenticated-retry branch closes the first transaction itself
+    # before opening the second, so each transaction this call opens is
+    # still closed exactly once.
     try:
+        target_uri = target or CFG.panel_uri(CFG.default_panel.address)
+        _LOGGER.info("do_call: target=%s", target_uri)
+        ftag = _gen("")
+        sdp = build_sdp()
+        call_state["call_id"] = cid
+        call_state["from_tag"] = ftag
+        call_state["original_target"] = target_uri
+
+        vimar_callid = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+
+        def _inv(branch, seq, auth=None):
+            m = (f"INVITE {target_uri} SIP/2.0\r\n"
+                 f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+                 f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
+                 f"Max-Forwards: 70\r\n"
+                 f"To: <{target_uri}>\r\n"
+                 f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
+                 f"Call-ID: {cid}\r\n"
+                 f"CSeq: {seq} INVITE\r\n"
+                 f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>"
+                 f';+sip.instance="<urn:uuid:{CFG.device_uuid}>"\r\n'
+                 f"User-Agent: {CFG.user_agent}\r\n"
+                 f"Supported: replaces,outbound,gruu,timer\r\n"
+                 f"Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,NOTIFY,INFO,MESSAGE,UPDATE\r\n"
+                 f"Session-Expires: 600;refresher=uas\r\n"
+                 f"Min-SE: 90\r\n")
+            if auth:
+                m += f"Proxy-Authorization: {auth}\r\n"
+            m += (f"Mobile-IMEI: {CFG.device_id}\r\n"
+                  f"MyName: {C.MY_NAME}\r\n"
+                  f"X-Call-ID: {vimar_callid}\r\n"
+                  f"Content-Type: application/sdp\r\n"
+                  f"Content-Length: {len(sdp)}\r\n\r\n{sdp}")
+            return m
+
+        def _ack(to_tag, seq):
+            branch = _gen()
+            to_hdr = f"<{target_uri}>"
+            if to_tag:
+                to_hdr += f";tag={to_tag}"
+            return (f"ACK {target_uri} SIP/2.0\r\n"
+                    f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+                    f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
+                    f"Max-Forwards: 70\r\n"
+                    f"To: {to_hdr}\r\n"
+                    f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
+                    f"Call-ID: {cid}\r\n"
+                    f"CSeq: {seq} ACK\r\n"
+                    f"Content-Length: 0\r\n\r\n")
+
+        branch = _gen()
+        cur_seq = _next_cseq()
+        key = _open_transaction(branch, cur_seq, "INVITE", cid)
+        await send(_inv(branch, cur_seq))
+        await broadcast("log", "INVITE inviato...")
+
+        queue = pending_transactions[key]
+        deadline = time.monotonic() + 45
+
         while time.monotonic() < deadline:
             try:
                 raw = await asyncio.wait_for(queue.get(), timeout=3)
@@ -667,7 +752,6 @@ async def do_call(target=None):
                 await send(_ack(ttag, cur_seq))
                 ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
                 if not ch:
-                    _set_calling(False)
                     return False, f"Auth vuoto ({msg.code})"
                 auth = _make_auth("INVITE", target_uri, ch)
                 _close_transaction(key, cid, cur_seq, "INVITE")
@@ -703,16 +787,17 @@ async def do_call(target=None):
             if msg.code >= 300:
                 _LOGGER.error("INVITE rejected: %d", msg.code)
                 await send(_ack(ttag, cur_seq))
-                _set_calling(False)
                 reason = (msg.start_line.split(" ", 2)[2]
                           if msg.start_line.count(" ") >= 2 else str(msg.code))
                 return False, f"{msg.code} {reason}"
 
-        _set_calling(False)
         _LOGGER.error("INVITE timeout (45s) for %s", target_uri)
         return False, "Timeout (45s)"
     finally:
-        _close_transaction(key, cid, cur_seq, "INVITE")
+        if key is not None:
+            _close_transaction(key, cid, cur_seq, "INVITE")
+        if not in_call:
+            _set_calling(False)
 
 
 async def send_keyframe_request():
