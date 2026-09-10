@@ -2,42 +2,78 @@
   "config": {
     "step": {
       "user": {
-        "title": "Vimar Intercom",
-        "description": "Aggiungi il videocitofono Vimar Elvox. Le credenziali SIP sono integrate."
+        "title": "Videocitofono Vimar",
+        "description": "Apri l'app Vimar View, vai in Impostazioni → Sistema → Esporta configurazione e scansiona o copia il codice QR mostrato. Incolla qui l'intero contenuto.\n\nIl contenuto è cifrato: Home Assistant lo decifra localmente e salva le credenziali in questa voce di configurazione.",
+        "data": {
+          "qr_payload": "Contenuto del codice QR"
+        }
+      },
+      "confirm": {
+        "title": "Conferma il posto esterno",
+        "description": "Il codice QR è stato decifrato correttamente:\n\n- Utente SIP: {sip_user}\n- Dominio SIP: {sip_domain}\n- MAC del posto esterno: {mac}\n- Password: {password}\n\nSeleziona Invia per aggiungere il videocitofono."
+      },
+      "reconfigure": {
+        "title": "Aggiorna il codice QR",
+        "description": "Incolla un nuovo contenuto QR dall'app Vimar View. L'identità del dispositivo generata in precedenza viene mantenuta, così il cloud Vimar continua a riconoscere questa installazione.",
+        "data": {
+          "qr_payload": "Contenuto del codice QR"
+        }
       }
+    },
+    "error": {
+      "invalid_qr": "Non sembra un codice QR Vimar. Copia l'intera stringa, inclusi eventuali caratteri '=' finali."
+    },
+    "abort": {
+      "already_configured": "Questo videocitofono è già configurato.",
+      "single_instance_allowed": "È possibile configurare un solo videocitofono Vimar.",
+      "wrong_panel": "Questo codice QR appartiene a un altro posto esterno. Rimuovi prima la voce esistente.",
+      "reconfigure_successful": "Credenziali aggiornate."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opzioni Videocitofono Vimar",
+        "description": "Gli indirizzi dei posti esterni sono gli interni SIP dei tuoi posti esterni, separati da virgola. Aggiungi ':Nome' per assegnare un'etichetta, ad esempio '55001:Cancello, 55002:Portone'.",
+        "data": {
+          "panels": "Indirizzi dei posti esterni",
+          "door_command": "Comando di apertura porta",
+          "prefer_local": "Preferisci il posto esterno sulla rete locale",
+          "sip_port": "Porta del proxy SIP cloud",
+          "rtp_port_base": "Porta RTP di base"
+        }
+      }
+    },
+    "error": {
+      "invalid_panels": "Gli indirizzi devono essere interni SIP numerici, separati da virgola."
     }
   },
   "entity": {
     "camera": {
-      "videocitofono": {
-        "name": "Videocitofono"
-      }
+      "intercom": { "name": "Videocitofono" }
     },
     "lock": {
-      "serratura": {
-        "name": "Serratura"
-      }
+      "door": { "name": "Porta" }
     },
     "button": {
-      "chiama": {
-        "name": "Chiama"
-      },
-      "riaggancia": {
-        "name": "Riaggancia"
-      }
+      "call": { "name": "Chiama" },
+      "answer": { "name": "Rispondi" },
+      "hang_up": { "name": "Riaggancia" },
+      "open_door": { "name": "Apri porta" },
+      "reconnect": { "name": "Riconnetti" }
     },
     "event": {
-      "campanello": {
-        "name": "Campanello"
-      }
+      "doorbell": { "name": "Campanello" }
     },
     "binary_sensor": {
-      "registrazione_sip": {
-        "name": "Registrazione SIP"
-      },
-      "in_chiamata": {
-        "name": "In Chiamata"
-      }
+      "sip_registration": { "name": "Registrazione SIP" },
+      "in_call": { "name": "In chiamata" }
+    }
+  },
+  "issues": {
+    "registration_down": {
+      "title": "Il videocitofono Vimar non è registrato",
+      "description": "Il videocitofono non risulta registrato al cloud Vimar da più di cinque minuti, quindi il campanello non suonerà in Home Assistant. Home Assistant continua a riprovare. Verifica che il posto esterno sia acceso e che questo host raggiunga {proxy_host} sulla porta {proxy_port}."
     }
   }
 }

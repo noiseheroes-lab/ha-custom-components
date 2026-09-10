@@ -3,41 +3,77 @@
     "step": {
       "user": {
         "title": "Vimar Intercom",
-        "description": "Add the Vimar Elvox video intercom. SIP credentials are built-in."
+        "description": "Open the Vimar View app, go to Settings → System → Export configuration, and scan or copy the QR code it shows. Paste the whole payload below.\n\nThe payload is encrypted; Home Assistant decrypts it locally and stores the credentials in this config entry.",
+        "data": {
+          "qr_payload": "QR code payload"
+        }
+      },
+      "confirm": {
+        "title": "Confirm the panel",
+        "description": "The QR code decoded successfully:\n\n- SIP user: {sip_user}\n- SIP domain: {sip_domain}\n- Panel MAC: {mac}\n- Password: {password}\n\nSelect Submit to add the intercom."
+      },
+      "reconfigure": {
+        "title": "Update the QR code",
+        "description": "Paste a fresh QR payload from the Vimar View app. The existing device identity is kept so the Vimar cloud still recognises this installation.",
+        "data": {
+          "qr_payload": "QR code payload"
+        }
       }
+    },
+    "error": {
+      "invalid_qr": "That does not look like a Vimar QR payload. Copy the whole string, including any trailing '=' characters."
+    },
+    "abort": {
+      "already_configured": "This intercom is already set up.",
+      "single_instance_allowed": "Only one Vimar intercom can be set up.",
+      "wrong_panel": "That QR code belongs to a different panel. Remove the existing entry first.",
+      "reconfigure_successful": "The credentials were updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Vimar Intercom options",
+        "description": "Panel addresses are the SIP extensions of your entrance panels, comma separated. Add ':Name' to label one, for example '55001:Street Gate, 55002:Building Door'.",
+        "data": {
+          "panels": "Panel addresses",
+          "door_command": "Door open command",
+          "prefer_local": "Prefer the panel on the local network",
+          "sip_port": "Cloud SIP proxy port",
+          "rtp_port_base": "RTP base port"
+        }
+      }
+    },
+    "error": {
+      "invalid_panels": "Panel addresses must be numeric SIP extensions, comma separated."
     }
   },
   "entity": {
     "camera": {
-      "videocitofono": {
-        "name": "Video Intercom"
-      }
+      "intercom": { "name": "Intercom" }
     },
     "lock": {
-      "serratura": {
-        "name": "Door Lock"
-      }
+      "door": { "name": "Door" }
     },
     "button": {
-      "chiama": {
-        "name": "Call"
-      },
-      "riaggancia": {
-        "name": "Hang Up"
-      }
+      "call": { "name": "Call" },
+      "answer": { "name": "Answer" },
+      "hang_up": { "name": "Hang up" },
+      "open_door": { "name": "Open door" },
+      "reconnect": { "name": "Reconnect" }
     },
     "event": {
-      "campanello": {
-        "name": "Doorbell"
-      }
+      "doorbell": { "name": "Doorbell" }
     },
     "binary_sensor": {
-      "registrazione_sip": {
-        "name": "SIP Registration"
-      },
-      "in_chiamata": {
-        "name": "In Call"
-      }
+      "sip_registration": { "name": "SIP registration" },
+      "in_call": { "name": "In call" }
+    }
+  },
+  "issues": {
+    "registration_down": {
+      "title": "Vimar Intercom is not registered",
+      "description": "The intercom has not been registered with the Vimar cloud for more than five minutes, so the doorbell will not ring in Home Assistant. Home Assistant keeps retrying. Check that the panel is online and that this host can reach {proxy_host} on port {proxy_port}."
     }
   }
 }
