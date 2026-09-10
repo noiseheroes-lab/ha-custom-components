@@ -2341,7 +2341,13 @@ async def connection_supervisor() -> None:
             if not await do_register():
                 raise ConnectionError("registration was refused")
             attempt = 0
-            await do_connect_profiles()
+            try:
+                await do_connect_profiles()
+            except Exception as err:  # noqa: BLE001 - optional, never fatal
+                # A plant that rejects connectProfiles is still usable:
+                # the registration is what matters. Failing here would
+                # spin the supervisor forever on a healthy connection.
+                _LOGGER.warning("connectProfiles failed (%s); continuing", err)
             await _reader_loop()
             raise ConnectionError("connection closed by the server")
         except asyncio.CancelledError:
@@ -3774,7 +3780,15 @@ Expected: `CAMERA_OK`, and every `requires_auth` line reads `requires_auth = Tru
 
 If `homeassistant.components.http.auth.async_sign_path` does not exist in the target HA version, import it from `homeassistant.components.http` instead; the reviewer must confirm against the installed HA before approving.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Re-run the full definition of done**
+
+The camera work lands after the documentation task, so Task 11's checks ran
+before this code existed. Run the whole block from **Task 11, step 6** again,
+unchanged, and report each line's result. Every line must still print `PASS`
+and the suite must still be green. If `docker` cannot start, say so in the
+report rather than marking those two lines passed.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 git add custom_components/vimar_intercom/camera.py
