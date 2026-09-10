@@ -17,10 +17,13 @@ from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_DEVICE_ID,
+    CONF_DEVICE_UUID,
     CONF_DOOR_COMMAND,
     CONF_MAC,
     CONF_PANELS,
     CONF_PREFER_LOCAL,
+    CONF_PUSH_TOKEN,
     CONF_RTP_PORT_BASE,
     CONF_SIP_DOMAIN,
     CONF_SIP_PORT,
@@ -53,7 +56,6 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialise the flow state."""
         self._entry_data: dict[str, Any] | None = None
-        self._summary: dict[str, str] = {}
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -111,7 +113,7 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
                 data = entry_data_from_qr(fields)
                 # Keep the identity generated at first setup: the Vimar
                 # cloud tracks the registration by it.
-                for key in ("device_id", "device_uuid", "push_token"):
+                for key in (CONF_DEVICE_ID, CONF_DEVICE_UUID, CONF_PUSH_TOKEN):
                     data[key] = entry.data.get(key, data[key])
                 await self.async_set_unique_id(
                     data[CONF_MAC] or data[CONF_SIP_USER])
@@ -136,7 +138,6 @@ class VimarIntercomOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         """Show and save the options."""
         errors: dict[str, str] = {}
-        options = self.config_entry.options
 
         if user_input is not None:
             try:
@@ -147,26 +148,32 @@ class VimarIntercomOptionsFlow(OptionsFlow):
             else:
                 return self.async_create_entry(data=user_input)
 
+        # Redisplay what the user actually submitted, falling back to the
+        # saved options. Rebuilding the form from the saved options alone
+        # would silently discard every other edit they made alongside the
+        # one that failed validation.
+        current = {**self.config_entry.options, **(user_input or {})}
+
         schema = vol.Schema({
             vol.Required(
                 CONF_PANELS,
-                default=options.get(CONF_PANELS, DEFAULT_PANELS),
+                default=current.get(CONF_PANELS, DEFAULT_PANELS),
             ): str,
             vol.Required(
                 CONF_DOOR_COMMAND,
-                default=options.get(CONF_DOOR_COMMAND, DEFAULT_DOOR_COMMAND),
+                default=current.get(CONF_DOOR_COMMAND, DEFAULT_DOOR_COMMAND),
             ): str,
             vol.Required(
                 CONF_PREFER_LOCAL,
-                default=options.get(CONF_PREFER_LOCAL, False),
+                default=current.get(CONF_PREFER_LOCAL, False),
             ): bool,
             vol.Required(
                 CONF_SIP_PORT,
-                default=options.get(CONF_SIP_PORT, DEFAULT_SIP_PORT),
+                default=current.get(CONF_SIP_PORT, DEFAULT_SIP_PORT),
             ): vol.All(int, vol.Range(min=1, max=65535)),
             vol.Required(
                 CONF_RTP_PORT_BASE,
-                default=options.get(CONF_RTP_PORT_BASE, DEFAULT_RTP_PORT_BASE),
+                default=current.get(CONF_RTP_PORT_BASE, DEFAULT_RTP_PORT_BASE),
             ): vol.All(int, vol.Range(min=1024, max=50000)),
         })
 
