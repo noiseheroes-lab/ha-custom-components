@@ -12,8 +12,30 @@ import logging
 
 from . import const as C
 from . import media_handler as media
+from .runtime import RuntimeConfig
+from .sip_parser import (
+    ParsedMessage,
+    call_id_key,
+    granted_expiry,
+    header_params,
+    parse_message,
+    response_keys,
+    tag_of,
+    transaction_key,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# Set once by the hub at start-up. The integration declares
+# single_config_entry, so one module-global config is correct.
+CFG: RuntimeConfig | None = None
+
+
+def configure(cfg: RuntimeConfig) -> None:
+    """Install the runtime configuration for this SIP client."""
+    global CFG
+    CFG = cfg
+
 
 # ─── Broadcast callback (set by hub) ────────────────────────────────
 _broadcast = None
@@ -53,8 +75,23 @@ call_state = {
     "remote_contact": None, "remote_sdp": None, "original_target": None,
 }
 
-pending_responses: dict[str, asyncio.Queue] = {}
+pending_transactions: dict[str, asyncio.Queue] = {}
 incoming_requests: asyncio.Queue = None
+
+
+def _open_transaction(branch: str, seq: int, method: str, call_id: str) -> str:
+    """Register a transaction and return its key."""
+    key = transaction_key(branch, seq, method)
+    queue: asyncio.Queue = asyncio.Queue()
+    pending_transactions[key] = queue
+    pending_transactions[call_id_key(call_id, seq, method)] = queue
+    return key
+
+
+def _close_transaction(key: str, call_id: str, seq: int, method: str) -> None:
+    """Forget a transaction and its Call-ID fallback."""
+    pending_transactions.pop(key, None)
+    pending_transactions.pop(call_id_key(call_id, seq, method), None)
 
 
 def set_state_callback(cb):
@@ -92,28 +129,21 @@ def _set_calling(val: bool):
 
 
 def get_local_ip():
-    """Detect local IP by connecting to the SIP proxy (cloud)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # Use cloud proxy for detection — always reachable
-        s.connect((C.SIP_PROXY, C.SIP_PORT))
-        ip = s.getsockname()[0]
-        _LOGGER.info("Detected local IP: %s", ip)
-        return ip
-    except Exception:
-        # Fallback: try local Tab5S
+    """Detect the local IP by opening a UDP socket toward the proxy."""
+    for host, port in ((CFG.proxy_host, CFG.proxy_port),
+                       (CFG.local_proxy, CFG.local_sip_port)):
+        if not host:
+            continue
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s2.connect((C.LOCAL_PROXY, C.LOCAL_SIP_PORT))
-            ip = s2.getsockname()[0]
-            s2.close()
-            _LOGGER.info("Detected local IP (via Tab5S): %s", ip)
-            return ip
-        except Exception:
-            _LOGGER.warning("IP detection failed, using fallback")
-            return "0.0.0.0"
-    finally:
-        s.close()
+            sock.connect((host, port))
+            return sock.getsockname()[0]
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    _LOGGER.warning("Could not determine the local IP address")
+    return "0.0.0.0"
 
 
 def _gen(prefix="z9hG4bK"):
@@ -129,13 +159,13 @@ def _next_cseq():
 # ─── Digest Auth ────────────────────────────────────────────────────
 
 def _compute_ha1(realm):
-    if realm == C.SIP_DOMAIN:
-        return C.SIP_HA1
-    return hashlib.md5(f"{C.SIP_USER}:{realm}:{C.SIP_PASSWORD}".encode()).hexdigest()
+    if realm == CFG.sip_domain:
+        return CFG.sip_ha1
+    return hashlib.md5(f"{CFG.sip_user}:{realm}:{CFG.sip_password}".encode()).hexdigest()
 
 
 def _digest_resp(method, uri, nonce, realm=None, qop=None, nc=None, cnonce=None):
-    ha1 = _compute_ha1(realm or C.SIP_DOMAIN)
+    ha1 = _compute_ha1(realm or CFG.sip_domain)
     ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
     if qop == "auth":
         return hashlib.md5(
@@ -145,25 +175,21 @@ def _digest_resp(method, uri, nonce, realm=None, qop=None, nc=None, cnonce=None)
 
 
 def _make_auth(method, uri, challenge):
-    p = {}
-    for item in challenge.replace("Digest ", "").split(","):
-        if "=" in item:
-            k, v = item.strip().split("=", 1)
-            p[k.strip()] = v.strip().strip('"')
+    p = header_params(challenge)
     nonce = p.get("nonce", "")
-    realm = p.get("realm", C.SIP_DOMAIN)
+    realm = p.get("realm", CFG.sip_domain)
     opaque = p.get("opaque", "")
     qop = p.get("qop", "")
     nc = "00000001"
     cnonce = f"{random.randint(10**7, 10**8-1):08x}"
     if "auth" in qop:
         resp = _digest_resp(method, uri, nonce, realm, "auth", nc, cnonce)
-        hdr = (f'Digest username="{C.SIP_USER}", realm="{realm}", '
+        hdr = (f'Digest username="{CFG.sip_user}", realm="{realm}", '
                f'nonce="{nonce}", uri="{uri}", response="{resp}", '
                f'algorithm=MD5, qop=auth, nc={nc}, cnonce="{cnonce}"')
     else:
         resp = _digest_resp(method, uri, nonce, realm)
-        hdr = (f'Digest username="{C.SIP_USER}", realm="{realm}", '
+        hdr = (f'Digest username="{CFG.sip_user}", realm="{realm}", '
                f'nonce="{nonce}", uri="{uri}", response="{resp}", '
                f'algorithm=MD5')
     if opaque:
@@ -187,9 +213,9 @@ async def connect():
     global reader, writer, lock
     loop = asyncio.get_event_loop()
     ctx = await loop.run_in_executor(None, _create_ssl_context)
-    _LOGGER.info("Connecting to SIP proxy %s:%d...", C.SIP_PROXY, C.SIP_PORT)
+    _LOGGER.info("Connecting to SIP proxy %s:%d...", CFG.proxy_host, CFG.proxy_port)
     reader, writer = await asyncio.open_connection(
-        C.SIP_PROXY, C.SIP_PORT, ssl=ctx, server_hostname=C.SIP_SNI)
+        CFG.proxy_host, CFG.proxy_port, ssl=ctx, server_hostname=CFG.sni)
     lock = asyncio.Lock()
     _LOGGER.info("SIP TLS connected")
 
@@ -233,45 +259,6 @@ async def send(msg: str):
     except Exception as e:
         _LOGGER.error("[SIP >>>] send failed: %s", e)
         raise
-
-
-def _parse(msg):
-    parts = msg.split("\r\n\r\n", 1)
-    body = parts[1] if len(parts) > 1 else ""
-    lines = parts[0].split("\r\n")
-    first = lines[0]
-    code = method = None
-    if first.startswith("SIP/2.0"):
-        try:
-            code = int(first.split()[1])
-        except (ValueError, IndexError):
-            pass
-    else:
-        method = first.split()[0] if first else None
-    hdrs = {}
-    via_list = []
-    for line in lines[1:]:
-        if ":" in line:
-            k, v = line.split(":", 1)
-            key = k.strip().lower()
-            if key == "via":
-                via_list.append(v.strip())
-            hdrs[key] = v.strip()
-    if via_list:
-        hdrs["_via_all"] = via_list
-    return (code or method), hdrs, body, first
-
-
-def _call_id(hdrs):
-    return hdrs.get("call-id", "")
-
-
-def _tag(header_val):
-    for part in header_val.split(";"):
-        part = part.strip()
-        if part.startswith("tag="):
-            return part[4:]
-    return ""
 
 
 # ─── Reader task ────────────────────────────────────────────────────
@@ -327,38 +314,48 @@ async def reader_task():
             raw = buf[:total].decode(errors="replace")
             buf = buf[total:]
 
-            kind, hdrs, body, first = _parse(raw)
-            cid = _call_id(hdrs)
-            _LOGGER.debug("[SIP <<<] %s", first)
+            msg = parse_message(raw)
+            _LOGGER.debug("[SIP <<<] %s", msg.start_line)
 
-            if isinstance(kind, int):
-                if cid in pending_responses:
-                    _LOGGER.debug("reader: queuing response %d for cid=%s", kind, cid[:24])
-                    await pending_responses[cid].put(raw)
+            if msg.code is not None:
+                queue = None
+                for key in response_keys(msg):
+                    queue = pending_transactions.get(key)
+                    if queue is not None:
+                        break
+                if queue is not None:
+                    await queue.put(raw)
                 else:
-                    _LOGGER.warning("Stale response %d for cid=%s (known: %s)", kind, cid[:24],
-                                    list(pending_responses.keys())[:3])
-            elif isinstance(kind, str):
+                    _LOGGER.debug(
+                        "Response %d matched no open transaction (%s)",
+                        msg.code, msg.start_line)
+            elif msg.method is not None:
                 await incoming_requests.put(raw)
 
 
-async def _wait_final(cid, timeout=15):
-    q = pending_responses.setdefault(cid, asyncio.Queue())
-    results = []
-    deadline = time.time() + timeout
-    while True:
-        rem = deadline - time.time()
-        if rem <= 0:
-            break
-        try:
-            raw = await asyncio.wait_for(q.get(), timeout=min(rem, 3))
-            results.append(raw)
-            kind, *_ = _parse(raw)
-            if isinstance(kind, int) and kind >= 200:
+async def _wait_final(key: str, call_id: str, seq: int, method: str,
+                       timeout: float = 15) -> list[str]:
+    """Collect responses for one transaction until a final one arrives."""
+    queue = pending_transactions.get(key)
+    if queue is None:
+        return []
+    results: list[str] = []
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-        except asyncio.TimeoutError:
-            continue
-    pending_responses.pop(cid, None)
+            try:
+                raw = await asyncio.wait_for(queue.get(), timeout=min(remaining, 3))
+            except asyncio.TimeoutError:
+                continue
+            results.append(raw)
+            msg = parse_message(raw)
+            if msg.code is not None and msg.code >= 200:
+                break
+    finally:
+        _close_transaction(key, call_id, seq, method)
     return results
 
 
@@ -382,7 +379,7 @@ def build_sdp():
         f"b=AS:512\r\n"
         f"t=0 0\r\n"
         f"a=rtcp-xr:rcvr-rtt=all:10000 stat-summary=loss,dup,jitt,TTL voip-metrics\r\n"
-        f"m=audio {C.RTP_AUDIO_PORT} RTP/SAVP 0 8 101\r\n"
+        f"m=audio {CFG.rtp_audio_port} RTP/SAVP 0 8 101\r\n"
         f"a=rtpmap:0 PCMU/8000\r\n"
         f"a=rtpmap:8 PCMA/8000\r\n"
         f"a=rtpmap:101 telephone-event/8000\r\n"
@@ -390,7 +387,7 @@ def build_sdp():
         f"a=ptime:20\r\n"
         f"a=sendrecv\r\n"
         f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_local_crypto_key}\r\n"
-        f"m=video {C.RTP_VIDEO_PORT} RTP/SAVP 96\r\n"
+        f"m=video {CFG.rtp_video_port} RTP/SAVP 96\r\n"
         f"b=AS:256\r\n"
         f"a=rtpmap:96 H264/90000\r\n"
         f"a=fmtp:96 profile-level-id=42801F;packetization-mode=1\r\n"
@@ -446,32 +443,31 @@ async def do_register():
     global local_tag
     local_tag = _gen("")
     cid = _gen("reg-")
-    uri = f"sip:{C.SIP_DOMAIN}"
+    uri = f"sip:{CFG.sip_domain}"
 
-    def _msg(auth=None, seq=1):
-        branch = _gen()
-        contact_uri = f"sip:{C.SIP_USER}@{MY_IP}:5070;transport=tls"
-        if C.PN_TOKEN:
+    def _msg(branch, seq, auth=None):
+        contact_uri = f"sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls"
+        if CFG.push_token:
             contact_uri += (f";app-id={C.PN_APP_ID}"
                            f";pn-type={C.PN_TYPE}"
-                           f";pn-tok={C.PN_TOKEN}"
+                           f";pn-tok={CFG.push_token}"
                            f";pn-msg-str=IM_MSG;pn-msg-snd=msg.caf"
                            f";pn-call-str=IC_MSG;pn-call-snd=notes_of_the_optimistic.caf"
-                           f";q=0.00;domain-name={C.SIP_DOMAIN}")
+                           f";q=0.00;domain-name={CFG.sip_domain}")
         contact = f"<{contact_uri}>"
-        contact += f';+sip.instance="<urn:uuid:{C.DEVICE_UUID}>"'
-        contact += f";expires={'5184000' if C.PN_TOKEN else '3600'}"
+        contact += f';+sip.instance="<urn:uuid:{CFG.device_uuid}>"'
+        contact += f";expires={'5184000' if CFG.push_token else '3600'}"
         m = (f"REGISTER {uri} SIP/2.0\r\n"
-             f"Via: SIP/2.0/TLS {MY_IP}:5070;branch={branch};rport\r\n"
-             f"Route: <sip:{C.SIP_ROUTE};transport=tls;lr>\r\n"
+             f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+             f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
              f"Max-Forwards: 70\r\n"
-             f"To: <sip:{C.SIP_USER}@{C.SIP_DOMAIN}>\r\n"
-             f"From: <sip:{C.SIP_USER}@{C.SIP_DOMAIN}>;tag={local_tag}\r\n"
+             f"To: <sip:{CFG.sip_user}@{CFG.sip_domain}>\r\n"
+             f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={local_tag}\r\n"
              f"Call-ID: {cid}\r\n"
              f"CSeq: {seq} REGISTER\r\n"
              f"Contact: {contact}\r\n"
-             f"User-Agent: {C.USER_AGENT}\r\n"
-             f"Mobile-IMEI: {C.DEVICE_IMEI}\r\n"
+             f"User-Agent: {CFG.user_agent}\r\n"
+             f"Mobile-IMEI: {CFG.device_id}\r\n"
              f"MyName: {C.MY_NAME}\r\n"
              f"Supported: replaces,outbound,gruu\r\n"
              f"Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,NOTIFY,INFO,MESSAGE,UPDATE\r\n")
@@ -479,27 +475,35 @@ async def do_register():
             m += f"Authorization: {auth}\r\n"
         return m + "Content-Length: 0\r\n\r\n"
 
-    s1 = _next_cseq()
-    await send(_msg(seq=s1))
-    resps = await _wait_final(cid)
+    branch = _gen()
+    seq = _next_cseq()
+    key = _open_transaction(branch, seq, "REGISTER", cid)
+    await send(_msg(branch, seq))
+    responses = await _wait_final(key, cid, seq, "REGISTER")
 
-    for r in resps:
-        code, hdrs, *_ = _parse(r)
-        if code == 401:
-            ch = hdrs.get("www-authenticate", "")
+    for raw in responses:
+        msg = parse_message(raw)
+        if msg.code == 401:
+            ch = msg.headers.get("www-authenticate", "")
             if not ch:
                 return False
             auth = _make_auth("REGISTER", uri, ch)
-            await send(_msg(auth=auth, seq=_next_cseq()))
-            for r2 in await _wait_final(cid):
-                if _parse(r2)[0] == 200:
+            branch2 = _gen()
+            seq2 = _next_cseq()
+            key2 = _open_transaction(branch2, seq2, "REGISTER", cid)
+            await send(_msg(branch2, seq2, auth=auth))
+            for raw2 in await _wait_final(key2, cid, seq2, "REGISTER"):
+                msg2 = parse_message(raw2)
+                if msg2.code == 200:
+                    expiry = granted_expiry(msg2, CFG.sip_user, 3600)
                     _set_registered(True)
-                    _LOGGER.info("SIP registered successfully")
+                    _LOGGER.info("SIP registered successfully (expires=%ds)", expiry)
                     return True
             return False
-        elif code == 200:
+        elif msg.code == 200:
+            expiry = granted_expiry(msg, CFG.sip_user, 3600)
             _set_registered(True)
-            _LOGGER.info("SIP registered successfully")
+            _LOGGER.info("SIP registered successfully (expires=%ds)", expiry)
             return True
     return False
 
@@ -512,19 +516,18 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
     ftag = _gen("")
     cid = _gen("sys-")
 
-    def _msg(auth=None, seq=1):
-        branch = _gen()
+    def _msg(branch, seq, auth=None):
         m = (f"MESSAGE {target_uri} SIP/2.0\r\n"
-             f"Via: SIP/2.0/TLS {MY_IP}:5070;branch={branch};rport\r\n"
-             f"Route: <sip:{C.SIP_ROUTE};transport=tls;lr>\r\n"
+             f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+             f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
              f"Max-Forwards: 70\r\n"
              f"To: <{target_uri}>\r\n"
-             f"From: <sip:{C.SIP_USER}@{C.SIP_DOMAIN}>;tag={ftag}\r\n"
+             f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
              f"Call-ID: {cid}\r\n"
              f"CSeq: {seq} MESSAGE\r\n"
-             f"Contact: <sip:{C.SIP_USER}@{MY_IP}:5070;transport=tls>\r\n"
-             f"User-Agent: {C.USER_AGENT}\r\n"
-             f"Mobile-IMEI: {C.DEVICE_IMEI}\r\n"
+             f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>\r\n"
+             f"User-Agent: {CFG.user_agent}\r\n"
+             f"Mobile-IMEI: {CFG.device_id}\r\n"
              f"MyName: {C.MY_NAME}\r\n")
         if extra_headers:
             for k, v in extra_headers.items():
@@ -535,30 +538,36 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
               f"Content-Length: {len(body_text)}\r\n\r\n{body_text}")
         return m
 
-    await send(_msg(seq=_next_cseq()))
-    for r in await _wait_final(cid, timeout=15):
-        code, hdrs, *_ = _parse(r)
-        _LOGGER.info("do_system_message: response %s for %s", code, target_uri)
-        if code and code < 200:
+    branch = _gen()
+    seq = _next_cseq()
+    key = _open_transaction(branch, seq, "MESSAGE", cid)
+    await send(_msg(branch, seq))
+    for raw in await _wait_final(key, cid, seq, "MESSAGE", timeout=15):
+        msg = parse_message(raw)
+        _LOGGER.info("do_system_message: response %s for %s", msg.code, target_uri)
+        if msg.code and msg.code < 200:
             continue
-        if code in (401, 407):
-            ch = hdrs.get("proxy-authenticate", "") or hdrs.get("www-authenticate", "")
+        if msg.code in (401, 407):
+            ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
             if not ch:
-                return False, f"Auth vuoto ({code})"
+                return False, f"Auth vuoto ({msg.code})"
             auth = _make_auth("MESSAGE", target_uri, ch)
-            await send(_msg(auth=auth, seq=_next_cseq()))
-            for r2 in await _wait_final(cid, timeout=15):
-                c2 = _parse(r2)[0]
-                _LOGGER.info("do_system_message: auth response %s for %s", c2, target_uri)
-                if c2 and 200 <= c2 < 300:
-                    return True, f"OK ({c2})"
-                if c2 and c2 >= 300:
-                    return False, f"Errore: {c2}"
+            branch2 = _gen()
+            seq2 = _next_cseq()
+            key2 = _open_transaction(branch2, seq2, "MESSAGE", cid)
+            await send(_msg(branch2, seq2, auth=auth))
+            for raw2 in await _wait_final(key2, cid, seq2, "MESSAGE", timeout=15):
+                msg2 = parse_message(raw2)
+                _LOGGER.info("do_system_message: auth response %s for %s", msg2.code, target_uri)
+                if msg2.code and 200 <= msg2.code < 300:
+                    return True, f"OK ({msg2.code})"
+                if msg2.code and msg2.code >= 300:
+                    return False, f"Errore: {msg2.code}"
             return False, "Timeout"
-        if code and 200 <= code < 300:
-            return True, f"OK ({code})"
-        if code and code >= 300:
-            return False, f"Errore: {code}"
+        if msg.code and 200 <= msg.code < 300:
+            return True, f"OK ({msg.code})"
+        if msg.code and msg.code >= 300:
+            return False, f"Errore: {msg.code}"
     return False, "Timeout"
 
 
@@ -572,7 +581,7 @@ async def do_call(target=None):
         return False, "Già in chiamata"
 
     _set_calling(True)
-    target_uri = target or C.INTERCOM
+    target_uri = target or CFG.panel_uri(CFG.default_panel.address)
     _LOGGER.info("do_call: target=%s", target_uri)
     ftag = _gen("")
     cid = _gen("call-")
@@ -583,26 +592,25 @@ async def do_call(target=None):
 
     vimar_callid = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
 
-    def _inv(auth=None, seq=1):
-        branch = _gen()
+    def _inv(branch, seq, auth=None):
         m = (f"INVITE {target_uri} SIP/2.0\r\n"
-             f"Via: SIP/2.0/TLS {MY_IP}:5070;branch={branch};rport\r\n"
-             f"Route: <sip:{C.SIP_ROUTE};transport=tls;lr>\r\n"
+             f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+             f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
              f"Max-Forwards: 70\r\n"
              f"To: <{target_uri}>\r\n"
-             f"From: <sip:{C.SIP_USER}@{C.SIP_DOMAIN}>;tag={ftag}\r\n"
+             f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
              f"Call-ID: {cid}\r\n"
              f"CSeq: {seq} INVITE\r\n"
-             f"Contact: <sip:{C.SIP_USER}@{MY_IP}:5070;transport=tls>"
-             f';+sip.instance="<urn:uuid:{C.DEVICE_UUID}>"\r\n'
-             f"User-Agent: {C.USER_AGENT}\r\n"
+             f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>"
+             f';+sip.instance="<urn:uuid:{CFG.device_uuid}>"\r\n'
+             f"User-Agent: {CFG.user_agent}\r\n"
              f"Supported: replaces,outbound,gruu,timer\r\n"
              f"Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,NOTIFY,INFO,MESSAGE,UPDATE\r\n"
              f"Session-Expires: 600;refresher=uas\r\n"
              f"Min-SE: 90\r\n")
         if auth:
             m += f"Proxy-Authorization: {auth}\r\n"
-        m += (f"Mobile-IMEI: {C.DEVICE_IMEI}\r\n"
+        m += (f"Mobile-IMEI: {CFG.device_id}\r\n"
               f"MyName: {C.MY_NAME}\r\n"
               f"X-Call-ID: {vimar_callid}\r\n"
               f"Content-Type: application/sdp\r\n"
@@ -615,96 +623,104 @@ async def do_call(target=None):
         if to_tag:
             to_hdr += f";tag={to_tag}"
         return (f"ACK {target_uri} SIP/2.0\r\n"
-                f"Via: SIP/2.0/TLS {MY_IP}:5070;branch={branch};rport\r\n"
-                f"Route: <sip:{C.SIP_ROUTE};transport=tls;lr>\r\n"
+                f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+                f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
                 f"Max-Forwards: 70\r\n"
                 f"To: {to_hdr}\r\n"
-                f"From: <sip:{C.SIP_USER}@{C.SIP_DOMAIN}>;tag={ftag}\r\n"
+                f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
                 f"Call-ID: {cid}\r\n"
                 f"CSeq: {seq} ACK\r\n"
                 f"Content-Length: 0\r\n\r\n")
 
+    branch = _gen()
     cur_seq = _next_cseq()
-    await send(_inv(seq=cur_seq))
+    key = _open_transaction(branch, cur_seq, "INVITE", cid)
+    await send(_inv(branch, cur_seq))
     await broadcast("log", "INVITE inviato...")
 
-    q = pending_responses.setdefault(cid, asyncio.Queue())
-    _LOGGER.debug("do_call: cid=%s, q id=%s, pending_keys=%s", cid[:24], id(q), list(pending_responses.keys())[:3])
-    deadline = time.time() + 45
+    queue = pending_transactions[key]
+    deadline = time.monotonic() + 45
 
-    while time.time() < deadline:
-        _LOGGER.debug("do_call: waiting q.get (qsize=%d, cid_in_pending=%s, q_is_same=%s)",
-                       q.qsize(), cid in pending_responses, pending_responses.get(cid) is q)
-        try:
-            raw = await asyncio.wait_for(q.get(), timeout=3)
-        except asyncio.TimeoutError:
-            _LOGGER.debug("do_call: q.get timeout (qsize=%d)", q.qsize())
-            continue
+    # A raise anywhere below (parse_sdp, media.setup_media,
+    # send_keyframe_request, _make_auth) must not strand the transaction
+    # that is open at that moment — close whichever one is current on
+    # every exit. The authenticated-retry branch closes the first
+    # transaction itself before opening the second, so each transaction
+    # this call opens is still closed exactly once.
+    try:
+        while time.monotonic() < deadline:
+            try:
+                raw = await asyncio.wait_for(queue.get(), timeout=3)
+            except asyncio.TimeoutError:
+                continue
 
-        code, hdrs, body, first = _parse(raw)
-        ttag = _tag(hdrs.get("to", ""))
-        _LOGGER.debug("do_call: response %s (body=%dB)", code, len(body) if body else 0)
+            msg = parse_message(raw)
+            ttag = tag_of(msg.headers.get("to", ""))
+            _LOGGER.debug("do_call: response %s (body=%dB)", msg.code, len(msg.body) if msg.body else 0)
 
-        if code in (100, 180, 183):
-            if code == 183 and body:
-                call_state["remote_sdp"] = parse_sdp(body)
-            continue
+            if msg.code in (100, 180, 183):
+                if msg.code == 183 and msg.body:
+                    call_state["remote_sdp"] = parse_sdp(msg.body)
+                continue
 
-        if code in (401, 407):
-            await send(_ack(ttag, cur_seq))
-            ch = hdrs.get("proxy-authenticate", "") or hdrs.get("www-authenticate", "")
-            if not ch:
-                pending_responses.pop(cid, None)
+            if msg.code in (401, 407):
+                await send(_ack(ttag, cur_seq))
+                ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
+                if not ch:
+                    _set_calling(False)
+                    return False, f"Auth vuoto ({msg.code})"
+                auth = _make_auth("INVITE", target_uri, ch)
+                _close_transaction(key, cid, cur_seq, "INVITE")
+                branch = _gen()
+                cur_seq = _next_cseq()
+                key = _open_transaction(branch, cur_seq, "INVITE", cid)
+                queue = pending_transactions[key]
+                await send(_inv(branch, cur_seq, auth=auth))
+                continue
+
+            if 200 <= msg.code < 300:
+                call_state["to_tag"] = ttag
+                raw_contact = msg.headers.get("contact", "")
+                if "<" in raw_contact and ">" in raw_contact:
+                    call_state["remote_contact"] = raw_contact[raw_contact.index("<")+1:raw_contact.index(">")]
+                else:
+                    call_state["remote_contact"] = raw_contact
+                await send(_ack(ttag, cur_seq))
+
+                if msg.body:
+                    remote = parse_sdp(msg.body)
+                    call_state["remote_sdp"] = remote
+                    _LOGGER.info("SDP: audio=%s video=%s", remote.get('audio', {}), remote.get('video', {}))
+                    await media.setup_media(remote, _local_crypto_key, _local_video_crypto_key)
+
+                _set_in_call(True)
                 _set_calling(False)
-                return False, f"Auth vuoto ({code})"
-            auth = _make_auth("INVITE", target_uri, ch)
-            cur_seq = _next_cseq()
-            await send(_inv(auth=auth, seq=cur_seq))
-            continue
+                await broadcast("call_started", "Connesso!")
+                # Request keyframe immediately — no delay
+                await send_keyframe_request()
+                return True, "Connesso!"
 
-        if 200 <= code < 300:
-            call_state["to_tag"] = ttag
-            raw_contact = hdrs.get("contact", "")
-            if "<" in raw_contact and ">" in raw_contact:
-                call_state["remote_contact"] = raw_contact[raw_contact.index("<")+1:raw_contact.index(">")]
-            else:
-                call_state["remote_contact"] = raw_contact
-            await send(_ack(ttag, cur_seq))
+            if msg.code >= 300:
+                _LOGGER.error("INVITE rejected: %d", msg.code)
+                await send(_ack(ttag, cur_seq))
+                _set_calling(False)
+                reason = (msg.start_line.split(" ", 2)[2]
+                          if msg.start_line.count(" ") >= 2 else str(msg.code))
+                return False, f"{msg.code} {reason}"
 
-            if body:
-                remote = parse_sdp(body)
-                call_state["remote_sdp"] = remote
-                _LOGGER.info("SDP: audio=%s video=%s", remote.get('audio', {}), remote.get('video', {}))
-                await media.setup_media(remote, _local_crypto_key, _local_video_crypto_key)
-
-            _set_in_call(True)
-            _set_calling(False)
-            await broadcast("call_started", "Connesso!")
-            # Request keyframe immediately — no delay
-            await send_keyframe_request()
-            pending_responses.pop(cid, None)
-            return True, "Connesso!"
-
-        if code >= 300:
-            _LOGGER.error("INVITE rejected: %d", code)
-            await send(_ack(ttag, cur_seq))
-            pending_responses.pop(cid, None)
-            _set_calling(False)
-            reason = first.split(" ", 2)[2] if first.count(" ") >= 2 else str(code)
-            return False, f"{code} {reason}"
-
-    pending_responses.pop(cid, None)
-    _set_calling(False)
-    _LOGGER.error("INVITE timeout (45s) for %s", target_uri)
-    return False, "Timeout (45s)"
+        _set_calling(False)
+        _LOGGER.error("INVITE timeout (45s) for %s", target_uri)
+        return False, "Timeout (45s)"
+    finally:
+        _close_transaction(key, cid, cur_seq, "INVITE")
 
 
 async def send_keyframe_request():
     """Send SIP INFO picture_fast_update to get a video keyframe (SPS/PPS)."""
     if not in_call or not call_state["call_id"]:
         return
-    info_target = call_state.get("remote_contact") or C.INTERCOM
-    to_uri = call_state.get("original_target") or C.INTERCOM
+    info_target = call_state.get("remote_contact") or CFG.panel_uri(CFG.default_panel.address)
+    to_uri = call_state.get("original_target") or CFG.panel_uri(CFG.default_panel.address)
     seq = _next_cseq()
     body = ('<?xml version="1.0" encoding="utf-8" ?>'
             '<media_control><vc_primitive><to_encoder>'
@@ -712,11 +728,11 @@ async def send_keyframe_request():
             '</to_encoder></vc_primitive></media_control>')
     msg = (
         f"INFO {info_target} SIP/2.0\r\n"
-        f"Via: SIP/2.0/TLS {MY_IP}:5070;branch={_gen()};rport\r\n"
-        f"Route: <sip:{C.SIP_ROUTE};transport=tls;lr>\r\n"
+        f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={_gen()};rport\r\n"
+        f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
         f"Max-Forwards: 70\r\n"
         f"To: <{to_uri}>;tag={call_state['to_tag']}\r\n"
-        f"From: <sip:{C.SIP_USER}@{C.SIP_DOMAIN}>;tag={call_state['from_tag']}\r\n"
+        f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={call_state['from_tag']}\r\n"
         f"Call-ID: {call_state['call_id']}\r\n"
         f"CSeq: {seq} INFO\r\n"
         f"Content-Type: application/media_control+xml\r\n"
@@ -737,24 +753,27 @@ async def do_hangup():
     ftag = call_state["from_tag"] or local_tag or _gen("")
     ttag = call_state["to_tag"] or ""
 
-    target_uri = call_state.get("remote_contact") or C.INTERCOM
-    to_uri = call_state.get("original_target") or C.INTERCOM
+    target_uri = call_state.get("remote_contact") or CFG.panel_uri(CFG.default_panel.address)
+    to_uri = call_state.get("original_target") or CFG.panel_uri(CFG.default_panel.address)
     to_hdr = f"<{to_uri}>"
     if ttag:
         to_hdr += f";tag={ttag}"
 
+    branch = _gen()
+    seq = _next_cseq()
     bye = (f"BYE {target_uri} SIP/2.0\r\n"
-           f"Via: SIP/2.0/TLS {MY_IP}:5070;branch={_gen()};rport\r\n"
-           f"Route: <sip:{C.SIP_ROUTE};transport=tls;lr>\r\n"
+           f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+           f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
            f"Max-Forwards: 70\r\n"
            f"To: {to_hdr}\r\n"
-           f"From: <sip:{C.SIP_USER}@{C.SIP_DOMAIN}>;tag={ftag}\r\n"
+           f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
            f"Call-ID: {cid}\r\n"
-           f"CSeq: {_next_cseq()} BYE\r\n"
-           f"User-Agent: {C.USER_AGENT}\r\n"
+           f"CSeq: {seq} BYE\r\n"
+           f"User-Agent: {CFG.user_agent}\r\n"
            f"Content-Length: 0\r\n\r\n")
+    key = _open_transaction(branch, seq, "BYE", cid)
     await send(bye)
-    await _wait_final(cid, timeout=5)
+    await _wait_final(key, cid, seq, "BYE", timeout=5)
 
     _set_in_call(False)
     call_state.update(call_id=None, from_tag=None, to_tag=None,
@@ -763,64 +782,72 @@ async def do_hangup():
     await broadcast("call_ended", "Chiamata terminata")
 
 
-async def do_door():
+async def do_door(target: str | None = None):
     """Legacy door open — prefer do_system_message via hub.async_door."""
-    _LOGGER.info("do_door: sending %s to %s", C.DOOR_COMMAND, C.DOOR_ESTERNO)
+    address = target or CFG.default_panel.address
+    uri = CFG.panel_uri(address)
+    _LOGGER.info("do_door: sending %s to %s", CFG.door_command, uri)
     return await do_system_message(
-        C.DOOR_ESTERNO, C.DOOR_COMMAND, extra_headers={"Panda": "command"})
+        uri, CFG.door_command, extra_headers={"Panda": "command"})
 
 
 async def do_options(target=None):
     if not registered:
         return False, "Non registrato"
-    target = target or C.INTERCOM
+    target = target or CFG.panel_uri(CFG.default_panel.address)
     ftag = _gen("")
     cid = _gen("opt-")
 
-    def _msg(auth=None, seq=1):
-        branch = _gen()
+    def _msg(branch, seq, auth=None):
         m = (f"OPTIONS {target} SIP/2.0\r\n"
-             f"Via: SIP/2.0/TLS {MY_IP}:5070;branch={branch};rport\r\n"
-             f"Route: <sip:{C.SIP_ROUTE};transport=tls;lr>\r\n"
+             f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+             f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
              f"Max-Forwards: 70\r\n"
              f"To: <{target}>\r\n"
-             f"From: <sip:{C.SIP_USER}@{C.SIP_DOMAIN}>;tag={ftag}\r\n"
+             f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
              f"Call-ID: {cid}\r\n"
              f"CSeq: {seq} OPTIONS\r\n"
-             f"User-Agent: {C.USER_AGENT}\r\n"
+             f"User-Agent: {CFG.user_agent}\r\n"
              f"Accept: application/sdp\r\n")
         if auth:
             m += f"Proxy-Authorization: {auth}\r\n"
         return m + "Content-Length: 0\r\n\r\n"
 
-    await send(_msg(seq=_next_cseq()))
-    for r in await _wait_final(cid):
-        code, hdrs, *_ = _parse(r)
-        if code and code < 200:
+    branch = _gen()
+    seq = _next_cseq()
+    key = _open_transaction(branch, seq, "OPTIONS", cid)
+    await send(_msg(branch, seq))
+    for raw in await _wait_final(key, cid, seq, "OPTIONS"):
+        msg = parse_message(raw)
+        if msg.code and msg.code < 200:
             continue
-        if code in (401, 407):
-            ch = hdrs.get("proxy-authenticate", "") or hdrs.get("www-authenticate", "")
+        if msg.code in (401, 407):
+            ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
             if not ch:
                 return False, "Auth vuoto"
-            await send(_msg(auth=_make_auth("OPTIONS", target, ch), seq=_next_cseq()))
-            for r2 in await _wait_final(cid):
-                c2 = _parse(r2)[0]
-                if c2 and 200 <= c2 < 300:
-                    return True, f"OK: {c2}"
-                return False, f"Errore: {c2}"
+            auth = _make_auth("OPTIONS", target, ch)
+            branch2 = _gen()
+            seq2 = _next_cseq()
+            key2 = _open_transaction(branch2, seq2, "OPTIONS", cid)
+            await send(_msg(branch2, seq2, auth=auth))
+            for raw2 in await _wait_final(key2, cid, seq2, "OPTIONS"):
+                msg2 = parse_message(raw2)
+                if msg2.code and 200 <= msg2.code < 300:
+                    return True, f"OK: {msg2.code}"
+                return False, f"Errore: {msg2.code}"
             return False, "Timeout"
-        if code and 200 <= code < 300:
-            return True, f"OK: {code}"
-        if code and code >= 300:
-            return False, f"Errore: {code}"
+        if msg.code and 200 <= msg.code < 300:
+            return True, f"OK: {msg.code}"
+        if msg.code and msg.code >= 300:
+            return False, f"Errore: {msg.code}"
     return False, "Timeout"
 
 
 async def do_connect_profiles():
     """Register push profile on Vimar cloud. Uses Digest auth (not Basic)."""
-    username = f"{C.SIP_USER}@{C.SIP_DOMAIN}"
-    body = [{"sipid": C.SIP_USER, "domain": C.SIP_DOMAIN, "pntok": C.PN_TOKEN}]
-    if not C.PN_TOKEN:
+    username = f"{CFG.sip_user}@{CFG.sip_domain}"
+    body = [{"sipid": CFG.sip_user, "domain": CFG.sip_domain, "pntok": CFG.push_token}]
+    if not CFG.push_token:
         return False, "No FCM token"
 
     import requests as req_lib
@@ -830,7 +857,7 @@ async def do_connect_profiles():
         return req_lib.post(
             f"https://ipvdes.vimar.cloud/eipvdesUtils/{endpoint}",
             json=body,
-            auth=req_lib.auth.HTTPDigestAuth(username, C.PN_TOKEN),
+            auth=req_lib.auth.HTTPDigestAuth(username, CFG.push_token),
             headers={"Accept": "application/json"}, timeout=15)
 
     try:
@@ -861,14 +888,14 @@ pending_incoming = {
 
 
 async def handle_incoming_invite(raw):
-    _, hdrs, body, first = _parse(raw)
-    from_hdr = hdrs.get("from", "?")
-    cid = _call_id(hdrs)
-    via_block = _via_block(hdrs)
-    to_hdr = hdrs.get("to", "")
-    cseq = hdrs.get("cseq", "1 INVITE")
+    msg = parse_message(raw)
+    from_hdr = msg.headers.get("from", "?")
+    cid = msg.headers.get("call-id", "")
+    via_block = _via_block(msg)
+    to_hdr = msg.headers.get("to", "")
+    cseq = msg.headers.get("cseq", "1 INVITE")
 
-    caller_tag = _tag(from_hdr)
+    caller_tag = tag_of(from_hdr)
     caller_uri = ""
     if "<" in from_hdr and ">" in from_hdr:
         caller_uri = from_hdr[from_hdr.index("<")+1:from_hdr.index(">")]
@@ -880,14 +907,14 @@ async def handle_incoming_invite(raw):
     pending_incoming.update(
         active=True, cid=cid, from_hdr=from_hdr, to_hdr=to_hdr,
         cseq=cseq, via_block=via_block, my_tag=my_tag,
-        caller_uri=caller_uri, caller_tag=caller_tag, body=body,
+        caller_uri=caller_uri, caller_tag=caller_tag, body=msg.body,
     )
 
     await send(
         f"SIP/2.0 180 Ringing\r\n"
         f"{via_block}To: {to_hdr};tag={my_tag}\r\nFrom: {from_hdr}\r\n"
         f"Call-ID: {cid}\r\nCSeq: {cseq}\r\n"
-        f"Contact: <sip:{C.SIP_USER}@{MY_IP}:5070;transport=tls>\r\n"
+        f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>\r\n"
         f"Content-Length: 0\r\n\r\n")
 
     await broadcast("ring", f"Chiamata da: {caller_uri}")
@@ -904,7 +931,7 @@ async def do_answer_incoming():
         f"SIP/2.0 200 OK\r\n"
         f"{p['via_block']}To: {p['to_hdr']};tag={p['my_tag']}\r\nFrom: {p['from_hdr']}\r\n"
         f"Call-ID: {p['cid']}\r\nCSeq: {p['cseq']}\r\n"
-        f"Contact: <sip:{C.SIP_USER}@{MY_IP}:5070;transport=tls>\r\n"
+        f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>\r\n"
         f"Content-Type: application/sdp\r\n"
         f"Content-Length: {len(sdp)}\r\n\r\n{sdp}")
 
@@ -940,23 +967,21 @@ async def do_decline_incoming():
     pending_incoming["active"] = False
 
 
-def _via_block(hdrs):
-    via_all = hdrs.get("_via_all", [])
-    if via_all:
-        return "".join(f"Via: {v}\r\n" for v in via_all)
-    return f"Via: {hdrs.get('via', '')}\r\n"
+def _via_block(msg: ParsedMessage) -> str:
+    """Rebuild the Via stack of a request, for use in a response."""
+    return "".join(f"Via: {via}\r\n" for via in msg.via_list)
 
 
 async def handle_incoming_bye(raw):
-    _, hdrs, *_ = _parse(raw)
-    cid = _call_id(hdrs)
-    from_hdr = hdrs.get("from", "")
-    to_hdr = hdrs.get("to", "")
-    cseq = hdrs.get("cseq", "1 BYE")
+    msg = parse_message(raw)
+    cid = msg.headers.get("call-id", "")
+    from_hdr = msg.headers.get("from", "")
+    to_hdr = msg.headers.get("to", "")
+    cseq = msg.headers.get("cseq", "1 BYE")
 
     await send(
         f"SIP/2.0 200 OK\r\n"
-        f"{_via_block(hdrs)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+        f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
         f"Call-ID: {cid}\r\nCSeq: {cseq}\r\n"
         f"Content-Length: 0\r\n\r\n")
 
@@ -968,31 +993,31 @@ async def handle_incoming_bye(raw):
 
 
 async def handle_incoming_options(raw):
-    _, hdrs, *_ = _parse(raw)
-    from_hdr = hdrs.get("from", "")
-    to_hdr = hdrs.get("to", "")
-    cid = _call_id(hdrs)
-    cseq = hdrs.get("cseq", "1 OPTIONS")
+    msg = parse_message(raw)
+    from_hdr = msg.headers.get("from", "")
+    to_hdr = msg.headers.get("to", "")
+    cid = msg.headers.get("call-id", "")
+    cseq = msg.headers.get("cseq", "1 OPTIONS")
     await send(
         f"SIP/2.0 200 OK\r\n"
-        f"{_via_block(hdrs)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+        f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
         f"Call-ID: {cid}\r\nCSeq: {cseq}\r\n"
         f"Allow: INVITE,ACK,BYE,CANCEL,OPTIONS,NOTIFY,INFO,MESSAGE,UPDATE\r\n"
         f"Content-Length: 0\r\n\r\n")
 
 
 async def handle_incoming_cancel(raw):
-    _, hdrs, *_ = _parse(raw)
-    cid = _call_id(hdrs)
-    from_hdr = hdrs.get("from", "")
-    to_hdr = hdrs.get("to", "")
-    cseq = hdrs.get("cseq", "1 CANCEL")
+    msg = parse_message(raw)
+    cid = msg.headers.get("call-id", "")
+    from_hdr = msg.headers.get("from", "")
+    to_hdr = msg.headers.get("to", "")
+    cseq = msg.headers.get("cseq", "1 CANCEL")
 
     _LOGGER.info("Incoming CANCEL for %s", cid[:24])
 
     await send(
         f"SIP/2.0 200 OK\r\n"
-        f"{_via_block(hdrs)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+        f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
         f"Call-ID: {cid}\r\nCSeq: {cseq}\r\n"
         f"Content-Length: 0\r\n\r\n")
 
@@ -1012,36 +1037,37 @@ async def handle_incoming_cancel(raw):
 async def request_processor():
     while True:
         raw = await incoming_requests.get()
-        kind, hdrs, body, _ = _parse(raw)
-        if kind == "INVITE":
+        msg = parse_message(raw)
+        method = msg.method
+        if method == "INVITE":
             asyncio.create_task(handle_incoming_invite(raw))
-        elif kind == "CANCEL":
+        elif method == "CANCEL":
             asyncio.create_task(handle_incoming_cancel(raw))
-        elif kind == "BYE":
+        elif method == "BYE":
             asyncio.create_task(handle_incoming_bye(raw))
-        elif kind == "OPTIONS":
+        elif method == "OPTIONS":
             asyncio.create_task(handle_incoming_options(raw))
-        elif kind == "MESSAGE":
-            _LOGGER.info("SIP MESSAGE: %s", body[:200])
-            await broadcast("message", body[:200])
-            from_hdr = hdrs.get("from", "")
-            to_hdr = hdrs.get("to", "")
-            msg_cid = hdrs.get("call-id", "")
-            msg_cseq = hdrs.get("cseq", "1 MESSAGE")
+        elif method == "MESSAGE":
+            _LOGGER.info("SIP MESSAGE: %s", msg.body[:200])
+            await broadcast("message", msg.body[:200])
+            from_hdr = msg.headers.get("from", "")
+            to_hdr = msg.headers.get("to", "")
+            msg_cid = msg.headers.get("call-id", "")
+            msg_cseq = msg.headers.get("cseq", "1 MESSAGE")
             await send(
                 f"SIP/2.0 200 OK\r\n"
-                f"{_via_block(hdrs)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+                f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
                 f"Call-ID: {msg_cid}\r\nCSeq: {msg_cseq}\r\n"
                 f"Content-Length: 0\r\n\r\n")
-        elif kind == "INFO":
-            from_hdr = hdrs.get("from", "")
-            to_hdr = hdrs.get("to", "")
-            info_cid = hdrs.get("call-id", "")
-            info_cseq = hdrs.get("cseq", "1 INFO")
+        elif method == "INFO":
+            from_hdr = msg.headers.get("from", "")
+            to_hdr = msg.headers.get("to", "")
+            info_cid = msg.headers.get("call-id", "")
+            info_cseq = msg.headers.get("cseq", "1 INFO")
             await send(
                 f"SIP/2.0 200 OK\r\n"
-                f"{_via_block(hdrs)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+                f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
                 f"Call-ID: {info_cid}\r\nCSeq: {info_cseq}\r\n"
                 f"Content-Length: 0\r\n\r\n")
-        elif kind != "ACK":
-            _LOGGER.debug("Unhandled SIP request: %s", kind)
+        elif method != "ACK":
+            _LOGGER.debug("Unhandled SIP request: %s", method)

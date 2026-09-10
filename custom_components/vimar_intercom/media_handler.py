@@ -7,14 +7,23 @@ import random
 import socket
 import struct
 import subprocess
+import tempfile
 
-from .const import (
-    RTP_AUDIO_PORT, RTP_VIDEO_PORT,
-    FFMPEG_AV_VIDEO_PORT, FFMPEG_AV_AUDIO_PORT,
-)
+from .runtime import RuntimeConfig
 from .srtp import SRTPContext
 
 _LOGGER = logging.getLogger(__name__)
+
+# Set once by the hub at start-up. The integration declares
+# single_config_entry, so one module-global config is correct.
+CFG: RuntimeConfig | None = None
+
+
+def configure(cfg: RuntimeConfig) -> None:
+    """Install the runtime configuration for this media handler."""
+    global CFG
+    CFG = cfg
+
 
 # ─── Broadcast callback (set by main.py) ────────────────────────────
 _broadcast = None
@@ -98,7 +107,7 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
-        _LOGGER.info("RTP Audio ready on :%d", RTP_AUDIO_PORT)
+        _LOGGER.info("RTP Audio ready on :%d", CFG.rtp_audio_port)
 
     def datagram_received(self, data, addr):
         if len(data) < 4:
@@ -125,7 +134,7 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         if len(rtp) <= hlen:
             return
         # Forward decrypted RTP to AV ffmpeg port
-        self.ffmpeg_av_sock.sendto(rtp, ('127.0.0.1', FFMPEG_AV_AUDIO_PORT))
+        self.ffmpeg_av_sock.sendto(rtp, ('127.0.0.1', CFG.av_audio_port))
         payload = rtp[hlen:]
         self.pkt_count += 1
         if self.pkt_count == 1:
@@ -194,7 +203,7 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
-        _LOGGER.info("RTP Video ready on :%d", RTP_VIDEO_PORT)
+        _LOGGER.info("RTP Video ready on :%d", CFG.rtp_video_port)
         # Start ordered NAL sender
         loop = asyncio.get_event_loop()
         self._nal_queue = asyncio.Queue(maxsize=500)
@@ -351,7 +360,7 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         Ensures SPS→PPS→IDR ordering: if IDR arrives before SPS+PPS,
         buffer it and emit after both parameter sets are received.
         """
-        if not nal_data or not ws_send_bytes or not self._nal_queue:
+        if not nal_data or not self._nal_queue:
             return
         nal_type = nal_data[0] & 0x1F if nal_data else 0
         self._nal_count += 1
@@ -417,15 +426,16 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                 pass
 
     async def _nal_sender(self):
-        """Drain NAL queue and send via WebSocket in order."""
+        """Drain the ordered NAL queue.
+
+        No consumer is wired up yet: Task 12 replaces this whole path
+        with a registry of media consumers (e.g. the camera platform).
+        """
         try:
             while True:
                 msg = await self._nal_queue.get()
-                if ws_send_bytes:
-                    try:
-                        await ws_send_bytes(msg)
-                    except Exception:
-                        pass
+                # No consumer registered yet — see docstring.
+                continue
         except asyncio.CancelledError:
             pass
 
@@ -443,7 +453,7 @@ audio_proto: RTPAudioProtocol | None = None
 video_proto: RTPVideoProtocol | None = None
 av_ffmpeg_proc = None
 _stun_task = None
-_audio_task = None
+_av_sdp_path: str | None = None
 
 
 # ─── Transport setup ────────────────────────────────────────────────
@@ -455,11 +465,11 @@ async def setup_transports():
     # Use SO_REUSEADDR to avoid "Address in use" on HA restart/reload
     audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    audio_sock.bind(('0.0.0.0', RTP_AUDIO_PORT))
+    audio_sock.bind(('0.0.0.0', CFG.rtp_audio_port))
 
     video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    video_sock.bind(('0.0.0.0', RTP_VIDEO_PORT))
+    video_sock.bind(('0.0.0.0', CFG.rtp_video_port))
 
     _, audio_proto = await loop.create_datagram_endpoint(
         RTPAudioProtocol, sock=audio_sock)
@@ -469,7 +479,7 @@ async def setup_transports():
 
 async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=None):
     """Start media after SIP call established. Called by sip.py."""
-    global _stun_task, _audio_task
+    global _stun_task
     audio = remote_sdp.get("audio", {})
     video = remote_sdp.get("video", {})
     remote_ip = remote_sdp.get("conn", "")
@@ -518,20 +528,13 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         _stun_task.cancel()
     _stun_task = asyncio.create_task(_stun_keepalive())
 
-    if _audio_task:
-        _audio_task.cancel()
-    _audio_task = asyncio.create_task(_audio_broadcast())
-
 
 async def stop_media():
     """Stop all media. Called on hangup/bye."""
-    global _stun_task, _audio_task
+    global _stun_task
     if _stun_task:
         _stun_task.cancel()
         _stun_task = None
-    if _audio_task:
-        _audio_task.cancel()
-        _audio_task = None
     if audio_proto:
         audio_proto.remote_addr = None
         audio_proto.pkt_count = 0
@@ -584,52 +587,23 @@ async def _stun_keepalive():
         pass
 
 
-# ─── Audio broadcast ────────────────────────────────────────────────
-
-# ws_send_bytes: set by main.py — async fn(data) to send binary to all clients
-ws_send_bytes = None
-
-
-async def _audio_broadcast():
-    """Forward decoded PCM to browser via WebSocket."""
-    try:
-        while True:
-            if not audio_proto:
-                await asyncio.sleep(0.5)
-                continue
-            try:
-                pcm = await asyncio.wait_for(
-                    audio_proto.audio_buffer.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-            if ws_send_bytes:
-                await ws_send_bytes(b'\x01' + pcm)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        _LOGGER.error("Audio broadcast error: %s", e)
-
-
-
 # (ffmpeg video pipeline removed — H.264 NALs sent directly from RTPVideoProtocol)
 
 
 # ─── AV stream (H264 video + PCMU audio → MPEG-TS for HomeKit) ────
 
-def _create_av_sdp():
-    """Create SDP with both video and audio for the AV ffmpeg."""
-    sdp_path = "/tmp/intercom_av.sdp"
-    with open(sdp_path, "w") as f:
-        f.write(
-            f"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=AV\r\n"
-            f"c=IN IP4 127.0.0.1\r\nt=0 0\r\n"
-            f"m=audio {FFMPEG_AV_AUDIO_PORT} RTP/AVP 0\r\n"
-            f"a=rtpmap:0 PCMU/8000\r\n"
-            f"m=video {FFMPEG_AV_VIDEO_PORT} RTP/AVP 96\r\n"
-            f"a=rtpmap:96 H264/90000\r\n"
-            f"a=fmtp:96 profile-level-id=42801F\r\n"
+def _create_av_sdp() -> str:
+    """Write the SDP that describes the audio RTP stream for ffmpeg."""
+    global _av_sdp_path
+    fd, _av_sdp_path = tempfile.mkstemp(prefix="vimar_av_", suffix=".sdp")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=AV\r\n"
+            "c=IN IP4 127.0.0.1\r\nt=0 0\r\n"
+            f"m=audio {CFG.av_audio_port} RTP/AVP 0\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
         )
-    return sdp_path
+    return _av_sdp_path
 
 
 async def start_av_ffmpeg():
@@ -658,7 +632,7 @@ async def start_av_ffmpeg():
 
 
 async def stop_av_ffmpeg():
-    global av_ffmpeg_proc
+    global av_ffmpeg_proc, _av_sdp_path
     if av_ffmpeg_proc:
         try:
             av_ffmpeg_proc.terminate()
@@ -670,6 +644,12 @@ async def stop_av_ffmpeg():
                 pass
         av_ffmpeg_proc = None
         _LOGGER.info("AV ffmpeg stopped")
+    if _av_sdp_path:
+        try:
+            os.unlink(_av_sdp_path)
+        except OSError:
+            pass
+        _av_sdp_path = None
 
 
 async def _read_av_ffmpeg_stderr():
