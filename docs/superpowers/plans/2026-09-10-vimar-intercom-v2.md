@@ -1799,6 +1799,7 @@ Fixes the `Stale response` defect: REGISTER replies arriving during an active di
   - `sip_parser.cseq_parts(headers: Mapping[str, str]) -> tuple[int | None, str]`
   - `sip_parser.transaction_key(branch: str, seq: int | None, method: str) -> str`
   - `sip_parser.response_keys(msg: ParsedMessage) -> list[str]` — every key a response could match, most specific first.
+  - `sip_parser.call_id_key(call_id: str, seq: int | None, method: str) -> str` — the Call-ID fallback key, CSeq included.
   - `sip_parser.tag_of(header_value: str) -> str`
   - `sip_parser.granted_expiry(msg: ParsedMessage, contact_user: str, requested: int) -> int`
 
@@ -1894,13 +1895,30 @@ def test_transaction_key_is_stable():
 def test_response_keys_prefer_branch_and_cseq_over_call_id():
     keys = sp.response_keys(sp.parse_message(REGISTER_200))
     assert keys[0] == "z9hG4bKabc123|7|REGISTER"
-    assert keys[-1] == "cid:reg-deadbeef"
+    assert keys[-1] == "cid:reg-deadbeef|7|REGISTER"
 
 
 def test_response_keys_fall_back_to_call_id_without_a_branch():
     raw = REGISTER_200.replace(";branch=z9hG4bKabc123", "")
     keys = sp.response_keys(sp.parse_message(raw))
-    assert keys == ["cid:reg-deadbeef"]
+    assert keys == ["cid:reg-deadbeef|7|REGISTER"]
+
+
+def test_call_id_fallback_separates_a_retry_from_its_original():
+    # A REGISTER and its authenticated retry share a Call-ID. If the
+    # fallback key did not carry the CSeq, a late response to the first
+    # would be delivered to the second and accepted as its final answer.
+    first = sp.response_keys(sp.parse_message(
+        REGISTER_200.replace(";branch=z9hG4bKabc123", "")))
+    retry = sp.response_keys(sp.parse_message(
+        REGISTER_200.replace(";branch=z9hG4bKabc123", "")
+                    .replace("CSeq: 7", "CSeq: 8")))
+    assert first != retry
+
+
+def test_response_keys_are_empty_without_a_parseable_cseq():
+    raw = REGISTER_200.replace("CSeq: 7 REGISTER", "CSeq: nonsense")
+    assert sp.response_keys(sp.parse_message(raw)) == []
 
 
 def test_two_transactions_on_one_call_id_get_different_keys():
@@ -2061,9 +2079,21 @@ def response_keys(msg: ParsedMessage) -> list[str]:
     if branch and seq is not None:
         keys.append(transaction_key(branch, seq, method))
     call_id = msg.headers.get("call-id", "")
-    if call_id:
-        keys.append(f"cid:{call_id}")
+    if call_id and seq is not None:
+        keys.append(call_id_key(call_id, seq, method))
     return keys
+
+
+def call_id_key(call_id: str, seq: int | None, method: str) -> str:
+    """Fallback key for a peer that does not echo our branch.
+
+    The CSeq is part of the key on purpose. A REGISTER and its
+    authenticated retry share a Call-ID, so a bare `cid:` key would let a
+    late or duplicated response from the first transaction be delivered
+    to the second and accepted as its final response — discarding the
+    real one. Including the CSeq makes the two keys distinct.
+    """
+    return f"cid:{call_id}|{seq}|{method}"
 
 
 def tag_of(header_value: str) -> str:
@@ -2097,7 +2127,7 @@ def granted_expiry(msg: ParsedMessage, contact_user: str, requested: int) -> int
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python3 -m pytest tests/vimar_intercom/test_sip_parser.py -q`
-Expected: PASS, 17 passed
+Expected: PASS, 19 passed
 
 - [ ] **Step 5: Use the parser and per-transaction keys in `sip_client.py`**
 
@@ -2106,6 +2136,7 @@ Expected: PASS, 17 passed
 ```python
 from .sip_parser import (
     ParsedMessage,
+    call_id_key,
     granted_expiry,
     header_params,
     parse_message,
@@ -2136,15 +2167,16 @@ pending_transactions: dict[str, asyncio.Queue] = {}
 def _open_transaction(branch: str, seq: int, method: str, call_id: str) -> str:
     """Register a transaction and return its key."""
     key = transaction_key(branch, seq, method)
-    pending_transactions[key] = asyncio.Queue()
-    pending_transactions.setdefault(f"cid:{call_id}", pending_transactions[key])
+    queue: asyncio.Queue = asyncio.Queue()
+    pending_transactions[key] = queue
+    pending_transactions[call_id_key(call_id, seq, method)] = queue
     return key
 
 
-def _close_transaction(key: str, call_id: str) -> None:
+def _close_transaction(key: str, call_id: str, seq: int, method: str) -> None:
     """Forget a transaction and its Call-ID fallback."""
     pending_transactions.pop(key, None)
-    pending_transactions.pop(f"cid:{call_id}", None)
+    pending_transactions.pop(call_id_key(call_id, seq, method), None)
 ```
 
 5. In the reader, route by the first matching key:
@@ -2169,7 +2201,9 @@ def _close_transaction(key: str, call_id: str) -> None:
 6. Replace `_wait_final(cid, timeout)` with:
 
 ```python
-async def _wait_final(key: str, call_id: str, timeout: float = 15) -> list[str]:
+async def _wait_final(
+    key: str, call_id: str, seq: int, method: str, timeout: float = 15
+) -> list[str]:
     """Collect responses for one transaction until a final one arrives."""
     queue = pending_transactions.get(key)
     if queue is None:
@@ -2190,7 +2224,7 @@ async def _wait_final(key: str, call_id: str, timeout: float = 15) -> list[str]:
             if msg.code is not None and msg.code >= 200:
                 break
     finally:
-        _close_transaction(key, call_id)
+        _close_transaction(key, call_id, seq, method)
     return results
 ```
 
@@ -2201,8 +2235,16 @@ async def _wait_final(key: str, call_id: str, timeout: float = 15) -> list[str]:
     seq = _next_cseq()
     key = _open_transaction(branch, seq, "REGISTER", cid)
     await send(_msg(branch=branch, seq=seq))
-    responses = await _wait_final(key, cid)
+    responses = await _wait_final(key, cid, seq, "REGISTER")
 ```
+
+**`do_call` is the exception that needs care.** It does not route through
+`_wait_final`; it drives `pending_transactions[key]` by hand. Wrap its whole
+wait-and-dispatch body in `try: ... finally: _close_transaction(key, cid, seq,
+"INVITE")`, so an exception raised while parsing the SDP, setting up media, or
+building the authentication header cannot strand the transaction. A stranded
+entry is keyed on a random branch that will never recur, so it is never
+collected — a slow leak in a process that runs for months.
 
 Each `_msg`/`_inv` closure takes `branch` as a parameter instead of calling `_gen()` internally. The authenticated retry opens a **new** transaction with a fresh branch and CSeq, exactly as RFC 3261 requires.
 
