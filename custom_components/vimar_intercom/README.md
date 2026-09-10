@@ -1,25 +1,32 @@
 # Vimar Intercom — Home Assistant Integration
 
-> ### ⚠️ Version 1.x is in maintenance — v2 is under active development
+> ### 🚧 Version 2 is under active development on `main`
 >
-> A substantial rewrite is in progress on the [`v2` branch](https://github.com/noiseheroes-lab/ha-custom-components/tree/v2).
-> It is **not ready to install** and will be published as a pre-release when it is.
+> This is a reverse-engineered integration in the middle of a rewrite, and `main` is the
+> development branch. Everything here compiles and the unit tests pass, but v2 is **not
+> feature-complete** and has **not been verified against a clean Home Assistant install**.
+> Install it only if you are willing to help shape it.
 >
-> Known limitations of the 1.x you are reading about, all fixed in v2:
+> **Working in v2 today**
+> - Setup by pasting the QR code shown by the Vimar app — no more editing `const.py`
+> - Every credential and plant-specific value lives in the config entry
+> - Entrance panel addresses are configurable instead of hardcoded
+> - SIP responses correlated per transaction, so REGISTER replies are no longer discarded
+> - Apple-specific push code and the private-app HTTP surface removed
 >
-> - **The component forces its own logger to DEBUG at import time**, which floods the Home Assistant
->   log and silently overrides your `logger:` configuration ([#1](https://github.com/noiseheroes-lab/ha-custom-components/issues/1)).
-> - **Credentials and plant-specific values must be edited by hand in `const.py`.** v2 configures
->   itself from the QR code shown by the Vimar app.
-> - **The entrance panel addresses are hardcoded to one specific installation**, and one of the two
->   defaults is wrong. They become configurable in v2.
-> - **The camera entity never produces a frame.** Video is only forwarded to a private WebSocket
->   consumer, so the MJPEG view and the thumbnail are empty for everyone else.
-> - **SIP reconnection gives up after five attempts** and stays down until Home Assistant restarts.
+> **Not done yet**
+> - Unbounded SIP reconnection and a real registration lifecycle (1.x gave up after five attempts)
+> - The public `vimar_intercom_ring` event and the reconnect / repair affordances
+> - The camera: video is not yet forwarded to a Home Assistant consumer, so the entity produces no frame
+> - Final documentation, changelog and the English-only sweep
 >
-> If you run a Vimar Elvox plant and are willing to help test v2 once it is ready, please say so
-> in an issue — this is reverse engineered against a single installation, and a second one is the
-> only way to find out what has been assumed rather than established.
+> **Upgrading from 1.x requires reconfiguring the integration**, because credentials moved out of
+> `const.py` into the config entry. If you need the previous behaviour, install from commit
+> [`883deac`](https://github.com/noiseheroes-lab/ha-custom-components/tree/883deac).
+>
+> If you run a Vimar Elvox plant, testing reports are the most useful thing you can contribute:
+> this is reverse engineered against a single installation, and a second one is the only way to
+> find out what has been assumed rather than established.
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 
