@@ -3012,7 +3012,25 @@ Known replacements, all in `sip_client.py` and `hub.py`:
 | `# Messages go to the targa (PE) address...` | `# Commands go to the entrance panel, which drives its own relay.` |
 | `# ─── Door targets (from Tab5S rubrica ACTUATOR_LIST) ───` | `# ─── Door targets ───` |
 
-- [ ] **Step 2: Fix the log levels**
+- [ ] **Step 2: Delete the dead code the refactor exposed**
+
+Two functions have no callers left anywhere in the component. Confirm that
+with a grep before deleting each, and report what the grep showed:
+
+- `sip_client.do_door()` — superseded by `hub.async_door`, which is what every
+  entity calls. Task 5 kept it alive by giving it a `target` parameter; it is
+  still dead.
+- `media_handler.send_audio()` — its only caller was the audio WebSocket that
+  Task 1 deleted. There is no talk-back path in the public integration.
+
+```bash
+grep -rn "do_door\|send_audio" custom_components/vimar_intercom/
+```
+
+Delete only what that grep shows to be unreferenced. If either has acquired a
+caller, leave it and say so.
+
+- [ ] **Step 3: Fix the log levels**
 
 Apply throughout:
 
@@ -3039,7 +3057,7 @@ _LOGGER.debug("Sending %s to %s", body_text, target_uri)
 _LOGGER.debug("Stream opened (%d viewers)", self._stream_viewers)
 ```
 
-- [ ] **Step 3: Verify the sweep**
+- [ ] **Step 4: Verify the sweep**
 
 ```bash
 grep -rniE "chiamata|registrat[oa]|serratur|citofon|portone|targa|rubrica|fallit|errore|apert|campanell|già|nessun|risposto" custom_components/vimar_intercom/*.py || echo "NO ITALIAN IN CODE"
@@ -3049,7 +3067,7 @@ python3 -m pytest -q
 ```
 Expected: `NO ITALIAN IN CODE`, `NO FORCED LOG LEVEL`, `COMPILE_OK`, tests pass
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add custom_components/vimar_intercom
