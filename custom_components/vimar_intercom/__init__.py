@@ -14,6 +14,7 @@ from homeassistant.core import HomeAssistant
 from . import media_handler as media
 from .const import DOMAIN
 from .hub import VimarIntercomHub
+from .runtime import build_runtime_config
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,17 +23,23 @@ PLATFORMS = ["camera", "lock", "button", "event", "binary_sensor"]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Vimar Intercom from a config entry."""
-    hub = VimarIntercomHub()
+    cfg = build_runtime_config(entry.data, entry.options)
+    hub = VimarIntercomHub(cfg)
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {"hub": hub}
 
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+
     await hub.async_start()
-
     hass.http.register_view(VimarAVStreamView(hub))
-
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
+
+async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload when the options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

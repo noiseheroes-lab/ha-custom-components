@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 from . import sip_client as sip
 from . import media_handler as media
+from .runtime import RuntimeConfig
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -16,7 +17,9 @@ MAX_CALL_DURATION = 300  # 5 minutes — auto-hangup safety net
 class VimarIntercomHub:
     """Orchestrates SIP registration, calls, door control, and media."""
 
-    def __init__(self):
+    def __init__(self, cfg: RuntimeConfig) -> None:
+        """Store the runtime configuration and initialise the state."""
+        self._cfg = cfg
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._ring_callbacks: list[Callable] = []
@@ -27,6 +30,11 @@ class VimarIntercomHub:
         self._keyframe_task: asyncio.Task | None = None
         self._auto_called = False
         self._auto_call_target: str | None = None
+
+    @property
+    def config(self) -> RuntimeConfig:
+        """Runtime configuration for this hub."""
+        return self._cfg
 
     @property
     def registered(self) -> bool:
@@ -88,7 +96,7 @@ class VimarIntercomHub:
         """Background auto-call when video stream opens without active call."""
         try:
             if target:
-                uri = f"sip:{target}@{sip.C.SIP_DOMAIN}"
+                uri = self._cfg.panel_uri(target)
                 ok, msg = await sip.do_call(target=uri)
             else:
                 ok, msg = await sip.do_call()
@@ -169,6 +177,9 @@ class VimarIntercomHub:
         if self._running:
             return
 
+        sip.configure(self._cfg)
+        media.configure(self._cfg)
+
         sip.init(self._handle_broadcast)
         sip.set_state_callback(self._on_sip_state_change)
         media.init(self._handle_broadcast)
@@ -209,7 +220,7 @@ class VimarIntercomHub:
     async def async_call(self, target: str | None = None) -> tuple[bool, str]:
         self._auto_called = False
         if target:
-            uri = f"sip:{target}@{sip.C.SIP_DOMAIN}"
+            uri = self._cfg.panel_uri(target)
             return await sip.do_call(target=uri)
         return await sip.do_call()
 
@@ -224,58 +235,50 @@ class VimarIntercomHub:
         self._cancel_call_timeout()
         await sip.do_hangup()
 
-    async def async_door(self, target: str | None = None, command: str | None = None) -> tuple[bool, str]:
-        """Open door via SIP MESSAGE to targa (PE) address.
+    async def async_door(
+        self, target: str | None = None, command: str | None = None
+    ) -> tuple[bool, str]:
+        """Open a door by sending a SIP MESSAGE to the entrance panel.
 
-        From Tab5S rubrica ACTUATOR_LIST:
-          55001 (targa master)  → OPEN_2F = Portone Esterno
-          55002 (targa interna) → OPEN_2F = Portone Interno
-        The targa forwards the command to its local relay.
-        No active call required.
+        The panel forwards the command to its own relay, so no active
+        call is required.
         """
-        if target:
-            uri = f"sip:{target}@{sip.C.SIP_DOMAIN}"
-            body = command or sip.C.DOOR_COMMAND
-        else:
-            uri = sip.C.DOOR_ESTERNO
-            body = sip.C.DOOR_COMMAND
+        address = target or self._cfg.default_panel.address
+        uri = self._cfg.panel_uri(address)
+        body = command or self._cfg.door_command
 
-        _LOGGER.info("Door command: uri=%s body=%s registered=%s", uri, body, sip.registered)
+        _LOGGER.debug("Door command to %s (registered=%s)", address, sip.registered)
 
         ok, msg = await sip.do_system_message(
             uri, body, extra_headers={"Panda": "command"})
-
         if ok:
-            _LOGGER.info("Door open OK: %s", msg)
-            return ok, msg
+            _LOGGER.info("Door %s opened", address)
+            return True, msg
 
-        # Retry once after re-registration — handles stale connection
-        _LOGGER.warning("Door command failed (%s), retrying after re-register...", msg)
+        _LOGGER.warning("Door command to %s failed (%s); re-registering and retrying",
+                        address, msg)
         try:
-            reg_ok = await sip.do_register()
-            if reg_ok:
-                ok2, msg2 = await sip.do_system_message(
-                    uri, body, extra_headers={"Panda": "command"})
-                if ok2:
-                    _LOGGER.info("Door open OK on retry: %s", msg2)
-                    return ok2, msg2
-                _LOGGER.error("Door retry also failed: %s", msg2)
-                return ok2, msg2
+            if not await sip.do_register():
+                return False, "Re-registration failed"
+            ok, msg = await sip.do_system_message(
+                uri, body, extra_headers={"Panda": "command"})
+            if ok:
+                _LOGGER.info("Door %s opened on retry", address)
             else:
-                _LOGGER.error("Re-registration failed, cannot retry door")
-                return False, "Re-registrazione fallita"
-        except Exception as e:
-            _LOGGER.error("Door retry error: %s", e)
-            return False, str(e)
+                _LOGGER.error("Door %s failed on retry: %s", address, msg)
+            return ok, msg
+        except Exception as err:  # noqa: BLE001 - surfaced to the caller
+            _LOGGER.error("Door retry error: %s", err)
+            return False, str(err)
 
     async def async_probe(self, target: str) -> tuple[bool, str]:
-        uri = f"sip:{target}@{sip.C.SIP_DOMAIN}"
+        uri = self._cfg.panel_uri(target)
         return await sip.do_options(target=uri)
 
     async def async_scan(self, start: int, end: int) -> list[dict]:
         results = []
         for addr in range(start, end + 1):
-            uri = f"sip:{addr}@{sip.C.SIP_DOMAIN}"
+            uri = self._cfg.panel_uri(str(addr))
             try:
                 ok, msg = await sip.do_options(target=uri)
                 results.append({"addr": addr, "ok": ok, "msg": msg})

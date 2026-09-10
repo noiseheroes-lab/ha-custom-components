@@ -44,7 +44,6 @@ from .const import (
 
 DEVICE_ID_DIGITS = 15
 VIDEO_PORT_OFFSET = 2000
-AV_VIDEO_PORT_OFFSET = 12000
 AV_AUDIO_PORT_OFFSET = 12002
 
 
@@ -81,7 +80,6 @@ class RuntimeConfig:
     door_command: str
     rtp_audio_port: int
     rtp_video_port: int
-    av_video_port: int
     av_audio_port: int
     user_agent: str
 
@@ -200,7 +198,6 @@ def build_runtime_config(
         door_command=options.get(CONF_DOOR_COMMAND) or DEFAULT_DOOR_COMMAND,
         rtp_audio_port=rtp_base,
         rtp_video_port=rtp_base + VIDEO_PORT_OFFSET,
-        av_video_port=rtp_base + AV_VIDEO_PORT_OFFSET,
         av_audio_port=rtp_base + AV_AUDIO_PORT_OFFSET,
         user_agent=USER_AGENT,
     )
