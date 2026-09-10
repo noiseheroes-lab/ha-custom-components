@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 .env
 .DS_Store
+
+# Subagent-driven-development scratch workspace
+.superpowers/
