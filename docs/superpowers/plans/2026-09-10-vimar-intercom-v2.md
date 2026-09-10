@@ -27,7 +27,13 @@ Every task's requirements implicitly include this section.
   `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
 - **Remux, never transcode.** ffmpeg runs with `-c copy`. The reference deployment is a fanless two-core 7 W machine in someone's home; re-encoding H.264 saturates it and heats it. Any change that introduces `-c:v libx264` or similar is a defect.
 - **Tasks 1-11 must stand on their own.** The camera work is deliberately last (Tasks 12-13): everything before it has to be complete and shippable even if the camera is not finished.
-- **Do not push.** Do not create releases or tags. Do not touch the maintainer's server or the private repo.
+- **Never push to `origin/main`.** The repository has no releases or tags and `hacs.json` does not set `zip_release`, so HACS installs **directly from the default branch**: anything landing on `origin/main` reaches people's homes within hours. `origin/main` stays at the 1.x snapshot until v2 is verified on real hardware. This work lives on the `v2` branch (`git push origin main:v2`).
+- Do not create releases or tags. Do not touch the maintainer's server or the private repo.
+- **Three promises are now public**, made in the repository's issue tracker, and binding:
+  1. No module in the component touches a logging handler or level. The user's `logger:` configuration is the only authority on verbosity. Never reintroduce a diagnostic shortcut, however convenient.
+  2. Panel addresses are configurable and the old `60001` default is gone — it was published as a known-wrong value.
+  3. The event `vimar_intercom_ring` and its payload `{"panel", "panel_name", "entry_id"}` are public API. Do not rename either without agreement.
+- **Release path**, for planning: Tasks 1-11 closed and verified → tag `v2.0.0-beta1` as a GitHub pre-release, which HACS offers only to users who opted into betas → trial on a second real system → merge to `main` and release `v2.0.0`. Task 13 may fall outside the beta provided the README says so.
 - Repo root for all paths below: `/Users/luca/Sites/ha-custom-components`.
 - Component root: `custom_components/vimar_intercom/`.
 
@@ -3261,6 +3267,19 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - [ ] **Step 1: Write `custom_components/vimar_intercom/README.md`**
 
 Sections, in this order, all in English, no mention of any private app:
+
+0. **Status banner, at the very top**, for as long as v2 is unreleased:
+
+```markdown
+> **Status: in active development.** This is the v2 rewrite and it is not
+> released yet. Do not point HACS at this branch. The stable version is 1.x
+> on the `main` branch. This notice is removed when v2.0.0 ships.
+```
+
+   Note for whoever merges v2 into `main`: `main` carries its own banner
+   declaring 1.x maintenance-only, added in `83f2a99`. The two conflict by
+   design. On merge, v2's documentation replaces it — do not keep either
+   banner once v2.0.0 is released.
 
 1. **Title and one-paragraph summary.** What it does: doorbell events, live video, door release and call control for Vimar Elvox video door entry systems, over the same cloud SIP protocol the Vimar View app uses.
 2. **Verified hardware.** "Developed and tested against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due Fili Plus system. Other panels speak the same protocol and may work, but are untested — please open an issue with your results."
