@@ -62,3 +62,34 @@ FFMPEG_AV_AUDIO_PORT = 19202    # AV ffmpeg reads audio here
 # ─── Local Tab5S ─────────────────────────────────────────────────
 LOCAL_PROXY = "192.168.X.X"
 LOCAL_SIP_PORT = 5060
+
+# ─── Config entry keys ───────────────────────────────────────────
+CONF_SIP_USER = "sip_user"
+CONF_SIP_PASSWORD = "sip_password"
+CONF_SIP_DOMAIN = "sip_domain"
+CONF_CLOUD_PROXY = "cloud_proxy"
+CONF_LOCAL_PROXY = "local_proxy"
+CONF_GROUP_ID = "group_id"
+CONF_MAC = "mac"
+CONF_PLANT_TYPE = "plant_type"
+CONF_PRODUCT_CODE = "product_code"
+CONF_DEVICE_ID = "device_id"
+CONF_DEVICE_UUID = "device_uuid"
+CONF_PUSH_TOKEN = "push_token"
+
+# ─── Options keys ────────────────────────────────────────────────
+CONF_PANELS = "panels"
+CONF_PREFER_LOCAL = "prefer_local"
+CONF_RTP_PORT_BASE = "rtp_port_base"
+CONF_SIP_PORT = "sip_port"
+CONF_DOOR_COMMAND = "door_command"
+
+# ─── Defaults ────────────────────────────────────────────────────
+DEFAULT_CLOUD_PROXY = "ipvdes.vimar.cloud"
+DEFAULT_SIP_PORT = 7042
+DEFAULT_LOCAL_SIP_PORT = 5060
+DEFAULT_GROUP_ID = "21"
+DEFAULT_PANELS = "55001"
+DEFAULT_DOOR_COMMAND = "OPEN_2F"
+DEFAULT_RTP_PORT_BASE = 7200
+DEFAULT_REGISTER_EXPIRY = 3600
