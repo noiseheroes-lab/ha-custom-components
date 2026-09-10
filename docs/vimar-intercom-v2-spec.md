@@ -87,7 +87,11 @@ A reference implementation of the decryption exists in Swift in the private app 
    - Invalid base64, failed decryption, or missing `ID`/`PWD`/`CDOMAIN` → `errors["base"] = "invalid_qr"`.
    - Success → `async_set_unique_id(mac or id)`, `_abort_if_unique_id_configured()`, then show a confirmation step listing what was found, with the password masked.
 2. `async_step_reconfigure` — same form, updates the existing entry and reloads it.
-3. `OptionsFlow` — the few things a user may want to tune after setup: local panel address, whether to prefer the local panel over the cloud, RTP port base, log verbosity. Nothing secret belongs here that is not already in the entry.
+3. `OptionsFlow` — the few things a user may want to tune after setup: the entrance panel addresses, the door open command, whether to prefer the local panel over the cloud, the SIP proxy port, and the RTP port base. Nothing secret belongs here that is not already in the entry.
+
+   Log verbosity is deliberately **not** an option: §10 puts it in Home Assistant's own `logger:` configuration, and a second control would contradict it.
+
+   Panel addresses cannot come from the QR — it does not carry them — and must not be hardcoded, since the extensions in any one installation belong to that plant, not to the protocol.
 
 ### 6.3 Derived values
 

@@ -25,6 +25,8 @@ Every task's requirements implicitly include this section.
 - **Never log** credentials, QR payloads, decrypted QR plaintext, or full SIP messages at INFO. No module-level `setLevel`.
 - Work on `main`, small verifiable commits, each ending with:
   `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
+- **Remux, never transcode.** ffmpeg runs with `-c copy`. The reference deployment is a fanless two-core 7 W machine in someone's home; re-encoding H.264 saturates it and heats it. Any change that introduces `-c:v libx264` or similar is a defect.
+- **Tasks 1-11 must stand on their own.** The camera work is deliberately last (Tasks 12-13): everything before it has to be complete and shippable even if the camera is not finished.
 - **Do not push.** Do not create releases or tags. Do not touch the maintainer's server or the private repo.
 - Repo root for all paths below: `/Users/luca/Sites/ha-custom-components`.
 - Component root: `custom_components/vimar_intercom/`.
@@ -35,12 +37,15 @@ These resolve gaps or contradictions in the spec. They are binding for implement
 
 1. **`single_config_entry: true`.** The SIP and media layers use module-global state. Rewriting them into per-entry objects is a large, risky refactor of code that works in production and cannot be tested here against a real panel. Instead the manifest declares a single config entry, which makes the module-global design correct rather than accidental.
 2. **The audio WebSocket, the MJPEG view, the push-token view and the debug view are deleted.** They exist only to serve the private mobile app. `hub.video_frame` already returns `None` unconditionally, so the MJPEG view and the camera thumbnail have never produced a frame for anyone but that app.
-3. **Video reaches HA through ffmpeg.** Decrypted H.264 NALs are written as Annex-B to ffmpeg's stdin while audio RTP continues to arrive on a UDP port described by an SDP file; ffmpeg muxes both to MPEG-TS. The camera exposes that as `stream_source` over a **signed path**, so `requires_auth = True` holds.
+3. **Video reaches HA through ffmpeg, and this is the last thing built.** Decrypted H.264 NALs are written as Annex-B to ffmpeg's stdin while audio RTP arrives on a UDP port described by an SDP file; ffmpeg **remuxes** both to MPEG-TS with `-c copy`. The camera exposes that as `stream_source` over a **signed path**, so `requires_auth = True` holds. Because it is the one part that cannot be verified here, it is Tasks 12 and 13, after the documentation.
 4. **Panel addresses are configurable, not hardcoded.** `55001`/`55002` are the maintainer's plant. The QR does not carry the panel list, so panels live in the options flow as a comma-separated list of SIP extensions, defaulting to `55001`. One lock and one call button are created per configured panel.
 5. **No "log verbosity" option**, despite spec §6.2 listing one. Spec §10 says verbosity belongs to Home Assistant's own `logger:` configuration; a second control would contradict it. Documented in the README instead.
 6. **`USER_AGENT` stays verbatim** as a constant. It is not personal data, and the Vimar cloud is known to accept exactly this string. Changing it risks breaking registration and cannot be tested here.
 7. **The proxy host defaults to `CPROXY`, falling back to `ipvdes.vimar.cloud`.** That value is already public in the current `const.py` as `SIP_SNI`/`SIP_ROUTE`. The options flow lets a user override host and port.
 8. **Tests are plain `pytest`** over modules that do not import `homeassistant`. `qr.py`, `runtime.py`, `sip_parser.py`, `backoff.py` and the media registry are written to keep that true. Config-flow tests are out of scope, as in spec §3.
+9. **The call, answer and hang-up buttons stay, described for what they actually do.** Removing the audio WebSocket removes talk-back, and Home Assistant has no two-way voice interface for cameras anyway. But audio still flows *from* the panel: it is muxed into the MPEG-TS stream. So the honest surface is see-and-hear, not silence, and the buttons remain genuinely useful — Call starts the stream from a chosen panel, Answer accepts an incoming call so the panel stops ringing. The README must say plainly: **you can see and hear the door; you cannot speak back.** It must not imply an intercom conversation.
+10. **End-to-end validation is a scheduled event, not a step an implementer can take.** The Vimar cloud accepts **one SIP registration per account**. A second instance registering with the same credentials deregisters the first, taking down the intercom in a real house. No task in this plan may run the component against the live account. Validation happens in a session agreed with the maintainer, in which the production integration is stopped first. Until that session has happened, the camera is documented as implemented but unverified.
+11. **One instance, one system.** `single_config_entry: true` means a Home Assistant installation can integrate exactly one Vimar system. This is a real limitation and belongs in the README, not only in this plan.
 
 ## File Structure
 
@@ -84,6 +89,7 @@ These resolve gaps or contradictions in the spec. They are binding for implement
 - `custom_components/vimar_intercom/push_sender.py`
 
 ---
+
 
 ### Task 1: Strip the private-app surface
 
@@ -274,9 +280,9 @@ Apply these edits:
 
 - [ ] **Step 5: Remove the WebSocket audio sink from `media_handler.py`**
 
-Delete the module-global `ws_send_bytes` and every reference to it. In `_emit_nal` and `_queue_nal` the guard `if not nal_data or not ws_send_bytes or not self._nal_queue` becomes `if not nal_data or not self._nal_queue`. In `_nal_sender`, replace the `if ws_send_bytes:` block with a no-op `continue` for now — Task 10 replaces this whole path with the consumer registry. Also delete `_audio_broadcast_loop`'s `if ws_send_bytes:` send and the loop itself if nothing else calls it; if `setup_media` starts it, delete that call too.
+Delete the module-global `ws_send_bytes` and every reference to it. In `_emit_nal` and `_queue_nal` the guard `if not nal_data or not ws_send_bytes or not self._nal_queue` becomes `if not nal_data or not self._nal_queue`. In `_nal_sender`, replace the `if ws_send_bytes:` block with a no-op `continue` for now — Task 12 replaces this whole path with the consumer registry. Also delete `_audio_broadcast_loop`'s `if ws_send_bytes:` send and the loop itself if nothing else calls it; if `setup_media` starts it, delete that call too.
 
-Leave `send_audio` in place; it becomes unused but harmless, and Task 12 removes it if still unreferenced.
+Leave `send_audio` in place; it becomes unused but harmless, and Task 10 removes it if still unreferenced.
 
 - [ ] **Step 6: Extend `.gitignore`**
 
@@ -1598,7 +1604,7 @@ def _create_av_sdp() -> str:
     return _av_sdp_path
 ```
 
-(The video half of the SDP disappears here because Task 10 feeds video through ffmpeg's stdin. Add `import tempfile` and a module-global `_av_sdp_path: str | None = None`, unlinked in `stop_av_ffmpeg`.)
+(The video half of the SDP disappears here because Task 12 feeds video through ffmpeg's stdin. Add `import tempfile` and a module-global `_av_sdp_path: str | None = None`, unlinked in `stop_av_ffmpeg`.)
 
 - [ ] **Step 5: Take the config in the hub**
 
@@ -2907,7 +2913,321 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 10: Video consumer registry with SPS/PPS replay
+### Task 10: Logging discipline and the English-only sweep
+
+**Files:**
+- Modify: every `.py` in `custom_components/vimar_intercom/`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: no behaviour change; only log levels, log text and comments.
+
+- [ ] **Step 1: Translate every remaining Italian string and comment**
+
+Run the scan and fix each hit:
+
+```bash
+grep -rniE "chiamata|registrat[oa]|serratur|citofon|portone|targa|rubrica|fallit|errore|apert|campanell|già|nessun|risposto|vuoto|riaggancia|rispondi|esterna|interna" custom_components/vimar_intercom/*.py
+```
+
+Known replacements, all in `sip_client.py` and `hub.py`:
+
+| Italian | English |
+|---|---|
+| `"Non registrato"` | `"Not registered"` |
+| `"Già in chiamata"` | `"Already in a call"` |
+| `"Chiamata attiva!"` | `"Call established"` |
+| `"Chiamata terminata"` | `"Call ended"` |
+| `"Chiamata cancellata"` | `"Call cancelled"` |
+| `"Nessuna chiamata in arrivo"` | `"No incoming call"` |
+| `"Risposto!"` | `"Answered"` |
+| `f"Auth vuoto ({code})"` | `f"Empty authentication challenge ({code})"` |
+| `f"Errore: {code}"` | `f"Rejected with {code}"` |
+| `"Re-registrazione fallita"` | `"Re-registration failed"` |
+| `"Timeout"` | `"Timed out"` |
+| `# Messages go to the targa (PE) address...` | `# Commands go to the entrance panel, which drives its own relay.` |
+| `# ─── Door targets (from Tab5S rubrica ACTUATOR_LIST) ───` | `# ─── Door targets ───` |
+
+- [ ] **Step 2: Fix the log levels**
+
+Apply throughout:
+
+- INFO stays only for lifecycle: setup, registration granted or lost, call started or ended, door opened, pipeline started or stopped, reconnect attempts.
+- Everything protocol-level moves to DEBUG: `[SIP >>>]`, `[SIP <<<]`, `do_system_message` header dumps, `WS action received`, NAL counters, `Video pkt #`, `FU-A START`/`FU-A END`, `First video RTP from`, `RTP Video ready on`, `Detected local IP`.
+- Delete these entirely, they are development scaffolding: the `NAL #%d type=...` per-NAL log, the `Flushing SPS→PPS→IDR` log, the `self.pkt_count <= 20` and `self._nal_count <= 20` special cases.
+- Never log at INFO with a credential, a QR payload, or a full SIP message in the arguments. `_LOGGER.debug("[SIP >>>] %s", first_line)` logs only the start line and is fine; a full-message log is not.
+
+Specific edits:
+
+```python
+# sip_client.get_local_ip
+_LOGGER.debug("Detected local IP %s", ip)
+
+# sip_client.connect
+_LOGGER.info("Connecting to the SIP proxy %s:%d", CFG.proxy_host, CFG.proxy_port)
+...
+_LOGGER.info("SIP TLS connection established")
+
+# sip_client.do_system_message — was INFO with the body
+_LOGGER.debug("Sending %s to %s", body_text, target_uri)
+
+# hub.stream_opened
+_LOGGER.debug("Stream opened (%d viewers)", self._stream_viewers)
+```
+
+- [ ] **Step 3: Verify the sweep**
+
+```bash
+grep -rniE "chiamata|registrat[oa]|serratur|citofon|portone|targa|rubrica|fallit|errore|apert|campanell|già|nessun|risposto" custom_components/vimar_intercom/*.py || echo "NO ITALIAN IN CODE"
+grep -rn "setLevel" custom_components/vimar_intercom/ || echo "NO FORCED LOG LEVEL"
+python3 -m compileall -q custom_components/vimar_intercom && echo COMPILE_OK
+python3 -m pytest -q
+```
+Expected: `NO ITALIAN IN CODE`, `NO FORCED LOG LEVEL`, `COMPILE_OK`, tests pass
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add custom_components/vimar_intercom
+git commit -m "chore(vimar): English-only code and honest log levels
+
+Translates every remaining Italian log message and comment, moves
+protocol traces to DEBUG, keeps INFO for lifecycle events only, and
+removes the per-NAL development logging that produced hundreds of
+thousands of lines in the reference deployment.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 11: Documentation, changelog and the definition of done
+
+**Files:**
+- Modify: `custom_components/vimar_intercom/README.md` (full rewrite)
+- Modify: `custom_components/vimar_intercom/ARCHITECTURE.md` (full rewrite)
+- Modify: `README.md` (Vimar section)
+- Modify: `CHANGELOG.md`
+- Modify: `hacs.json`
+
+**Interfaces:**
+- Consumes: the entity names, event name and option names produced by every earlier task.
+- Produces: documentation only.
+
+- [ ] **Step 1: Write `custom_components/vimar_intercom/README.md`**
+
+Sections, in this order, all in English, no mention of any private app:
+
+1. **Title and one-paragraph summary.** What it does: doorbell events, live video, door release and call control for Vimar Elvox video door entry systems, over the same cloud SIP protocol the Vimar View app uses.
+2. **Verified hardware.** "Developed and tested against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due Fili Plus system. Other panels speak the same protocol and may work, but are untested — please open an issue with your results."
+3. **Requirements.** The Vimar View app, already paired with the panel; the QR payload it can export; a Home Assistant host that can reach `ipvdes.vimar.cloud` on TCP 7042; `ffmpeg` (bundled with Home Assistant OS/Container).
+4. **Installation.** HACS custom repository, then a manual `custom_components/vimar_intercom` copy. Restart, then **Settings → Devices & services → Add integration → Vimar Intercom**.
+5. **Setup.** Paste the QR payload. Confirm the summary. Done.
+6. **Entities table:**
+
+   | Entity | Type | Notes |
+   |---|---|---|
+   | `camera.vimar_intercom_intercom` | camera | Opening the stream places a call to the panel |
+   | `event.vimar_intercom_doorbell` | event | Event type `ring`, attribute `panel` |
+   | `lock.vimar_intercom_<panel>` | lock | Unlock pulses the door release; re-locks itself |
+   | `button.vimar_intercom_call_<panel>` | button | Call that panel |
+   | `button.vimar_intercom_open_<panel>` | button | Open that panel's door |
+   | `button.vimar_intercom_answer` / `_hangup` | button | Answer or end a call |
+   | `button.vimar_intercom_reconnect` | button | Rebuild the SIP connection |
+   | `binary_sensor.vimar_intercom_sip_registration` | binary_sensor | Connectivity; on only while registered |
+   | `binary_sensor.vimar_intercom_in_call` | binary_sensor | A call is up |
+
+7. **Automation examples**, both using the bus event:
+
+```yaml
+automation:
+  - alias: "Notify on doorbell"
+    triggers:
+      - trigger: event
+        event_type: vimar_intercom_ring
+    actions:
+      - action: notify.notify
+        data:
+          title: "Someone is at the door"
+          message: "Panel {{ trigger.event.data.panel_name }} is calling."
+
+  - alias: "Doorbell snapshot"
+    triggers:
+      - trigger: event
+        event_type: vimar_intercom_ring
+    actions:
+      - action: camera.snapshot
+        target:
+          entity_id: camera.vimar_intercom_intercom
+        data:
+          filename: "/media/doorbell_{{ now().timestamp() | int }}.jpg"
+```
+
+8. **Options.** Panel addresses (with the `address:Name` syntax and how to find them: they are printed on the panel's address label and shown in the Vimar View address book), door open command, prefer local panel, SIP proxy port, RTP base port.
+9. **Limitations.** State each plainly:
+   - **You can see and hear the door; you cannot speak back.** Audio from the panel is carried in the camera stream. Home Assistant does not send audio to the panel, and has no two-way voice interface for cameras. Call and Answer control the call, they do not open a conversation.
+   - **One Vimar system per Home Assistant installation.** The integration declares `single_config_entry`.
+   - **The camera is implemented but not yet verified end to end.** It has been built and unit tested, but not confirmed against a live panel. Remove this sentence once it has been.
+   - **Only one SIP registration exists per Vimar account.** Running a second client — a test instance, or the Vimar View app configured with the same credentials — will deregister this one.
+10. **Troubleshooting.**
+   - *Registration stays off* — check the host can reach the proxy shown in the sensor's attributes; press the Reconnect button; the integration retries forever, so a repair issue after five minutes means the panel or the network, not Home Assistant.
+   - *No video* — video only flows inside a call, so the camera is black until something opens the stream; check `ffmpeg` is present; check the RTP base port is not firewalled.
+   - *Door does not open* — confirm the panel address in the options; some plants use a different command than `OPEN_2F`.
+   - *More detail in the log*:
+
+```yaml
+logger:
+  logs:
+    custom_components.vimar_intercom: debug
+```
+
+   with a warning that DEBUG includes protocol traces and should not be left on.
+11. **How it works, honestly.** "This integration speaks the SIP dialect the Vimar cloud uses for the Vimar View app. That dialect is not documented; it was reverse engineered from the app and from captured traffic. It works today and it can break the day Vimar changes something. It does not use any Vimar partner API and it is not affiliated with or endorsed by Vimar."
+12. **License.** MIT.
+
+- [ ] **Step 2: Write `ARCHITECTURE.md`**
+
+Keep the protocol notes that are already there, made generic, and add:
+
+- **Module map** — one line per module, matching the File Structure table in this plan.
+- **Connection state machine** — `disconnected → connecting → registering → registered → (call) → registered`, with every edge back to `disconnected` going through the supervisor's backoff, and a note that there is no terminal failure state by design.
+- **Transaction model** — responses correlate on `branch|CSeq|method`, Call-ID as fallback; each authenticated retry is a new transaction with a fresh branch.
+- **Media pipeline** — SRTP in, depacketise to NALs, `VideoStreamRegistry` fans out with parameter-set replay, ffmpeg muxes stdin H.264 plus RTP audio to MPEG-TS, camera reads it over a signed path.
+- **Threat model** — the entry holds SIP credentials in the Home Assistant config entry store, so anyone with access to `.storage` has them; every HTTP view requires authentication because the door release is reachable from them; the signed camera URL expires in ten minutes; the integration never opens an inbound port on the internet, it maintains an outbound TLS connection.
+
+- [ ] **Step 3: Update the repository `README.md`**
+
+Replace the Vimar block with:
+
+```markdown
+### 🔔 [Vimar Intercom](custom_components/vimar_intercom/)
+
+Integrate **Vimar Elvox** video door entry systems (verified on Tab 5S Plus, 40515/40517) into Home Assistant. Configure by pasting the QR code from the Vimar View app: doorbell events, live camera, door release, and call control.
+
+**Entities:** camera, doorbell event, locks, call and door buttons, SIP registration sensor
+
+**IoT class:** Local push (SIP) · **Version:** 2.0.0
+```
+
+- [ ] **Step 4: Update `CHANGELOG.md`**
+
+Prepend:
+
+```markdown
+## [2.0.0] — 2026-09-10
+
+### vimar_intercom v2.0.0
+
+**Breaking:** credentials no longer live in `const.py`. Upgrading from 1.x
+requires removing the existing entry and adding the integration again,
+pasting the QR payload from the Vimar View app. Nothing needs to be
+edited by hand any more.
+
+#### Added
+- QR-based config flow, with reconfigure and options flows.
+- `vimar_intercom_ring` event on the Home Assistant bus, carrying the
+  panel address and name.
+- Reconnect button and a repair issue raised when registration has been
+  down for more than five minutes.
+- Configurable panel addresses; one lock and one call button per panel.
+- Unit tests for QR decryption, configuration derivation, SIP
+  transaction correlation, the reconnect schedule and SPS/PPS replay,
+  running in CI.
+
+#### Fixed
+- Reconnection is unbounded with jittered exponential backoff. Previously
+  the client gave up after five attempts and stayed silent until Home
+  Assistant restarted.
+- SIP responses are correlated per transaction, so a REGISTER reply
+  arriving during a call is no longer discarded as stale.
+- Registration state follows the lifetime granted by the registrar, with
+  a refresh at half that lifetime.
+- Every new video consumer receives the cached SPS and PPS, so a client
+  attaching mid-stream can decode.
+
+#### Known limitations
+- The camera is implemented but not yet verified end to end against a
+  live panel.
+- Audio flows from the panel only. There is no talk-back.
+- One Vimar system per Home Assistant installation.
+
+#### Security
+- Every HTTP view requires authentication. The audio WebSocket, MJPEG
+  and AV views previously did not, which let anyone on the network open
+  the street gate.
+
+#### Removed
+- Apple push (APNs/PushKit) support and the `/api/vimar_intercom/push_token`
+  endpoint. The integration stops at the `vimar_intercom_ring` event;
+  subscribe to it from a notification service or a companion app.
+- The audio WebSocket, MJPEG and debug endpoints.
+- The import-time debug log handler that forced every installation to
+  DEBUG.
+```
+
+- [ ] **Step 5: Update `hacs.json`**
+
+```json
+{
+  "name": "NoiseHeroes HA Custom Components",
+  "render_readme": true,
+  "homeassistant": "2026.9.0"
+}
+```
+
+- [ ] **Step 6: Run the full definition-of-done check**
+
+```bash
+cd /Users/luca/Sites/ha-custom-components
+
+echo "--- §12.1 no private-app traces ---"
+grep -riE "apns|pushkit|callkit|swift|iphone|bundle_id|noiseheroes\.Home" custom_components/vimar_intercom/ && echo "FAIL" || echo "PASS"
+
+echo "--- §12.2 no Italian outside it.json ---"
+grep -rniE "chiamata|registrat[oa]|serratur|citofon|portone|campanell|già|nessun" \
+  --include="*.py" --include="*.md" --include="strings.json" \
+  custom_components/vimar_intercom/ && echo "FAIL" || echo "PASS"
+
+echo "--- §12.5 tests ---"
+python3 -m pytest -q
+
+echo "--- no unauthenticated views ---"
+grep -rn "requires_auth" custom_components/vimar_intercom/
+grep -rn "requires_auth = False" custom_components/vimar_intercom/ && echo "FAIL" || echo "PASS"
+
+echo "--- version bumped ---"
+grep '"version"' custom_components/vimar_intercom/manifest.json
+
+echo "--- hassfest and HACS, locally ---"
+# Needs the Docker daemon running (start Docker Desktop first). If it
+# cannot be started, say so in the task report rather than skipping
+# silently.
+docker run --rm -v "$PWD":/github/workspace ghcr.io/home-assistant/hassfest
+docker run --rm -v "$PWD":/github/workspace ghcr.io/hacs/action:main --category integration
+
+echo "--- no secrets ---"
+git log --oneline -20
+git grep -nEi "musicman|192\.168\.|[0-9a-f]{2}(:[0-9a-f]{2}){5}|AuthKey" -- custom_components docs README.md CHANGELOG.md && echo "REVIEW EACH HIT" || echo "PASS"
+```
+
+Every line must print `PASS`, the tests must be green, and the version must read `2.0.0`.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A
+git commit -m "docs(vimar): rewrite the documentation for v2.0.0
+
+README, ARCHITECTURE, repository README and CHANGELOG rewritten for
+someone who owns a Vimar panel and has never met the author, including
+the migration note for users coming from 1.x.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 12: Video consumer registry with SPS/PPS replay
 
 Fixes the real defect from spec §8: a consumer that attaches mid-stream never receives the parameter sets and therefore never decodes anything.
 
@@ -3347,7 +3667,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 11: Camera over a signed path
+### Task 13: Camera over a signed path
 
 **Files:**
 - Modify: `custom_components/vimar_intercom/camera.py` (full rewrite)
@@ -3470,307 +3790,23 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 12: Logging discipline and the English-only sweep
-
-**Files:**
-- Modify: every `.py` in `custom_components/vimar_intercom/`
-
-**Interfaces:**
-- Consumes: nothing.
-- Produces: no behaviour change; only log levels, log text and comments.
-
-- [ ] **Step 1: Translate every remaining Italian string and comment**
-
-Run the scan and fix each hit:
-
-```bash
-grep -rniE "chiamata|registrat[oa]|serratur|citofon|portone|targa|rubrica|fallit|errore|apert|campanell|già|nessun|risposto|vuoto|riaggancia|rispondi|esterna|interna" custom_components/vimar_intercom/*.py
-```
-
-Known replacements, all in `sip_client.py` and `hub.py`:
-
-| Italian | English |
-|---|---|
-| `"Non registrato"` | `"Not registered"` |
-| `"Già in chiamata"` | `"Already in a call"` |
-| `"Chiamata attiva!"` | `"Call established"` |
-| `"Chiamata terminata"` | `"Call ended"` |
-| `"Chiamata cancellata"` | `"Call cancelled"` |
-| `"Nessuna chiamata in arrivo"` | `"No incoming call"` |
-| `"Risposto!"` | `"Answered"` |
-| `f"Auth vuoto ({code})"` | `f"Empty authentication challenge ({code})"` |
-| `f"Errore: {code}"` | `f"Rejected with {code}"` |
-| `"Re-registrazione fallita"` | `"Re-registration failed"` |
-| `"Timeout"` | `"Timed out"` |
-| `# Messages go to the targa (PE) address...` | `# Commands go to the entrance panel, which drives its own relay.` |
-| `# ─── Door targets (from Tab5S rubrica ACTUATOR_LIST) ───` | `# ─── Door targets ───` |
-
-- [ ] **Step 2: Fix the log levels**
-
-Apply throughout:
-
-- INFO stays only for lifecycle: setup, registration granted or lost, call started or ended, door opened, pipeline started or stopped, reconnect attempts.
-- Everything protocol-level moves to DEBUG: `[SIP >>>]`, `[SIP <<<]`, `do_system_message` header dumps, `WS action received`, NAL counters, `Video pkt #`, `FU-A START`/`FU-A END`, `First video RTP from`, `RTP Video ready on`, `Detected local IP`.
-- Delete these entirely, they are development scaffolding: the `NAL #%d type=...` per-NAL log, the `Flushing SPS→PPS→IDR` log, the `self.pkt_count <= 20` and `self._nal_count <= 20` special cases.
-- Never log at INFO with a credential, a QR payload, or a full SIP message in the arguments. `_LOGGER.debug("[SIP >>>] %s", first_line)` logs only the start line and is fine; a full-message log is not.
-
-Specific edits:
-
-```python
-# sip_client.get_local_ip
-_LOGGER.debug("Detected local IP %s", ip)
-
-# sip_client.connect
-_LOGGER.info("Connecting to the SIP proxy %s:%d", CFG.proxy_host, CFG.proxy_port)
-...
-_LOGGER.info("SIP TLS connection established")
-
-# sip_client.do_system_message — was INFO with the body
-_LOGGER.debug("Sending %s to %s", body_text, target_uri)
-
-# hub.stream_opened
-_LOGGER.debug("Stream opened (%d viewers)", self._stream_viewers)
-```
-
-- [ ] **Step 3: Verify the sweep**
-
-```bash
-grep -rniE "chiamata|registrat[oa]|serratur|citofon|portone|targa|rubrica|fallit|errore|apert|campanell|già|nessun|risposto" custom_components/vimar_intercom/*.py || echo "NO ITALIAN IN CODE"
-grep -rn "setLevel" custom_components/vimar_intercom/ || echo "NO FORCED LOG LEVEL"
-python3 -m compileall -q custom_components/vimar_intercom && echo COMPILE_OK
-python3 -m pytest -q
-```
-Expected: `NO ITALIAN IN CODE`, `NO FORCED LOG LEVEL`, `COMPILE_OK`, tests pass
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add custom_components/vimar_intercom
-git commit -m "chore(vimar): English-only code and honest log levels
-
-Translates every remaining Italian log message and comment, moves
-protocol traces to DEBUG, keeps INFO for lifecycle events only, and
-removes the per-NAL development logging that produced hundreds of
-thousands of lines in the reference deployment.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 13: Documentation, changelog and the definition of done
-
-**Files:**
-- Modify: `custom_components/vimar_intercom/README.md` (full rewrite)
-- Modify: `custom_components/vimar_intercom/ARCHITECTURE.md` (full rewrite)
-- Modify: `README.md` (Vimar section)
-- Modify: `CHANGELOG.md`
-- Modify: `hacs.json`
-
-**Interfaces:**
-- Consumes: the entity names, event name and option names produced by every earlier task.
-- Produces: documentation only.
-
-- [ ] **Step 1: Write `custom_components/vimar_intercom/README.md`**
-
-Sections, in this order, all in English, no mention of any private app:
-
-1. **Title and one-paragraph summary.** What it does: doorbell events, live video, door release and call control for Vimar Elvox video door entry systems, over the same cloud SIP protocol the Vimar View app uses.
-2. **Verified hardware.** "Developed and tested against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due Fili Plus system. Other panels speak the same protocol and may work, but are untested — please open an issue with your results."
-3. **Requirements.** The Vimar View app, already paired with the panel; the QR payload it can export; a Home Assistant host that can reach `ipvdes.vimar.cloud` on TCP 7042; `ffmpeg` (bundled with Home Assistant OS/Container).
-4. **Installation.** HACS custom repository, then a manual `custom_components/vimar_intercom` copy. Restart, then **Settings → Devices & services → Add integration → Vimar Intercom**.
-5. **Setup.** Paste the QR payload. Confirm the summary. Done.
-6. **Entities table:**
-
-   | Entity | Type | Notes |
-   |---|---|---|
-   | `camera.vimar_intercom_intercom` | camera | Opening the stream places a call to the panel |
-   | `event.vimar_intercom_doorbell` | event | Event type `ring`, attribute `panel` |
-   | `lock.vimar_intercom_<panel>` | lock | Unlock pulses the door release; re-locks itself |
-   | `button.vimar_intercom_call_<panel>` | button | Call that panel |
-   | `button.vimar_intercom_open_<panel>` | button | Open that panel's door |
-   | `button.vimar_intercom_answer` / `_hangup` | button | Answer or end a call |
-   | `button.vimar_intercom_reconnect` | button | Rebuild the SIP connection |
-   | `binary_sensor.vimar_intercom_sip_registration` | binary_sensor | Connectivity; on only while registered |
-   | `binary_sensor.vimar_intercom_in_call` | binary_sensor | A call is up |
-
-7. **Automation examples**, both using the bus event:
-
-```yaml
-automation:
-  - alias: "Notify on doorbell"
-    triggers:
-      - trigger: event
-        event_type: vimar_intercom_ring
-    actions:
-      - action: notify.notify
-        data:
-          title: "Someone is at the door"
-          message: "Panel {{ trigger.event.data.panel_name }} is calling."
-
-  - alias: "Doorbell snapshot"
-    triggers:
-      - trigger: event
-        event_type: vimar_intercom_ring
-    actions:
-      - action: camera.snapshot
-        target:
-          entity_id: camera.vimar_intercom_intercom
-        data:
-          filename: "/media/doorbell_{{ now().timestamp() | int }}.jpg"
-```
-
-8. **Options.** Panel addresses (with the `address:Name` syntax and how to find them: they are printed on the panel's address label and shown in the Vimar View address book), door open command, prefer local panel, SIP proxy port, RTP base port.
-9. **Troubleshooting.**
-   - *Registration stays off* — check the host can reach the proxy shown in the sensor's attributes; press the Reconnect button; the integration retries forever, so a repair issue after five minutes means the panel or the network, not Home Assistant.
-   - *No video* — video only flows inside a call, so the camera is black until something opens the stream; check `ffmpeg` is present; check the RTP base port is not firewalled.
-   - *Door does not open* — confirm the panel address in the options; some plants use a different command than `OPEN_2F`.
-   - *More detail in the log*:
-
-```yaml
-logger:
-  logs:
-    custom_components.vimar_intercom: debug
-```
-
-   with a warning that DEBUG includes protocol traces and should not be left on.
-10. **How it works, honestly.** "This integration speaks the SIP dialect the Vimar cloud uses for the Vimar View app. That dialect is not documented; it was reverse engineered from the app and from captured traffic. It works today and it can break the day Vimar changes something. It does not use any Vimar partner API and it is not affiliated with or endorsed by Vimar."
-11. **License.** MIT.
-
-- [ ] **Step 2: Write `ARCHITECTURE.md`**
-
-Keep the protocol notes that are already there, made generic, and add:
-
-- **Module map** — one line per module, matching the File Structure table in this plan.
-- **Connection state machine** — `disconnected → connecting → registering → registered → (call) → registered`, with every edge back to `disconnected` going through the supervisor's backoff, and a note that there is no terminal failure state by design.
-- **Transaction model** — responses correlate on `branch|CSeq|method`, Call-ID as fallback; each authenticated retry is a new transaction with a fresh branch.
-- **Media pipeline** — SRTP in, depacketise to NALs, `VideoStreamRegistry` fans out with parameter-set replay, ffmpeg muxes stdin H.264 plus RTP audio to MPEG-TS, camera reads it over a signed path.
-- **Threat model** — the entry holds SIP credentials in the Home Assistant config entry store, so anyone with access to `.storage` has them; every HTTP view requires authentication because the door release is reachable from them; the signed camera URL expires in ten minutes; the integration never opens an inbound port on the internet, it maintains an outbound TLS connection.
-
-- [ ] **Step 3: Update the repository `README.md`**
-
-Replace the Vimar block with:
-
-```markdown
-### 🔔 [Vimar Intercom](custom_components/vimar_intercom/)
-
-Integrate **Vimar Elvox** video door entry systems (verified on Tab 5S Plus, 40515/40517) into Home Assistant. Configure by pasting the QR code from the Vimar View app: doorbell events, live camera, door release, and call control.
-
-**Entities:** camera, doorbell event, locks, call and door buttons, SIP registration sensor
-
-**IoT class:** Local push (SIP) · **Version:** 2.0.0
-```
-
-- [ ] **Step 4: Update `CHANGELOG.md`**
-
-Prepend:
-
-```markdown
-## [2.0.0] — 2026-09-10
-
-### vimar_intercom v2.0.0
-
-**Breaking:** credentials no longer live in `const.py`. Upgrading from 1.x
-requires removing the existing entry and adding the integration again,
-pasting the QR payload from the Vimar View app. Nothing needs to be
-edited by hand any more.
-
-#### Added
-- QR-based config flow, with reconfigure and options flows.
-- `vimar_intercom_ring` event on the Home Assistant bus, carrying the
-  panel address and name.
-- Reconnect button and a repair issue raised when registration has been
-  down for more than five minutes.
-- Configurable panel addresses; one lock and one call button per panel.
-- Unit tests for QR decryption, configuration derivation, SIP
-  transaction correlation, the reconnect schedule and SPS/PPS replay,
-  running in CI.
-
-#### Fixed
-- Reconnection is unbounded with jittered exponential backoff. Previously
-  the client gave up after five attempts and stayed silent until Home
-  Assistant restarted.
-- SIP responses are correlated per transaction, so a REGISTER reply
-  arriving during a call is no longer discarded as stale.
-- Registration state follows the lifetime granted by the registrar, with
-  a refresh at half that lifetime.
-- Every new video consumer receives the cached SPS and PPS, so a client
-  attaching mid-stream can decode.
-
-#### Security
-- Every HTTP view requires authentication. The audio WebSocket, MJPEG
-  and AV views previously did not, which let anyone on the network open
-  the street gate.
-
-#### Removed
-- Apple push (APNs/PushKit) support and the `/api/vimar_intercom/push_token`
-  endpoint. The integration stops at the `vimar_intercom_ring` event;
-  subscribe to it from a notification service or a companion app.
-- The audio WebSocket, MJPEG and debug endpoints.
-- The import-time debug log handler that forced every installation to
-  DEBUG.
-```
-
-- [ ] **Step 5: Update `hacs.json`**
-
-```json
-{
-  "name": "NoiseHeroes HA Custom Components",
-  "render_readme": true,
-  "homeassistant": "2026.9.0"
-}
-```
-
-- [ ] **Step 6: Run the full definition-of-done check**
-
-```bash
-cd /Users/luca/Sites/ha-custom-components
-
-echo "--- §12.1 no private-app traces ---"
-grep -riE "apns|pushkit|callkit|swift|iphone|bundle_id|noiseheroes\.Home" custom_components/vimar_intercom/ && echo "FAIL" || echo "PASS"
-
-echo "--- §12.2 no Italian outside it.json ---"
-grep -rniE "chiamata|registrat[oa]|serratur|citofon|portone|campanell|già|nessun" \
-  --include="*.py" --include="*.md" --include="strings.json" \
-  custom_components/vimar_intercom/ && echo "FAIL" || echo "PASS"
-
-echo "--- §12.5 tests ---"
-python3 -m pytest -q
-
-echo "--- no unauthenticated views ---"
-grep -rn "requires_auth" custom_components/vimar_intercom/
-grep -rn "requires_auth = False" custom_components/vimar_intercom/ && echo "FAIL" || echo "PASS"
-
-echo "--- version bumped ---"
-grep '"version"' custom_components/vimar_intercom/manifest.json
-
-echo "--- no secrets ---"
-git log --oneline -20
-git grep -nEi "musicman|192\.168\.|[0-9a-f]{2}(:[0-9a-f]{2}){5}|AuthKey" -- custom_components docs README.md CHANGELOG.md && echo "REVIEW EACH HIT" || echo "PASS"
-```
-
-Every line must print `PASS`, the tests must be green, and the version must read `2.0.0`.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add -A
-git commit -m "docs(vimar): rewrite the documentation for v2.0.0
-
-README, ARCHITECTURE, repository README and CHANGELOG rewritten for
-someone who owns a Vimar panel and has never met the author, including
-the migration note for users coming from 1.x.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
-```
-
----
-
 ## What this plan cannot verify
 
-Stated plainly, because the definition of done in the spec assumes a live system that is not available here:
+Stated plainly, because the definition of done in the spec assumes a live system that is not available here.
 
-- **A fresh install on a clean Home Assistant** (§12.3) and **the ten-minute network outage** (§12.4) cannot be exercised from this machine. Every task's verification is limited to compilation, the unit suite, and static checks. The reviewer for each task must not claim otherwise.
-- **`hassfest` and HACS validation** run in CI on push. Since this plan does not push, they are unverified locally. Run them by opening a pull request when the work is ready.
-- **The camera path** (Task 11) depends on `async_sign_path` being importable at the location used and on Home Assistant's `stream` component accepting a signed internal URL. This is the least certain part of the plan and should be the first thing tested against a real installation.
-- **The proxy host derivation** (`CPROXY`, defaulting to `ipvdes.vimar.cloud`) is inferred from the existing `SIP_SNI`/`SIP_ROUTE` constants. If registration fails against a real panel, the options flow's SIP proxy port and the `prefer_local` switch are the intended escape hatches, and the derivation in `runtime.build_runtime_config` is the place to correct it.
+- **The live account can carry only one SIP registration.** Registering a second client with the same credentials deregisters the first and takes the intercom in a real house offline. **No task in this plan may run the component against the live Vimar account.** Anyone tempted to "just try it" must stop and ask.
+- **A fresh install on a clean Home Assistant** (§12.3) and **the ten-minute network outage** (§12.4) therefore cannot be exercised while implementing. They belong to the validation session described below.
+- **`hassfest` and HACS validation can be run locally** with the Docker commands in Task 11, step 6. Docker is installed on this machine but the daemon is not running by default: start Docker Desktop first. If it cannot be started, report that rather than marking the check passed.
+- **The camera path** (Task 13) depends on `async_sign_path` being importable at the location used and on Home Assistant's `stream` component accepting a signed internal URL. It is the least certain part of the plan, which is why it is built last and documented as unverified.
+- **The proxy host derivation** (`CPROXY`, defaulting to `ipvdes.vimar.cloud`) is inferred from the existing `SIP_SNI`/`SIP_ROUTE` constants. If registration fails against a real panel, the options flow's SIP proxy port and the `prefer_local` switch are the intended escape hatches, and `runtime.build_runtime_config` is the place to correct it.
+
+### The validation session
+
+This is a step of the project, not an assumption. It has not happened yet.
+
+1. Agree a window with the maintainer.
+2. Stop the production integration on the live Home Assistant, so the account holds no registration.
+3. Install this version, paste the QR, and confirm: entities appear; the SIP registration sensor turns on; a real doorbell press fires `vimar_intercom_ring` and the event entity; the locks open both doors; the camera shows the panel and carries its audio.
+4. Pull the network for ten minutes, restore it, and confirm registration returns without restarting Home Assistant.
+5. Only then remove the "not yet verified end to end" sentence from the README and the CHANGELOG.
+6. If any step fails, the production version is restored first and the finding is written up before anything else is attempted.
