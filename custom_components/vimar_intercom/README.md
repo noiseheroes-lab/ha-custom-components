@@ -1,5 +1,26 @@
 # Vimar Intercom — Home Assistant Integration
 
+> ### ⚠️ Version 1.x is in maintenance — v2 is under active development
+>
+> A substantial rewrite is in progress on the [`v2` branch](https://github.com/noiseheroes-lab/ha-custom-components/tree/v2).
+> It is **not ready to install** and will be published as a pre-release when it is.
+>
+> Known limitations of the 1.x you are reading about, all fixed in v2:
+>
+> - **The component forces its own logger to DEBUG at import time**, which floods the Home Assistant
+>   log and silently overrides your `logger:` configuration ([#1](https://github.com/noiseheroes-lab/ha-custom-components/issues/1)).
+> - **Credentials and plant-specific values must be edited by hand in `const.py`.** v2 configures
+>   itself from the QR code shown by the Vimar app.
+> - **The entrance panel addresses are hardcoded to one specific installation**, and one of the two
+>   defaults is wrong. They become configurable in v2.
+> - **The camera entity never produces a frame.** Video is only forwarded to a private WebSocket
+>   consumer, so the MJPEG view and the thumbnail are empty for everyone else.
+> - **SIP reconnection gives up after five attempts** and stays down until Home Assistant restarts.
+>
+> If you run a Vimar Elvox plant and are willing to help test v2 once it is ready, please say so
+> in an issue — this is reverse engineered against a single installation, and a second one is the
+> only way to find out what has been assumed rather than established.
+
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 
 Integrate your **Vimar Elvox** video intercom panel into Home Assistant. Receive doorbell events, view the camera feed, answer calls, and unlock doors — all natively.
