@@ -166,8 +166,12 @@ def build_runtime_config(
     prefer_local = bool(options.get(CONF_PREFER_LOCAL, False)) and bool(local_proxy)
 
     if prefer_local:
+        # The panel's own SIP port is fixed by the device. CONF_SIP_PORT
+        # configures the cloud proxy only: the options flow always
+        # persists it, so applying it here would aim a saved cloud port
+        # at the local panel.
         proxy_host = local_proxy
-        proxy_port = int(options.get(CONF_SIP_PORT, DEFAULT_LOCAL_SIP_PORT))
+        proxy_port = DEFAULT_LOCAL_SIP_PORT
     else:
         proxy_host = cloud_proxy
         proxy_port = int(options.get(CONF_SIP_PORT, DEFAULT_SIP_PORT))

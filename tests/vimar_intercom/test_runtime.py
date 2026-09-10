@@ -105,13 +105,11 @@ def test_options_override_transport_and_panels():
         {
             "sip_port": 5061,
             "panels": "55001:Gate,55002:Door",
-            "prefer_local": True,
             "rtp_port_base": 8000,
             "door_command": "OPEN_1F",
         },
     )
     assert cfg.proxy_port == 5061
-    assert cfg.prefer_local is True
     assert [p.name for p in cfg.panels] == ["Gate", "Door"]
     assert cfg.rtp_audio_port == 8000
     assert cfg.rtp_video_port == 10000
@@ -125,6 +123,19 @@ def test_prefer_local_switches_the_proxy_host():
     assert cfg.proxy_port == 5060
     # The SNI and Route still name the cloud, which is what the cert covers.
     assert cfg.sni == "ipvdes.vimar.cloud"
+
+
+def test_prefer_local_ignores_the_cloud_proxy_port():
+    # sip_port configures the cloud proxy. The options flow always
+    # persists it, so honouring it locally would send a saved 7042 at a
+    # panel that listens on 5060 — breaking the very user who turned
+    # prefer_local on.
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(QR_FIELDS),
+        {"prefer_local": True, "sip_port": 7042},
+    )
+    assert cfg.proxy_host == "192.0.2.10"
+    assert cfg.proxy_port == 5060
 
 
 def test_prefer_local_is_ignored_without_a_local_proxy():
