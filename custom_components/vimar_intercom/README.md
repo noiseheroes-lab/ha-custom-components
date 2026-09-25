@@ -129,11 +129,15 @@ automation:
   Call and Answer control the call — they do not open a conversation.
 - **One Vimar system per Home Assistant installation.** The integration
   declares `single_config_entry`.
-- **The camera is not finished.** The SIP and RTP transport for video
-  exists, but nothing yet delivers video frames to a Home Assistant
-  consumer, so the camera entity currently shows no picture. This is
-  tracked as follow-up work; remove this sentence once it ships and has
-  been verified against a live panel.
+- **The camera is implemented but not yet verified end to end against a
+  live panel.** It streams the panel's H.264 video and PCMU audio,
+  remuxed to MPEG-TS by ffmpeg, over a signed URL that Home Assistant's
+  `stream` component fetches without a bearer token. The pipeline that
+  feeds it — depacketisation, SPS/PPS replay, the ffmpeg consumer — is
+  built and unit tested, but has never run against a real Vimar panel;
+  see "Before you install" above for why that has not been tried yet.
+  Remove this sentence once a validation session against real hardware
+  confirms it.
 - **Only one SIP registration exists per Vimar account.** Running a
   second client — a test instance, or the Vimar View app configured with
   the same credentials — will deregister this one.

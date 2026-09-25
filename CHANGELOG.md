@@ -29,14 +29,20 @@ edited by hand any more.
 - Registration state follows the lifetime granted by the registrar, with
   a refresh at half that lifetime.
 - Video depacketisation holds the most recent SPS/PPS and replays them
-  ahead of every IDR, so a consumer attaching mid-stream could decode —
-  this machinery exists but is unused: nothing consumes the depacketised
-  NAL queue yet (see Known limitations).
+  to every new consumer and ahead of every IDR, so a consumer attaching
+  mid-stream, or recovering from lost sync, can still decode. A
+  transiently stalling consumer gets a small bounded backlog instead of
+  being dropped outright.
+- The camera streams the panel's video and audio: ffmpeg remuxes
+  (`-c copy`) the depacketised H.264 and the RTP audio into MPEG-TS, and
+  the camera entity fetches it over a signed URL, so the underlying HTTP
+  view still requires authentication.
 
 #### Known limitations
-- The camera is not finished: the SIP/RTP transport and H.264
-  depacketisation exist, but nothing yet delivers video to a Home
-  Assistant consumer. Tracked as follow-up work.
+- The camera is implemented but not yet verified end to end against a
+  live panel: it is built and unit tested, but a second SIP registration
+  would deregister the production panel, so real-hardware validation is
+  a scheduled session, not something to try casually.
 - Audio flows from the panel only. There is no talk-back.
 - One Vimar system per Home Assistant installation.
 

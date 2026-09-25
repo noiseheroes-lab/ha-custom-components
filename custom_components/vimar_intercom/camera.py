@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
-from aiohttp import web
-
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import Camera, CameraEntityFeature
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.network import get_url
 
 from .const import DOMAIN, MANUFACTURER, MODEL
 
 _LOGGER = logging.getLogger(__name__)
+
+AV_PATH = "/api/vimar_intercom/av"
+SIGNATURE_LIFETIME = timedelta(minutes=10)
 
 
 async def async_setup_entry(
@@ -23,25 +26,29 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Set up the intercom camera."""
     hub = hass.data[DOMAIN][entry.entry_id]["hub"]
-    async_add_entities([VimarIntercomCamera(hub, entry.entry_id, hass)])
+    async_add_entities([VimarIntercomCamera(hub, entry.entry_id)])
 
 
 class VimarIntercomCamera(Camera):
-    """Intercom camera — streams video from SIP/RTP pipeline.
+    """Live video from the entrance panel.
 
-    Uses MJPEG directly (no RTSP/WebRTC). When the stream is opened
-    (e.g. from Apple Home), the hub auto-calls the intercom.
+    Opening the stream places a SIP call to the panel, because the panel
+    only sends video inside a call. Home Assistant fetches the stream
+    over a signed URL, so the underlying view still requires
+    authentication.
     """
 
     _attr_has_entity_name = True
     _attr_translation_key = "intercom"
     _attr_icon = "mdi:doorbell-video"
+    _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, hub, entry_id: str, hass: HomeAssistant) -> None:
+    def __init__(self, hub, entry_id: str) -> None:
+        """Attach the camera to the intercom device."""
         super().__init__()
         self._hub = hub
-        self._hass = hass
         self._attr_unique_id = f"{entry_id}_camera"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry_id)},
@@ -52,59 +59,25 @@ class VimarIntercomCamera(Camera):
 
     @property
     def is_streaming(self) -> bool:
-        """True when there's an active SIP call with video."""
+        """True while a call with video is up."""
         return self._hub.in_call
 
     @property
     def is_on(self) -> bool:
+        """The camera is always available; the stream starts on demand."""
         return True
 
     @property
-    def frontend_stream_type(self):
-        """Tell HA frontend to use MJPEG."""
-        from homeassistant.components.camera import StreamType
-        return StreamType.MJPEG
+    def use_stream_for_stills(self) -> bool:
+        """Take stills from the stream.
+
+        The panel sends H.264, never JPEG, so there is no still image to
+        fetch. Without this, Home Assistant would call `camera_image` and
+        get NotImplementedError for every snapshot and dashboard preview.
+        """
+        return True
 
     async def stream_source(self) -> str | None:
-        """AV stream URL for HomeKit (MPEG-TS with H264 video + PCMU audio)."""
-        base = self._hass.config.internal_url or "http://127.0.0.1:8123"
-        return f"{base}/api/vimar_intercom/av"
-
-    async def async_camera_image(
-        self, width: int | None = None, height: int | None = None
-    ) -> bytes | None:
-        """Return the latest cached JPEG frame (no auto-call).
-
-        This is called by Apple Home for the thumbnail on the home screen.
-        We only return whatever frame we already have — no SIP call triggered.
-        The live stream (user taps camera) goes through stream_source/MJPEG view
-        which triggers auto-call there.
-        """
-        return self._hub.video_frame
-
-    async def handle_async_mjpeg_stream(
-        self, request: web.Request
-    ) -> web.StreamResponse | None:
-        """Serve MJPEG stream directly to the HA frontend.
-
-        Does NOT auto-call — only shows video if a call is already active.
-        Use the Call button to start a call first.
-        """
-        import asyncio
-
-        response = web.StreamResponse()
-        response.content_type = "multipart/x-mixed-replace; boundary=frame"
-        await response.prepare(request)
-        try:
-            while True:
-                frame = self._hub.video_frame
-                if frame:
-                    await response.write(
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n"
-                        + frame + b"\r\n"
-                    )
-                await asyncio.sleep(0.1)
-        except (ConnectionResetError, asyncio.CancelledError):
-            pass
-        return response
+        """Signed URL of the MPEG-TS stream."""
+        signed = async_sign_path(self.hass, AV_PATH, SIGNATURE_LIFETIME)
+        return f"{get_url(self.hass, prefer_external=False)}{signed}"

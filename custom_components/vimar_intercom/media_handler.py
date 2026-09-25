@@ -414,7 +414,7 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                     break
 
     def _depacketize(self, payload, seq):
-        """Depacketize RTP H.264 payload → send NAL units via WebSocket."""
+        """Depacketize RTP H.264 payload → hand NAL units to the video registry."""
         if len(payload) < 1:
             return
         nal_type = payload[0] & 0x1F
@@ -575,9 +575,9 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         video_proto._nal_count = 0
         if remote_video_key:
             video_proto.srtp_rx = SRTPContext(remote_video_key)
-            _LOGGER.debug("SRTP Video RX — direct H.264 depacketization (no ffmpeg)")
+            _LOGGER.debug("SRTP Video RX context created")
         video_proto.send_stun()
-        await broadcast("log", f"Video SRTP → {vip}:{video['port']} (direct)")
+        await broadcast("log", f"Video SRTP → {vip}:{video['port']}")
 
     if _stun_task:
         _stun_task.cancel()
@@ -634,9 +634,6 @@ async def _stun_keepalive():
                 video_proto.send_stun()
     except asyncio.CancelledError:
         pass
-
-
-# (ffmpeg video pipeline removed — H.264 NALs sent directly from RTPVideoProtocol)
 
 
 # ─── AV stream (H264 video + PCMU audio → MPEG-TS for HomeKit) ────

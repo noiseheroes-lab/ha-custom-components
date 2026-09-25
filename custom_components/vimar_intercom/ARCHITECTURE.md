@@ -85,16 +85,29 @@ on separate ports (`RTPAudioProtocol`, `RTPVideoProtocol` in
   transcode — because the reference deployment is a fanless two-core
   machine that a live re-encode would saturate.
 - **Video** is decrypted, depacketised from RTP H.264 (FU-A and STAP-A)
-  into Annex-B NAL units, with the most recent SPS/PPS held and replayed
-  ahead of every IDR so a consumer attaching mid-stream can still decode.
+  into Annex-B NAL units, and handed to `VideoStreamRegistry`
+  (`media_handler.py`), which fans them out to consumers. It caches the
+  most recent SPS/PPS and replays them ahead of every IDR — and to any
+  new consumer as soon as it attaches — so a decoder that starts
+  mid-stream, or loses sync, can still recover. A consumer whose write
+  stalls transiently gets a small backlog (capped at 256 KB) to catch up
+  from; one that cannot recover, or was never seen again, is dropped.
 
-**This is where the integration stops today.** The depacketised NAL
-queue has no consumer: `media_handler._nal_sender` reads it and discards
-every frame, and the AV ffmpeg pipeline currently only carries audio — no
-video track reaches it. The camera entity's `stream_source()` points at
-the AV view, but there is no video to show. Wiring a real video consumer
-into this path, and finishing end-to-end delivery to the camera entity,
-is deliberately left to Tasks 12-13 rather than folded into this task.
+The one consumer wired up today is ffmpeg's stdin: the `/api/vimar_intercom/av`
+HTTP view starts ffmpeg when it is first opened, which remuxes (`-c
+copy`, never a transcode) the H.264 arriving on stdin with the PCMU audio
+arriving over a local RTP port into MPEG-TS on stdout. The camera entity
+exposes that view through a **signed path** — `async_sign_path` from
+`homeassistant.components.http.auth`, ten-minute expiry — because Home
+Assistant's `stream` component fetches `stream_source()` without
+carrying a bearer token, and the view still sets `requires_auth = True`.
+
+**This is built and unit tested but not verified against a real panel.**
+Whether the `stream` component's ffmpeg opens a signed internal URL
+cleanly, and whether the MPEG-TS the panel produces decodes without
+artifacts, is behavioural and needs a live Vimar panel — see the
+README's note on why that validation is a scheduled session, not
+something to try casually.
 
 ## Threat model
 
@@ -105,8 +118,11 @@ is deliberately left to Tasks 12-13 rather than folded into this task.
   `requires_auth = True`, with no exception — the door release is
   reachable through the SIP stack these views front, so an
   unauthenticated view would let anyone on the network that can reach
-  Home Assistant open the door. There is no separate signed-path scheme
-  yet; that is part of the unfinished camera work above.
+  Home Assistant open the door. The AV stream view is the one client
+  that cannot present a bearer token — Home Assistant's `stream`
+  component fetches `stream_source()` directly — so the camera signs
+  that URL with `async_sign_path` (ten-minute expiry) instead of
+  disabling auth; the view itself is unchanged and still requires it.
 - The integration never opens an inbound port on the internet. It
   maintains one outbound TLS connection to the Vimar cloud proxy; nothing
   listens for connections from outside the local network.

@@ -68,10 +68,6 @@ class VimarIntercomHub:
     def is_ringing(self) -> bool:
         return sip.pending_incoming["active"]
 
-    @property
-    def video_frame(self) -> bytes | None:
-        return None  # Video sent directly via WebSocket H.264 NALs
-
     def register_ring_callback(self, callback: Callable) -> None:
         self._ring_callbacks.append(callback)
 
