@@ -64,28 +64,6 @@ def ulaw_decode(data: bytes) -> bytes:
     return bytes(pcm)
 
 
-def ulaw_encode(pcm_data: bytes) -> bytes:
-    """16-bit signed LE PCM → μ-law bytes."""
-    BIAS = 0x84
-    CLIP = 32635
-    n = len(pcm_data) // 2
-    out = bytearray(n)
-    for i in range(n):
-        sample = struct.unpack_from('<h', pcm_data, i * 2)[0]
-        sign = 0x80 if sample < 0 else 0
-        if sample < 0:
-            sample = -sample
-        sample = min(sample, CLIP) + BIAS
-        exp = 7
-        mask = 0x4000
-        while exp > 0 and not (sample & mask):
-            exp -= 1
-            mask >>= 1
-        mantissa = (sample >> (exp + 3)) & 0x0F
-        out[i] = (~(sign | (exp << 4) | mantissa)) & 0xFF
-    return bytes(out)
-
-
 # ─── RTP Protocols ──────────────────────────────────────────────────
 
 class RTPAudioProtocol(asyncio.DatagramProtocol):
@@ -107,7 +85,7 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
-        _LOGGER.info("RTP Audio ready on :%d", CFG.rtp_audio_port)
+        _LOGGER.debug("RTP Audio ready on :%d", CFG.rtp_audio_port)
 
     def datagram_received(self, data, addr):
         if len(data) < 4:
@@ -138,7 +116,7 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         payload = rtp[hlen:]
         self.pkt_count += 1
         if self.pkt_count == 1:
-            _LOGGER.info("First SRTP audio from %s (%dB)", addr, len(payload))
+            _LOGGER.debug("First SRTP audio from %s (%dB)", addr, len(payload))
         pcm = ulaw_decode(payload)
         try:
             self.audio_buffer.put_nowait(pcm)
@@ -203,7 +181,7 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
-        _LOGGER.info("RTP Video ready on :%d", CFG.rtp_video_port)
+        _LOGGER.debug("RTP Video ready on :%d", CFG.rtp_video_port)
         # Start ordered NAL sender
         loop = asyncio.get_event_loop()
         self._nal_queue = asyncio.Queue(maxsize=500)
@@ -229,9 +207,9 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
 
         self.pkt_count += 1
         if self.pkt_count == 1:
-            _LOGGER.info("First video RTP from %s (%dB)", addr, len(rtp))
+            _LOGGER.debug("First video RTP from %s (%dB)", addr, len(rtp))
         if self.pkt_count <= 3 or self.pkt_count % 200 == 0:
-            _LOGGER.info("Video pkt #%d: %dB, srtp_ok=%d fail=%d nals=%d types=%s",
+            _LOGGER.debug("Video pkt #%d: %dB, srtp_ok=%d fail=%d nals=%d types=%s",
                          self.pkt_count, len(rtp), self._srtp_ok, self._srtp_fail,
                          self._nal_count, self._nal_types)
 
@@ -316,14 +294,13 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                 self._fua_buf.extend(fragment)
                 self._fua_started = True
                 self._fua_expected_seq = (seq + 1) & 0xFFFF
-                if nal_unit_type in (5, 7, 8) or self.pkt_count <= 20:
-                    _LOGGER.info("FU-A START seq=%d nalType=%d fragSize=%d",
+                if nal_unit_type in (5, 7, 8):
+                    _LOGGER.debug("FU-A START seq=%d nalType=%d fragSize=%d",
                                  seq, nal_unit_type, len(fragment))
             elif not self._fua_started:
                 # FU-A continuation without start — dropped start packet
-                if self.pkt_count <= 20:
-                    _LOGGER.warning("FU-A middle/end without start: seq=%d nalType=%d end=%s",
-                                    seq, nal_unit_type, end)
+                _LOGGER.warning("FU-A middle/end without start: seq=%d nalType=%d end=%s",
+                                seq, nal_unit_type, end)
                 return
             else:
                 # Check sequence continuity — tolerate small gaps (1-3 missing pkts)
@@ -346,8 +323,8 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
 
             if end and self._fua_started:
                 completed_type = self._fua_buf[0] & 0x1F if self._fua_buf else 0
-                if completed_type in (5, 7, 8) or self._nal_count <= 20:
-                    _LOGGER.info("FU-A END seq=%d nalType=%d totalSize=%d",
+                if completed_type in (5, 7, 8):
+                    _LOGGER.debug("FU-A END seq=%d nalType=%d totalSize=%d",
                                  seq, completed_type, len(self._fua_buf))
                 self._emit_nal(bytes(self._fua_buf))
                 self._fua_buf = bytearray()
@@ -365,10 +342,6 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         nal_type = nal_data[0] & 0x1F if nal_data else 0
         self._nal_count += 1
         self._nal_types[nal_type] = self._nal_types.get(nal_type, 0) + 1
-        if self._nal_count <= 10 or nal_type in (7, 8, 5):
-            _LOGGER.info("NAL #%d type=%d size=%d (first4: %s)",
-                         self._nal_count, nal_type, len(nal_data),
-                         nal_data[:4].hex() if len(nal_data) >= 4 else nal_data.hex())
 
         # Reorder: ensure SPS+PPS always precede IDR
         if nal_type == 7:  # SPS
@@ -385,7 +358,7 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         elif nal_type == 5:  # IDR
             if not self._sps_pps_sent:
                 # No SPS+PPS sent yet — buffer IDR
-                _LOGGER.info("IDR buffered — waiting for SPS+PPS")
+                _LOGGER.debug("IDR buffered — waiting for SPS+PPS")
                 self._pending_idr = nal_data
                 return
             else:
@@ -402,8 +375,6 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
 
     def _flush_params_and_idr(self):
         """Emit SPS→PPS→(pending IDR) in correct order."""
-        _LOGGER.info("Flushing SPS→PPS→IDR (pending_idr=%s)",
-                     "yes" if self._pending_idr else "no")
         if self._last_sps:
             self._queue_nal(self._last_sps)
         if self._last_pps:
@@ -493,10 +464,10 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         audio_proto.pkt_count = 0
         if remote_audio_key:
             audio_proto.srtp_rx = SRTPContext(remote_audio_key)
-            _LOGGER.info("SRTP Audio RX context created")
+            _LOGGER.debug("SRTP Audio RX context created")
         if local_crypto_key:
             audio_proto.srtp_tx = SRTPContext(local_crypto_key)
-            _LOGGER.info("SRTP Audio TX context created")
+            _LOGGER.debug("SRTP Audio TX context created")
         audio_proto.send_stun()
         await broadcast("log", f"Audio SRTP → {aip}:{audio['port']}")
 
@@ -520,7 +491,7 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         video_proto._nal_types = {}
         if remote_video_key:
             video_proto.srtp_rx = SRTPContext(remote_video_key)
-            _LOGGER.info("SRTP Video RX — direct H.264 depacketization (no ffmpeg)")
+            _LOGGER.debug("SRTP Video RX — direct H.264 depacketization (no ffmpeg)")
         video_proto.send_stun()
         await broadcast("log", f"Video SRTP → {vip}:{video['port']} (direct)")
 
@@ -564,13 +535,6 @@ def close_transports():
     if video_proto and video_proto.transport:
         video_proto.transport.close()
         video_proto = None
-
-
-def send_audio(pcm_data: bytes):
-    """Encode PCM from browser and send as RTP. Called by main.py."""
-    ulaw = ulaw_encode(pcm_data)
-    if audio_proto and audio_proto.remote_addr:
-        audio_proto.send_rtp(ulaw)
 
 
 # ─── STUN keepalive ─────────────────────────────────────────────────

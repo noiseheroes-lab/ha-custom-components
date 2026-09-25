@@ -125,7 +125,7 @@ class VimarIntercomHub:
 
     async def stream_opened(self, target: str | None = None):
         self._stream_viewers += 1
-        _LOGGER.info("Stream opened (%d viewers, target=%s)", self._stream_viewers, target)
+        _LOGGER.debug("Stream opened (%d viewers)", self._stream_viewers)
 
         if self._hangup_task:
             self._hangup_task.cancel()
@@ -134,7 +134,7 @@ class VimarIntercomHub:
         if sip.in_call or sip.calling:
             return
 
-        if sip.registered:
+        if sip.is_registered():
             self._auto_called = True
             self._auto_call_target = target
             # Fire auto-call as background task — don't block the HTTP response
@@ -320,7 +320,7 @@ class VimarIntercomHub:
             uri = self._cfg.door_uri
             body = command or self._cfg.door_command
 
-        _LOGGER.debug("Door command %s to %s (registered=%s)", body, uri, sip.registered)
+        _LOGGER.debug("Door command %s to %s (registered=%s)", body, uri, sip.is_registered())
 
         ok, msg = await sip.do_system_message(
             uri, body, extra_headers={"Panda": "command"})

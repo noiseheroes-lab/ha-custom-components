@@ -32,6 +32,16 @@ async def async_setup_entry(
     async_add_entities([VimarIntercomLock(hub, entry.entry_id)])
 
 
+def _device_info(entry_id: str) -> DeviceInfo:
+    """Device entry shared by every Vimar Intercom entity."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry_id)},
+        name="Vimar Intercom",
+        manufacturer=MANUFACTURER,
+        model=MODEL,
+    )
+
+
 class VimarIntercomLock(LockEntity):
     """A door release, modelled as a lock.
 
@@ -49,12 +59,7 @@ class VimarIntercomLock(LockEntity):
         self._attr_unique_id = f"{entry_id}_lock"
         self._is_locked = True
         self._relock_task: asyncio.Task | None = None
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
-            name="Vimar Intercom",
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-        )
+        self._attr_device_info = _device_info(entry_id)
 
     @property
     def is_locked(self) -> bool:

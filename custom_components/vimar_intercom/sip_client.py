@@ -71,9 +71,8 @@ MY_IP = None
 
 # Registration lifetime, tracked so `is_registered()` reflects what the
 # registrar actually granted rather than a flag that only ever moves
-# forward. Both are `None` while there is no live registration.
+# forward. `None` while there is no live registration.
 registration_expiry: float | None = None
-registered_since: float | None = None
 _reregister_task: asyncio.Task | None = None
 
 # Set by connection_supervisor() on each connection attempt; used by
@@ -158,7 +157,9 @@ def get_local_ip():
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.connect((host, port))
-            return sock.getsockname()[0]
+            ip = sock.getsockname()[0]
+            _LOGGER.debug("Detected local IP %s", ip)
+            return ip
         except OSError:
             continue
         finally:
@@ -234,11 +235,11 @@ async def connect():
     global reader, writer, lock
     loop = asyncio.get_event_loop()
     ctx = await loop.run_in_executor(None, _create_ssl_context)
-    _LOGGER.info("Connecting to SIP proxy %s:%d...", CFG.proxy_host, CFG.proxy_port)
+    _LOGGER.info("Connecting to the SIP proxy %s:%d", CFG.proxy_host, CFG.proxy_port)
     reader, writer = await asyncio.open_connection(
         CFG.proxy_host, CFG.proxy_port, ssl=ctx, server_hostname=CFG.sni)
     lock = asyncio.Lock()
-    _LOGGER.info("SIP TLS connected")
+    _LOGGER.info("SIP TLS connection established")
 
 
 async def send(msg: str):
@@ -500,7 +501,7 @@ def _accept_registration(msg: ParsedMessage) -> bool:
     half of zero would re-REGISTER in a tight loop for as long as the
     registrar kept answering that way.
     """
-    global registration_expiry, registered_since
+    global registration_expiry
     granted = granted_expiry(msg, CFG.sip_user, C.DEFAULT_REGISTER_EXPIRY)
     if granted <= 0:
         _LOGGER.warning(
@@ -508,9 +509,7 @@ def _accept_registration(msg: ParsedMessage) -> bool:
         _clear_registration()
         return False
     granted = max(granted, C.MIN_REGISTER_EXPIRY)
-    now = time.monotonic()
-    registration_expiry = now + granted
-    registered_since = now
+    registration_expiry = time.monotonic() + granted
     _set_registered(True)
     _LOGGER.info("SIP registered for %ds", granted)
     _schedule_reregister(granted * REGISTER_EXPIRY_SAFETY)
@@ -541,10 +540,9 @@ def _clear_registration() -> None:
     cancelling the previous timer — leaving `is_registered()` permanently
     False and the connectivity sensor stuck off.
     """
-    global registration_expiry, registered_since
+    global registration_expiry
     _cancel_reregister()
     registration_expiry = None
-    registered_since = None
     _set_registered(False)
 
 
@@ -629,10 +627,10 @@ async def do_register():
 
 
 async def do_system_message(target_uri, body_text, extra_headers=None):
-    if not registered:
+    if not is_registered():
         _LOGGER.warning("do_system_message: not registered, target=%s body=%s", target_uri, body_text)
-        return False, "Non registrato"
-    _LOGGER.info("do_system_message: target=%s body=%s headers=%s", target_uri, body_text, extra_headers)
+        return False, "Not registered"
+    _LOGGER.debug("Sending %s to %s", body_text, target_uri)
     ftag = _gen("")
     cid = _gen("sys-")
 
@@ -664,13 +662,13 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
     await send(_msg(branch, seq))
     for raw in await _wait_final(key, cid, seq, "MESSAGE", timeout=15):
         msg = parse_message(raw)
-        _LOGGER.info("do_system_message: response %s for %s", msg.code, target_uri)
+        _LOGGER.debug("do_system_message: response %s for %s", msg.code, target_uri)
         if msg.code and msg.code < 200:
             continue
         if msg.code in (401, 407):
             ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
             if not ch:
-                return False, f"Auth vuoto ({msg.code})"
+                return False, f"Empty authentication challenge ({msg.code})"
             auth = _make_auth("MESSAGE", target_uri, ch)
             branch2 = _gen()
             seq2 = _next_cseq()
@@ -678,27 +676,27 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
             await send(_msg(branch2, seq2, auth=auth))
             for raw2 in await _wait_final(key2, cid, seq2, "MESSAGE", timeout=15):
                 msg2 = parse_message(raw2)
-                _LOGGER.info("do_system_message: auth response %s for %s", msg2.code, target_uri)
+                _LOGGER.debug("do_system_message: auth response %s for %s", msg2.code, target_uri)
                 if msg2.code and 200 <= msg2.code < 300:
                     return True, f"OK ({msg2.code})"
                 if msg2.code and msg2.code >= 300:
-                    return False, f"Errore: {msg2.code}"
-            return False, "Timeout"
+                    return False, f"Rejected with {msg2.code}"
+            return False, "Timed out"
         if msg.code and 200 <= msg.code < 300:
             return True, f"OK ({msg.code})"
         if msg.code and msg.code >= 300:
-            return False, f"Errore: {msg.code}"
-    return False, "Timeout"
+            return False, f"Rejected with {msg.code}"
+    return False, "Timed out"
 
 
 async def do_call(target=None):
-    """INVITE a SIP target (default: intercom targa 55001)."""
-    if not registered:
+    """INVITE a SIP target (default: intercom entrance panel 55001)."""
+    if not is_registered():
         _LOGGER.error("do_call: NOT registered")
-        return False, "Non registrato"
+        return False, "Not registered"
     if in_call or calling:
         _LOGGER.error("do_call: already in call/calling")
-        return False, "Già in chiamata"
+        return False, "Already in a call"
 
     _set_calling(True)
     key: str | None = None
@@ -769,7 +767,7 @@ async def do_call(target=None):
         cur_seq = _next_cseq()
         key = _open_transaction(branch, cur_seq, "INVITE", cid)
         await send(_inv(branch, cur_seq))
-        await broadcast("log", "INVITE inviato...")
+        await broadcast("log", "INVITE sent")
 
         queue = pending_transactions[key]
         deadline = time.monotonic() + 45
@@ -793,7 +791,7 @@ async def do_call(target=None):
                 await send(_ack(ttag, cur_seq))
                 ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
                 if not ch:
-                    return False, f"Auth vuoto ({msg.code})"
+                    return False, f"Empty authentication challenge ({msg.code})"
                 auth = _make_auth("INVITE", target_uri, ch)
                 _close_transaction(key, cid, cur_seq, "INVITE")
                 branch = _gen()
@@ -815,15 +813,15 @@ async def do_call(target=None):
                 if msg.body:
                     remote = parse_sdp(msg.body)
                     call_state["remote_sdp"] = remote
-                    _LOGGER.info("SDP: audio=%s video=%s", remote.get('audio', {}), remote.get('video', {}))
+                    _LOGGER.debug("SDP: audio=%s video=%s", remote.get('audio', {}), remote.get('video', {}))
                     await media.setup_media(remote, _local_crypto_key, _local_video_crypto_key)
 
                 _set_in_call(True)
                 _set_calling(False)
-                await broadcast("call_started", "Connesso!")
+                await broadcast("call_started", "Connected")
                 # Request keyframe immediately — no delay
                 await send_keyframe_request()
-                return True, "Connesso!"
+                return True, "Connected"
 
             if msg.code >= 300:
                 _LOGGER.error("INVITE rejected: %d", msg.code)
@@ -833,7 +831,7 @@ async def do_call(target=None):
                 return False, f"{msg.code} {reason}"
 
         _LOGGER.error("INVITE timeout (45s) for %s", target_uri)
-        return False, "Timeout (45s)"
+        return False, "Timed out (45s)"
     finally:
         if key is not None:
             _close_transaction(key, cid, cur_seq, "INVITE")
@@ -864,7 +862,7 @@ async def send_keyframe_request():
         f"Content-Type: application/media_control+xml\r\n"
         f"Content-Length: {len(body)}\r\n\r\n{body}")
     await send(msg)
-    _LOGGER.info("Sent INFO picture_fast_update (keyframe request)")
+    _LOGGER.debug("Sent INFO picture_fast_update (keyframe request)")
 
 
 async def do_hangup():
@@ -872,7 +870,7 @@ async def do_hangup():
     if not in_call or not call_state["call_id"]:
         _set_in_call(False)
         await media.stop_media()
-        await broadcast("call_ended", "Chiamata terminata")
+        await broadcast("call_ended", "Call ended")
         return
 
     cid = call_state["call_id"]
@@ -905,21 +903,12 @@ async def do_hangup():
     call_state.update(call_id=None, from_tag=None, to_tag=None,
                       remote_contact=None, remote_sdp=None, original_target=None)
     await media.stop_media()
-    await broadcast("call_ended", "Chiamata terminata")
-
-
-async def do_door(target: str | None = None):
-    """Legacy door open — prefer do_system_message via hub.async_door."""
-    address = target or CFG.default_panel.address
-    uri = CFG.panel_uri(address)
-    _LOGGER.info("do_door: sending %s to %s", CFG.door_command, uri)
-    return await do_system_message(
-        uri, CFG.door_command, extra_headers={"Panda": "command"})
+    await broadcast("call_ended", "Call ended")
 
 
 async def do_options(target=None):
-    if not registered:
-        return False, "Non registrato"
+    if not is_registered():
+        return False, "Not registered"
     target = target or CFG.panel_uri(CFG.default_panel.address)
     ftag = _gen("")
     cid = _gen("opt-")
@@ -950,7 +939,7 @@ async def do_options(target=None):
         if msg.code in (401, 407):
             ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
             if not ch:
-                return False, "Auth vuoto"
+                return False, f"Empty authentication challenge ({msg.code})"
             auth = _make_auth("OPTIONS", target, ch)
             branch2 = _gen()
             seq2 = _next_cseq()
@@ -960,13 +949,13 @@ async def do_options(target=None):
                 msg2 = parse_message(raw2)
                 if msg2.code and 200 <= msg2.code < 300:
                     return True, f"OK: {msg2.code}"
-                return False, f"Errore: {msg2.code}"
-            return False, "Timeout"
+                return False, f"Rejected with {msg2.code}"
+            return False, "Timed out"
         if msg.code and 200 <= msg.code < 300:
             return True, f"OK: {msg.code}"
         if msg.code and msg.code >= 300:
-            return False, f"Errore: {msg.code}"
-    return False, "Timeout"
+            return False, f"Rejected with {msg.code}"
+    return False, "Timed out"
 
 
 async def do_connect_profiles():
@@ -978,10 +967,11 @@ async def do_connect_profiles():
 
     import requests as req_lib
     loop = asyncio.get_event_loop()
+    base_url = f"https://{CFG.route}/eipvdesUtils"
 
     def _call(endpoint):
         return req_lib.post(
-            f"https://ipvdes.vimar.cloud/eipvdesUtils/{endpoint}",
+            f"{base_url}/{endpoint}",
             json=body,
             auth=req_lib.auth.HTTPDigestAuth(username, CFG.push_token),
             headers={"Accept": "application/json"}, timeout=15)
@@ -990,13 +980,13 @@ async def do_connect_profiles():
         resp = await loop.run_in_executor(None, _call, "connectProfiles")
         _LOGGER.info("connectProfiles: %d", resp.status_code)
         if resp.status_code == 200:
-            return True, "Profilo connesso"
+            return True, "Profile connected"
         if resp.status_code == 403:
             await loop.run_in_executor(None, _call, "disconnectProfiles")
             resp3 = await loop.run_in_executor(None, _call, "connectProfiles")
             _LOGGER.info("connectProfiles retry: %d", resp3.status_code)
             if resp3.status_code == 200:
-                return True, "Profilo connesso"
+                return True, "Profile connected"
             return False, f"connectProfiles: {resp3.status_code}"
         return False, f"connectProfiles: {resp.status_code}"
     except Exception as e:
@@ -1068,11 +1058,11 @@ async def do_answer_incoming():
     if p["body"]:
         remote = parse_sdp(p["body"])
         call_state["remote_sdp"] = remote
-        _LOGGER.info("Answer SDP: audio=%s video=%s", remote.get('audio'), remote.get('video'))
+        _LOGGER.debug("Answer SDP: audio=%s video=%s", remote.get('audio'), remote.get('video'))
         await media.setup_media(remote, _local_crypto_key, _local_video_crypto_key)
 
     pending_incoming["active"] = False
-    await broadcast("call_started", "Chiamata attiva!")
+    await broadcast("call_started", "Call established")
     # Request keyframe for video
     await send_keyframe_request()
     return True, "Answered"
@@ -1113,7 +1103,7 @@ async def handle_incoming_bye(raw):
     call_state.update(call_id=None, from_tag=None, to_tag=None,
                       remote_contact=None, remote_sdp=None, original_target=None)
     await media.stop_media()
-    await broadcast("call_ended", "Chiamata terminata")
+    await broadcast("call_ended", "Call ended")
 
 
 async def handle_incoming_options(raw):
@@ -1155,7 +1145,7 @@ async def handle_incoming_cancel(raw):
             f"Content-Length: 0\r\n\r\n")
         pending_incoming["active"] = False
 
-    await broadcast("ring_ended", "Chiamata cancellata")
+    await broadcast("ring_ended", "Call cancelled")
 
 
 async def request_processor():
@@ -1172,7 +1162,7 @@ async def request_processor():
         elif method == "OPTIONS":
             asyncio.create_task(handle_incoming_options(raw))
         elif method == "MESSAGE":
-            _LOGGER.info("SIP MESSAGE: %s", msg.body[:200])
+            _LOGGER.debug("SIP MESSAGE: %s", msg.body[:200])
             await broadcast("message", msg.body[:200])
             from_hdr = msg.headers.get("from", "")
             to_hdr = msg.headers.get("to", "")
