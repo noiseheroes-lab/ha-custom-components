@@ -126,6 +126,12 @@ class VimarIntercomHub:
         task.add_done_callback(self._background.discard)
         return task
 
+    def _schedule_delayed_hangup(self) -> None:
+        """Start the grace period before dropping an unwatched auto-call."""
+        if self._hangup_task:
+            self._hangup_task.cancel()
+        self._hangup_task = asyncio.create_task(self._delayed_hangup())
+
     def _clear_auto_call(self) -> None:
         """Forget that the live call was one this hub placed itself.
 
@@ -188,7 +194,7 @@ class VimarIntercomHub:
                 # 45 s. Without this the call establishes with nobody
                 # watching and runs to MAX_CALL_DURATION, holding the
                 # account's single registration the whole time.
-                self._hangup_task = asyncio.create_task(self._delayed_hangup())
+                self._schedule_delayed_hangup()
         except asyncio.CancelledError:
             self._clear_auto_call()
             raise
@@ -205,7 +211,7 @@ class VimarIntercomHub:
             return
 
         if sip.in_call:
-            self._hangup_task = asyncio.create_task(self._delayed_hangup())
+            self._schedule_delayed_hangup()
         elif not sip.calling:
             # There is no call to hang up and none on its way: the
             # auto-call never established (the view gave up waiting), or
@@ -265,7 +271,11 @@ class VimarIntercomHub:
                 if not sip.in_call:
                     return
                 await sip.send_keyframe_request()
-            # Then periodic every 2s
+            # Then periodic for the rest of the call, whether or not a
+            # viewer is attached: the registry caches every IDR that
+            # arrives, and that cache is what a still is decoded from,
+            # so stopping the requests would freeze the snapshot of a
+            # call answered without the camera open.
             while sip.in_call:
                 await asyncio.sleep(2)
                 await sip.send_keyframe_request()
