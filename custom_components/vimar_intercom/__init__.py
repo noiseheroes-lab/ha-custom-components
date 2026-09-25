@@ -39,6 +39,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     domain_data = hass.data.setdefault(DOMAIN, {})
 
+    # A v2 entry is loading, so whatever 1.x entry raised the
+    # re-setup issue has been dealt with.
+    ir.async_delete_issue(hass, DOMAIN, ISSUE_MIGRATION_REQUIRED)
+
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
     hub.set_issue_callbacks(
