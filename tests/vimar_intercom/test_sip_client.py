@@ -7,6 +7,8 @@ behaviours need pinning down.
 """
 
 import asyncio
+import ssl
+import time
 
 import pytest
 
@@ -416,3 +418,281 @@ def test_a_bye_for_another_dialog_leaves_the_live_call_alone(
     assert sip.in_call is True
     assert sip.call_state["call_id"] == "call-abc"
     assert live_call == []
+
+
+# ─── a hang-up during setup is deferred, not dropped ─────────────────
+
+def _raw_200_with_sdp() -> str:
+    """The panel answering an INVITE, with an SDP answer attached."""
+    body = ("v=0\r\n"
+            "o=- 1 1 IN IP4 192.0.2.9\r\n"
+            "c=IN IP4 192.0.2.9\r\n"
+            "m=audio 40000 RTP/SAVP 0\r\n"
+            "m=video 40002 RTP/SAVP 96\r\n")
+    return (
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS 192.0.2.5:5070;branch=z9hG4bK-ours\r\n"
+        "From: <sip:60901@example.invalid>;tag=ftag\r\n"
+        "To: <sip:55001@example.invalid>;tag=paneltag\r\n"
+        "Call-ID: call-abc\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Contact: <sip:55001@192.0.2.9:5060;transport=tls>\r\n"
+        "Content-Type: application/sdp\r\n"
+        f"Content-Length: {len(body.encode())}\r\n\r\n{body}")
+
+
+@pytest.fixture
+def configured(monkeypatch):
+    """A registered SIP layer with a configuration and no real socket."""
+    config = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(QR_FIELDS), {})
+    monkeypatch.setattr(sip, "CFG", config)
+    monkeypatch.setattr(sip, "MY_IP", "192.0.2.5")
+    monkeypatch.setattr(sip, "registered", True)
+    monkeypatch.setattr(sip, "registration_expiry", time.monotonic() + 3600)
+    return config
+
+
+async def _first_transaction_queue() -> asyncio.Queue:
+    """Wait for the transaction the operation under test just opened."""
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if sip.pending_transactions:
+            return next(iter(sip.pending_transactions.values()))
+    raise AssertionError("no transaction was opened")
+
+
+def test_a_hang_up_during_setup_is_honoured_when_the_call_connects(
+        configured, monkeypatch):
+    """The press must survive the up-to-45 s window, not be discarded.
+
+    `do_hangup` cannot tear down a dialog `do_call` still owns, so it
+    records the request instead. Dropping it let the call establish and
+    run to the five-minute limit, holding the account's single SIP
+    registration while the hub declined every real doorbell press.
+    """
+    sent: list[str] = []
+    media_setups: list[object] = []
+    events: list[str] = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    async def _setup_media(remote):
+        media_setups.append(remote)
+
+    async def _stop_media():
+        events.append("stop_media")
+
+    async def _broadcast(msg_type, _msg):
+        events.append(msg_type)
+
+    monkeypatch.setattr(sip, "send", _send)
+    monkeypatch.setattr(sip, "_wait_final", _no_wait)
+    monkeypatch.setattr(sip.media, "setup_media", _setup_media)
+    monkeypatch.setattr(sip.media, "stop_media", _stop_media)
+    monkeypatch.setattr(sip, "_broadcast", _broadcast)
+
+    async def scenario():
+        task = asyncio.create_task(sip.do_call())
+        queue = await _first_transaction_queue()
+        # The INVITE is in flight; the user gives up and presses Hang up.
+        await sip.do_hangup()
+        assert sip.hangup_requested is True
+        # Only now does the panel answer.
+        await queue.put(_raw_200_with_sdp())
+        return await task
+
+    ok, msg = run(scenario())
+
+    assert ok is False
+    assert "hung up" in msg.lower()
+    # The dialog was completed far enough to end it properly: the ACK
+    # went, then the BYE.
+    methods = [m.split(" ", 1)[0] for m in sent]
+    assert methods == ["INVITE", "ACK", "BYE"]
+    assert "Call-ID: call-" in sent[-1]
+    # No media was ever started for a call nobody is watching.
+    assert media_setups == []
+    assert sip.in_call is False
+    assert sip.calling is False
+    assert sip.hangup_requested is False
+    assert "call_started" not in events
+    assert events[-1] == "call_ended"
+
+
+def test_a_hang_up_recorded_by_a_failed_call_does_not_end_the_next_one(
+        configured, monkeypatch):
+    """A rejected INVITE never reaches `_end_call_locally` to clear it."""
+    sip.calling = True
+    sip.call_state["call_id"] = "call-that-was-rejected"
+
+    async def _send(_msg):
+        pass
+
+    monkeypatch.setattr(sip, "send", _send)
+    run(sip.do_hangup())
+    assert sip.hangup_requested is True
+
+    async def scenario():
+        task = asyncio.create_task(sip.do_call())
+        await _first_transaction_queue()
+        # `do_call` clears the stale request before it can act on it.
+        assert sip.hangup_requested is False
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    run(scenario())
+
+
+# ─── Content-Length is a byte count ──────────────────────────────────
+
+def test_content_length_counts_bytes_not_characters(configured, monkeypatch):
+    """One accented character used to corrupt the whole SIP stream.
+
+    `send` encodes the message as UTF-8, so a character count
+    under-declares the body and the proxy frames the surplus bytes as
+    the head of the next request. `door_command` is user-supplied.
+    """
+    sent: list[str] = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(sip, "send", _send)
+    monkeypatch.setattr(sip, "_wait_final", _no_wait)
+
+    body = "APRÌ_2F"
+    run(sip.do_system_message("sip:21@example.invalid", body))
+
+    head, _, wire_body = sent[0].partition("\r\n\r\n")
+    declared = int([line.split(":", 1)[1] for line in head.split("\r\n")
+                    if line.lower().startswith("content-length:")][0])
+    assert declared == len(body.encode())
+    assert declared != len(body)
+    assert declared == len(wire_body.encode())
+
+
+# ─── a challenge is answered with the header that matches its code ───
+
+def _raw_challenge(code: int, header: str) -> str:
+    return (
+        f"SIP/2.0 {code} Unauthorized\r\n"
+        "Via: SIP/2.0/TLS 192.0.2.5:5070;branch=z9hG4bK-ours\r\n"
+        "From: <sip:60901@example.invalid>;tag=ftag\r\n"
+        "To: <sip:21@example.invalid>;tag=servertag\r\n"
+        "Call-ID: sys-abc\r\n"
+        "CSeq: 1 MESSAGE\r\n"
+        f'{header}: Digest realm="example.invalid", '
+        'nonce="abc123", qop="auth"\r\n'
+        "Content-Length: 0\r\n\r\n")
+
+
+def _run_challenged_message(monkeypatch, code, header):
+    """Send one MESSAGE, answer it with `code`, and return what went out."""
+    sent: list[str] = []
+    responses = [[_raw_challenge(code, header)], []]
+
+    async def _send(msg):
+        sent.append(msg)
+
+    async def _wait(*_args, **_kwargs):
+        return responses.pop(0) if responses else []
+
+    monkeypatch.setattr(sip, "send", _send)
+    monkeypatch.setattr(sip, "_wait_final", _wait)
+    run(sip.do_system_message("sip:21@example.invalid", "OPEN_2F"))
+    return sent
+
+
+def test_a_401_challenge_is_answered_with_authorization(
+        configured, monkeypatch):
+    """A 401 answered with Proxy-Authorization is simply ignored.
+
+    The retry is rejected identically, `do_system_message` reports
+    "Rejected with 401", and the door silently does not open.
+    """
+    sent = _run_challenged_message(monkeypatch, 401, "WWW-Authenticate")
+    assert len(sent) == 2
+    assert "\r\nAuthorization: Digest " in sent[1]
+    assert "\r\nProxy-Authorization:" not in sent[1]
+
+
+def test_a_407_challenge_is_answered_with_proxy_authorization(
+        configured, monkeypatch):
+    """The proxy's own challenge keeps the header it expects."""
+    sent = _run_challenged_message(monkeypatch, 407, "Proxy-Authenticate")
+    assert len(sent) == 2
+    assert "\r\nProxy-Authorization: Digest " in sent[1]
+
+
+# ─── declining: 486 for a real visitor, 603 for our own echo ─────────
+
+@pytest.fixture
+def ringing(configured, monkeypatch):
+    """One pending incoming INVITE, and the list of what we send back."""
+    sent: list[str] = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(sip, "send", _send)
+    sip.pending_incoming.update(
+        active=True, cid="call-in", from_hdr="<sip:55001@example.invalid>",
+        to_hdr="<sip:60901@example.invalid>", cseq="1 INVITE",
+        via_block="Via: SIP/2.0/TLS 192.0.2.9:5060;branch=z9hG4bK-panel\r\n",
+        my_tag="mytag", caller_uri="sip:55001@example.invalid")
+    return sent
+
+
+def test_declining_our_own_echo_uses_603(ringing):
+    run(sip.do_decline_incoming())
+    assert ringing[0].startswith("SIP/2.0 603 Decline")
+    assert sip.pending_incoming["active"] is False
+
+
+def test_declining_a_real_visitor_uses_486_busy_here(ringing):
+    """603 is a global failure: a forking proxy cancels the other
+    branches, so the indoor unit stops ringing too."""
+    run(sip.do_decline_incoming(busy=True))
+    assert ringing[0].startswith("SIP/2.0 486 Busy Here")
+    assert sip.pending_incoming["active"] is False
+
+
+# ─── framing is not left to the peer ─────────────────────────────────
+
+def test_a_negative_content_length_cannot_re_slice_the_header(monkeypatch):
+    """It made `total` smaller than the header and fed it back in."""
+    reconnects: list[bool] = []
+    monkeypatch.setattr(sip, "request_reconnect",
+                        lambda: reconnects.append(True))
+    raw = (b"SIP/2.0 200 OK\r\nCall-ID: x\r\nContent-Length: -400\r\n\r\n")
+    assert run(sip._dispatch_buffer(raw)) == b""
+    assert reconnects == [True]
+
+
+def test_an_enormous_content_length_is_refused(monkeypatch):
+    """Without a ceiling the reader buffers until the host runs out."""
+    reconnects: list[bool] = []
+    monkeypatch.setattr(sip, "request_reconnect",
+                        lambda: reconnects.append(True))
+    raw = (b"SIP/2.0 200 OK\r\nCall-ID: x\r\n"
+           b"Content-Length: 99999999\r\n\r\n")
+    assert run(sip._dispatch_buffer(raw)) == b""
+    assert reconnects == [True]
+
+
+# ─── TLS verification never fails open ───────────────────────────────
+
+def test_a_missing_ca_file_is_refused_rather_than_unverified(
+        monkeypatch, tmp_path):
+    """It used to disable certificate validation on the door's socket."""
+    monkeypatch.setattr(sip.C, "CA_PATH", str(tmp_path / "absent.pem"))
+    with pytest.raises(FileNotFoundError):
+        sip._create_ssl_context()
+
+
+def test_the_shipped_ca_file_produces_a_verifying_context():
+    ctx = sip._create_ssl_context()
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True

@@ -4,10 +4,9 @@ import asyncio
 import base64
 import hashlib
 import os
-import random
+import secrets
 import socket
 import ssl
-import string
 import time
 import logging
 
@@ -84,6 +83,16 @@ call_state = {
     "remote_contact": None, "remote_sdp": None, "original_target": None,
 }
 
+# Set when a hang-up arrives while `do_call` still owns the dialog, and
+# honoured by `do_call` the moment the call is complete enough to end.
+# `do_hangup` cannot act itself in that window — see its docstring.
+hangup_requested = False
+
+
+def _set_hangup_requested(val: bool) -> None:
+    global hangup_requested
+    hangup_requested = val
+
 pending_transactions: dict[str, asyncio.Queue] = {}
 incoming_requests: asyncio.Queue = None
 
@@ -101,7 +110,7 @@ def reset_state() -> None:
     calls this before anything else.
     """
     global reader, writer, lock, registered, in_call, calling
-    global cseq_counter, local_tag, registration_expiry
+    global cseq_counter, local_tag, registration_expiry, hangup_requested
     global _state_change_callback, _broadcast
 
     _cancel_reregister()
@@ -119,6 +128,7 @@ def reset_state() -> None:
     cseq_counter = 0
     local_tag = None
     registration_expiry = None
+    hangup_requested = False
     call_state.update(call_id=None, from_tag=None, to_tag=None,
                       remote_contact=None, remote_sdp=None,
                       original_target=None)
@@ -206,7 +216,15 @@ def get_local_ip():
 
 
 def _gen(prefix="z9hG4bK"):
-    return f"{prefix}{random.randint(100000, 9999999):x}"
+    """A fresh Via branch, From tag or Call-ID token.
+
+    These identify a dialog, so a predictable one lets anything that can
+    reach the proxy guess the identifiers of a call in progress.
+    `random` is a Mersenne Twister seeded from a 32-bit-ish entropy pool
+    and the old `randint(100000, 9999999)` offered about 2^23 values;
+    `secrets` is the CSPRNG the rest of this component already uses.
+    """
+    return f"{prefix}{secrets.token_hex(8)}"
 
 
 def _next_cseq():
@@ -215,9 +233,33 @@ def _next_cseq():
     return cseq_counter
 
 
+def _content_length(body: str) -> int:
+    """The byte count of a SIP body, which is what Content-Length means.
+
+    `send` encodes the whole message as UTF-8, so counting characters
+    under-declares any body that is not pure ASCII. The proxy then frames
+    the surplus bytes as the start of the next request and the stream is
+    corrupt from that point on. `door_command` is user-supplied, so a
+    single accented character used to be enough — no attacker required.
+    """
+    return len(body.encode())
+
+
 # ─── Digest Auth ────────────────────────────────────────────────────
 
 def _compute_ha1(realm):
+    """HA1 for the realm the server named.
+
+    A realm other than the configured domain is answered rather than
+    refused. That does hand a proxy a chosen-realm
+    `MD5(user:realm:password)` — offline-crackable, though the password
+    itself never leaves — but the proxy is reached over a TLS connection
+    whose certificate is verified (see `_create_ssl_context`), so
+    obtaining that hash already requires being the real proxy or holding
+    a valid certificate for it. Refusing instead would break every
+    installation whose registrar names a realm that is not its domain,
+    which cannot be checked from here. See ARCHITECTURE.md.
+    """
     if realm == CFG.sip_domain:
         return CFG.sip_ha1
     return hashlib.md5(f"{CFG.sip_user}:{realm}:{CFG.sip_password}".encode()).hexdigest()
@@ -234,14 +276,38 @@ def _digest_resp(method, uri, nonce, realm=None, qop=None, nc=None, cnonce=None)
 
 
 def _make_auth(method, uri, challenge):
+    """Build the digest credentials that answer one challenge.
+
+    Only MD5 is implemented, which is what the Vimar cloud challenges
+    with. A server asking for anything else gets an MD5 response it will
+    reject — that is a visible failure, and it is logged here, rather
+    than the silent wrong answer the caller cannot distinguish from a
+    bad password.
+
+    `nc` is fixed at 1 because every request this client sends opens its
+    own transaction and is challenged afresh; the nonce is never reused
+    across two requests. A registrar that both reuses a nonce and
+    enforces a monotonic `nc` would reject the second request inside one
+    nonce's lifetime, and would need real nonce bookkeeping here.
+    """
     p = header_params(challenge)
     nonce = p.get("nonce", "")
     realm = p.get("realm", CFG.sip_domain)
     opaque = p.get("opaque", "")
-    qop = p.get("qop", "")
+    algorithm = (p.get("algorithm") or "MD5").strip()
+    if algorithm.upper() not in ("MD5", "MD5-SESS"):
+        _LOGGER.warning(
+            "The server asked for digest algorithm %s, which this client "
+            "cannot compute; answering with MD5, which it will reject",
+            algorithm)
+    # `qop` is a comma-separated list of what the server accepts. A bare
+    # substring test also matched `auth-int`, and the code then sent
+    # `qop=auth` with an auth-style ha2: a wrong response, and a silent
+    # downgrade of the integrity mode the server had asked for.
+    qop_values = [v.strip().strip('"') for v in p.get("qop", "").split(",")]
     nc = "00000001"
-    cnonce = f"{random.randint(10**7, 10**8-1):08x}"
-    if "auth" in qop:
+    cnonce = secrets.token_hex(8)
+    if "auth" in qop_values:
         resp = _digest_resp(method, uri, nonce, realm, "auth", nc, cnonce)
         hdr = (f'Digest username="{CFG.sip_user}", realm="{realm}", '
                f'nonce="{nonce}", uri="{uri}", response="{resp}", '
@@ -256,15 +322,47 @@ def _make_auth(method, uri, challenge):
     return hdr
 
 
+def _challenge_of(msg: ParsedMessage) -> tuple[str, str]:
+    """Return one challenge and the request header that answers it.
+
+    A 407 is the proxy challenging, and is answered with
+    `Proxy-Authorization`; a 401 is the endpoint challenging, and is
+    answered with `Authorization`. Emitting `Proxy-Authorization` for a
+    401 — which is what this used to do for every MESSAGE and every
+    INVITE — means the server ignores the credentials and rejects the
+    retry identically. For a door command that is the whole failure: the
+    press is accepted, nothing happens, and the log says only 401.
+    """
+    if msg.code == 407:
+        return msg.headers.get("proxy-authenticate", ""), "Proxy-Authorization"
+    return msg.headers.get("www-authenticate", ""), "Authorization"
+
+
 # ─── Transport ──────────────────────────────────────────────────────
 
 def _create_ssl_context():
+    """The verified TLS context every SIP connection uses.
+
+    A missing CA file used to disable certificate validation outright,
+    on the one socket that carries the door command and the digest
+    response, with no log line and no symptom. A component that cannot
+    verify the proxy refuses to talk to it instead: `__init__.py` checks
+    for the same file at setup and raises `ConfigEntryNotReady`, and
+    this raise covers the file going away afterwards.
+
+    `load_verify_locations` on top of `create_default_context()` adds the
+    Vimar CA to the system roots rather than replacing them, so this is
+    not certificate pinning: any publicly trusted certificate for the
+    proxy host also validates. That is deliberate — see ARCHITECTURE.md.
+    """
+    if not os.path.exists(C.CA_PATH):
+        raise FileNotFoundError(
+            f"The Vimar CA certificate is missing from {C.CA_PATH}. "
+            "Reinstall the integration: without it the proxy's "
+            "certificate cannot be verified, and this connection carries "
+            "the door command.")
     ctx = ssl.create_default_context()
-    if os.path.exists(C.CA_PATH):
-        ctx.load_verify_locations(C.CA_PATH)
-    else:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_verify_locations(C.CA_PATH)
     return ctx
 
 
@@ -379,6 +477,13 @@ async def _reader_loop() -> None:
         buf = await _dispatch_buffer(buf)
 
 
+# Largest SIP body this client will frame. Everything it legitimately
+# receives is an SDP offer or answer, a few kilobytes at most. The value
+# comes off the wire, so without a ceiling a peer can name a huge length
+# and make the reader buffer until the host runs out of memory.
+MAX_BODY_BYTES = 128 * 1024
+
+
 async def _dispatch_buffer(buf: bytes) -> bytes:
     """Parse complete SIP messages out of `buf`, dispatch them, and
     return the unconsumed remainder."""
@@ -392,6 +497,16 @@ async def _dispatch_buffer(buf: bytes) -> bytes:
                     cl = int(line.split(":", 1)[1].strip())
                 except ValueError:
                     pass
+        # Both bounds are on a value the peer chose. A negative length
+        # made `total` smaller than `hdr_end` and re-sliced part of the
+        # header back into the buffer, where it was parsed again as a
+        # message of its own.
+        if cl < 0 or cl > MAX_BODY_BYTES:
+            _LOGGER.warning(
+                "Dropping the SIP connection: a peer declared a "
+                "Content-Length of %d", cl)
+            request_reconnect()
+            return b""
         total = hdr_end + cl
         if len(buf) < total:
             break
@@ -666,7 +781,21 @@ async def do_register():
     return False
 
 
+# Returned as the message of `do_system_message` when no final response
+# ever arrived. It is not a failure: the request may well have reached
+# the panel and only its 200 OK been lost, so a caller must never resend
+# on this. `hub.async_door` depends on the distinction — a resent door
+# command pulses the relay a second time.
+NO_RESPONSE = "Timed out"
+
+
 async def do_system_message(target_uri, body_text, extra_headers=None):
+    """Send one MESSAGE and report how it ended.
+
+    Returns `(True, "OK (2xx)")`, or `(False, reason)` where `reason` is
+    `NO_RESPONSE` when nothing final came back and a description of the
+    response otherwise.
+    """
     if not is_registered():
         _LOGGER.warning("do_system_message: not registered, target=%s body=%s", target_uri, body_text)
         return False, "Not registered"
@@ -674,7 +803,7 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
     ftag = _gen("")
     cid = _gen("sys-")
 
-    def _msg(branch, seq, auth=None):
+    def _msg(branch, seq, auth=None, auth_header="Proxy-Authorization"):
         m = (f"MESSAGE {target_uri} SIP/2.0\r\n"
              f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
              f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
@@ -691,9 +820,9 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
             for k, v in extra_headers.items():
                 m += f"{k}: {v}\r\n"
         if auth:
-            m += f"Proxy-Authorization: {auth}\r\n"
+            m += f"{auth_header}: {auth}\r\n"
         m += (f"Content-Type: text/plain\r\n"
-              f"Content-Length: {len(body_text)}\r\n\r\n{body_text}")
+              f"Content-Length: {_content_length(body_text)}\r\n\r\n{body_text}")
         return m
 
     branch = _gen()
@@ -706,14 +835,14 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
         if msg.code and msg.code < 200:
             continue
         if msg.code in (401, 407):
-            ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
+            ch, auth_header = _challenge_of(msg)
             if not ch:
                 return False, f"Empty authentication challenge ({msg.code})"
             auth = _make_auth("MESSAGE", target_uri, ch)
             branch2 = _gen()
             seq2 = _next_cseq()
             key2 = _open_transaction(branch2, seq2, "MESSAGE", cid)
-            await send(_msg(branch2, seq2, auth=auth))
+            await send(_msg(branch2, seq2, auth=auth, auth_header=auth_header))
             for raw2 in await _wait_final(key2, cid, seq2, "MESSAGE", timeout=15):
                 msg2 = parse_message(raw2)
                 _LOGGER.debug("do_system_message: auth response %s for %s", msg2.code, target_uri)
@@ -721,12 +850,12 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
                     return True, f"OK ({msg2.code})"
                 if msg2.code and msg2.code >= 300:
                     return False, f"Rejected with {msg2.code}"
-            return False, "Timed out"
+            return False, NO_RESPONSE
         if msg.code and 200 <= msg.code < 300:
             return True, f"OK ({msg.code})"
         if msg.code and msg.code >= 300:
             return False, f"Rejected with {msg.code}"
-    return False, "Timed out"
+    return False, NO_RESPONSE
 
 
 async def do_call(target=None):
@@ -739,6 +868,10 @@ async def do_call(target=None):
         return False, "Already in a call"
 
     _set_calling(True)
+    # A previous call that never reached `_end_call_locally` — an INVITE
+    # the panel rejected after the user had already pressed Hang up —
+    # must not end this one before it starts.
+    _set_hangup_requested(False)
     key: str | None = None
     cur_seq: int | None = None
     cid = _gen("call-")
@@ -761,9 +894,9 @@ async def do_call(target=None):
         call_state["from_tag"] = ftag
         call_state["original_target"] = target_uri
 
-        vimar_callid = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+        vimar_callid = secrets.token_hex(5)
 
-        def _inv(branch, seq, auth=None):
+        def _inv(branch, seq, auth=None, auth_header="Proxy-Authorization"):
             m = (f"INVITE {target_uri} SIP/2.0\r\n"
                  f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
                  f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
@@ -780,12 +913,12 @@ async def do_call(target=None):
                  f"Session-Expires: 600;refresher=uas\r\n"
                  f"Min-SE: 90\r\n")
             if auth:
-                m += f"Proxy-Authorization: {auth}\r\n"
+                m += f"{auth_header}: {auth}\r\n"
             m += (f"Mobile-IMEI: {CFG.device_id}\r\n"
                   f"MyName: {C.MY_NAME}\r\n"
                   f"X-Call-ID: {vimar_callid}\r\n"
                   f"Content-Type: application/sdp\r\n"
-                  f"Content-Length: {len(sdp)}\r\n\r\n{sdp}")
+                  f"Content-Length: {_content_length(sdp)}\r\n\r\n{sdp}")
             return m
 
         def _ack(to_tag, seq):
@@ -829,7 +962,7 @@ async def do_call(target=None):
 
             if msg.code in (401, 407):
                 await send(_ack(ttag, cur_seq))
-                ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
+                ch, auth_header = _challenge_of(msg)
                 if not ch:
                     return False, f"Empty authentication challenge ({msg.code})"
                 auth = _make_auth("INVITE", target_uri, ch)
@@ -838,7 +971,8 @@ async def do_call(target=None):
                 cur_seq = _next_cseq()
                 key = _open_transaction(branch, cur_seq, "INVITE", cid)
                 queue = pending_transactions[key]
-                await send(_inv(branch, cur_seq, auth=auth))
+                await send(_inv(branch, cur_seq, auth=auth,
+                                auth_header=auth_header))
                 continue
 
             if 200 <= msg.code < 300:
@@ -849,6 +983,18 @@ async def do_call(target=None):
                 else:
                     call_state["remote_contact"] = raw_contact
                 await send(_ack(ttag, cur_seq))
+
+                if hangup_requested:
+                    # The user pressed Hang up while this INVITE was in
+                    # flight. `do_hangup` deferred to us then, and only
+                    # now is the dialog complete enough to end: the
+                    # To-tag and the remote Contact are set and the ACK
+                    # has gone, so the BYE below is a valid one. Media is
+                    # never started, and `do_hangup` runs the whole local
+                    # teardown including clearing the request.
+                    _set_in_call(True)
+                    await do_hangup()
+                    return False, "Hung up while the call was being set up"
 
                 if msg.body:
                     remote = parse_sdp(msg.body)
@@ -900,7 +1046,7 @@ async def send_keyframe_request():
         f"Call-ID: {call_state['call_id']}\r\n"
         f"CSeq: {seq} INFO\r\n"
         f"Content-Type: application/media_control+xml\r\n"
-        f"Content-Length: {len(body)}\r\n\r\n{body}")
+        f"Content-Length: {_content_length(body)}\r\n\r\n{body}")
     await send(msg)
     _LOGGER.debug("Sent INFO picture_fast_update (keyframe request)")
 
@@ -918,6 +1064,7 @@ async def _end_call_locally() -> None:
     """
     _set_calling(False)
     _set_in_call(False)
+    _set_hangup_requested(False)
     call_state.update(call_id=None, from_tag=None, to_tag=None,
                       remote_contact=None, remote_sdp=None,
                       original_target=None)
@@ -975,9 +1122,19 @@ async def do_hangup():
             # button, the five-minute limit, the unload — would take
             # this same branch and send no BYE, leaving the panel holding
             # the dialog and the account's single SIP registration
-            # occupied. Clearing `calling` is the whole of what this
-            # branch may safely do; the hang-up lands on the call once it
-            # is up.
+            # occupied.
+            #
+            # So the request is recorded rather than acted on, and
+            # `do_call` honours it at its 2xx. Dropping it instead —
+            # which is what this did — let the call establish and run to
+            # the full five-minute limit, holding the account's single
+            # registration while the hub declined every real doorbell
+            # press as the echo of a call the user had already tried to
+            # end. The setup window is up to 45 s and "open the camera,
+            # see nothing, press Hang up" lands inside it.
+            _set_hangup_requested(True)
+            _LOGGER.info("Hang-up requested while the call is still being "
+                         "set up; it will be honoured once the call is up")
             return
         # No dialog is being set up, so whatever is left in `call_state`
         # is stale and the local teardown is what clears it.
@@ -1070,7 +1227,7 @@ async def do_answer_incoming():
         f"Call-ID: {p['cid']}\r\nCSeq: {p['cseq']}\r\n"
         f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>\r\n"
         f"Content-Type: application/sdp\r\n"
-        f"Content-Length: {len(sdp)}\r\n\r\n{sdp}")
+        f"Content-Length: {_content_length(sdp)}\r\n\r\n{sdp}")
 
     _set_in_call(True)
     call_state["call_id"] = p["cid"]
@@ -1091,13 +1248,27 @@ async def do_answer_incoming():
     return True, "Answered"
 
 
-async def do_decline_incoming():
+async def do_decline_incoming(busy: bool = False):
+    """Refuse the pending INVITE.
+
+    `busy` picks 486 Busy Here over 603 Decline, and the difference is
+    not cosmetic. 603 is a *global* failure response: a forking proxy
+    takes it as the whole invitation being refused and cancels the other
+    branches, which in a Vimar plant means the indoor unit and the phone
+    app stop ringing too. That is right for the PBX echoing back a call
+    this client placed itself — we already have that call and want the
+    echo gone. It is wrong for a real visitor arriving while we happen
+    to be on a call: nobody refused them, this endpoint simply has no
+    second line, which is exactly what 486 says, and the rest of the
+    house keeps ringing.
+    """
     if not pending_incoming["active"]:
         return
 
+    status = "486 Busy Here" if busy else "603 Decline"
     p = pending_incoming
     await send(
-        f"SIP/2.0 603 Decline\r\n"
+        f"SIP/2.0 {status}\r\n"
         f"{p['via_block']}To: {p['to_hdr']};tag={p['my_tag']}\r\nFrom: {p['from_hdr']}\r\n"
         f"Call-ID: {p['cid']}\r\nCSeq: {p['cseq']}\r\n"
         f"Content-Length: 0\r\n\r\n")
