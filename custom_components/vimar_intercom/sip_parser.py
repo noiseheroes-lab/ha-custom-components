@@ -133,6 +133,23 @@ def call_id_key(call_id: str, seq: int | None, method: str) -> str:
     return f"cid:{call_id}|{seq}|{method}"
 
 
+def addr_uri(header_value: str) -> str:
+    """Return the URI carried by a From/To-style address header.
+
+    SIP allows two forms: `name-addr` — an optional display name
+    followed by the URI in angle brackets, e.g.
+    `"Front Door" <sip:55001@example.com>` — and a bare `addr-spec` with
+    no brackets at all, e.g. `sip:55001@example.com;tag=abc`, which is
+    equally legal. The bracket form is preferred; when there are none,
+    the text before the first `;` is the addr-spec, stripped of
+    surrounding whitespace. A header with no address before either a
+    `;` or the end of the string (including an empty header) yields ''.
+    """
+    if "<" in header_value and ">" in header_value:
+        return header_value[header_value.index("<") + 1:header_value.index(">")]
+    return header_value.split(";", 1)[0].strip()
+
+
 def tag_of(header_value: str) -> str:
     """Return the `tag` parameter of a From/To header, or ''."""
     for part in header_value.split(";")[1:]:

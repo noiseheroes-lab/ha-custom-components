@@ -119,6 +119,32 @@ def test_two_transactions_on_one_call_id_get_different_keys():
     assert first != second
 
 
+def test_addr_uri_reads_the_bracketed_form():
+    assert sp.addr_uri("<sip:55001@example.com>;tag=callertag") == (
+        "sip:55001@example.com")
+
+
+def test_addr_uri_reads_the_bracketed_form_with_a_display_name():
+    assert sp.addr_uri('"Front Door" <sip:55001@example.com>;tag=xyz') == (
+        "sip:55001@example.com")
+
+
+def test_addr_uri_falls_back_to_the_bare_addr_spec():
+    # A From header carrying a bare addr-spec, with no angle brackets at
+    # all, is legal SIP. The URI is whatever precedes the first `;`.
+    assert sp.addr_uri("sip:55001@example.com;tag=abc") == (
+        "sip:55001@example.com")
+
+
+def test_addr_uri_of_an_empty_header_is_empty():
+    assert sp.addr_uri("") == ""
+
+
+def test_addr_uri_with_neither_brackets_nor_a_uri_is_empty():
+    # No angle brackets and nothing before the first `;` either.
+    assert sp.addr_uri(";tag=abc") == ""
+
+
 def test_tag_of_reads_the_tag_parameter():
     assert sp.tag_of("<sip:a@b>;tag=totag") == "totag"
     assert sp.tag_of("<sip:a@b>") == ""

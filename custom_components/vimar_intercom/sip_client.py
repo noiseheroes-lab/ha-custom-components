@@ -16,6 +16,7 @@ from .backoff import reconnect_delay
 from .runtime import RuntimeConfig
 from .sip_parser import (
     ParsedMessage,
+    addr_uri,
     call_id_key,
     granted_expiry,
     header_params,
@@ -1021,9 +1022,7 @@ async def handle_incoming_invite(raw):
     cseq = msg.headers.get("cseq", "1 INVITE")
 
     caller_tag = tag_of(from_hdr)
-    caller_uri = ""
-    if "<" in from_hdr and ">" in from_hdr:
-        caller_uri = from_hdr[from_hdr.index("<")+1:from_hdr.index(">")]
+    caller_uri = addr_uri(from_hdr)
 
     _LOGGER.info("Incoming INVITE from %s", caller_uri)
 
