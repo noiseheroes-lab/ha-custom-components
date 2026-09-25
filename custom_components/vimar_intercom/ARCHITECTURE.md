@@ -23,7 +23,7 @@ can break the day Vimar changes something on their end.
 | `qr.py` | Decrypts and parses the QR configuration payload exported by the Vimar View app |
 | `runtime.py` | `RuntimeConfig` — every value the integration needs, derived once from the config entry; no Home Assistant import, fully unit testable |
 | `srtp.py` | SRTP (RFC 3711) encrypt/decrypt for the audio and video RTP streams |
-| `media_handler.py` | RTP/SRTP transport for audio and video, G.711 decoding, H.264 depacketisation, the AV ffmpeg process |
+| `media_handler.py` | RTP/SRTP transport for audio and video, H.264 depacketisation, the video registry, the AV ffmpeg process |
 | `config_flow.py` | Config, reconfigure and options flows — QR paste in, panel list and door command out |
 | `camera.py` | Camera entity — the live stream and the keyframe-derived still |
 | `event.py` | Doorbell event entity, also the source of the `vimar_intercom_ring` bus event |
@@ -138,8 +138,11 @@ something to try casually.
   Home Assistant open the door. The AV stream view is the one client
   that cannot present a bearer token — Home Assistant's `stream`
   component fetches `stream_source()` directly — so the camera signs
-  that URL with `async_sign_path` (ten-minute expiry) instead of
-  disabling auth; the view itself is unchanged and still requires it.
+  that URL with `async_sign_path` instead of disabling auth; the view
+  itself is unchanged and still requires it. The signature's lifetime is
+  derived from `MAX_CALL_DURATION`, so it always outlives the longest
+  call the integration allows — a stream cannot be cut by its own URL
+  expiring and then fail to restart on a 401 it could not recover from.
 - The integration never opens an inbound port on the internet. It
   maintains one outbound TLS connection to the Vimar cloud proxy. It
   does bind two UDP sockets on `0.0.0.0` for the RTP media streams
