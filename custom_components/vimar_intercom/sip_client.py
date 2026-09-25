@@ -315,11 +315,16 @@ async def connection_supervisor() -> None:
                 await asyncio.sleep(delay)
     finally:
         # The supervisor only ever exits via cancellation (hub.async_stop
-        # tearing the task down for HA unload). Without this, a pending
-        # re-register task scheduled by _accept_registration would keep
-        # sleeping past shutdown and then reconnect on its own — an
-        # orphaned connection outliving the integration it belongs to.
-        _cancel_reregister()
+        # tearing the task down for HA unload). This must clear the full
+        # registration state, not just cancel the timer: without it, a
+        # pending re-register task scheduled by _accept_registration would
+        # keep sleeping past shutdown and then reconnect on its own — an
+        # orphaned connection outliving the integration it belongs to —
+        # and `registration_expiry` would keep is_registered() reporting a
+        # live registration for up to its full lifetime after the socket
+        # is closed, since neither hub.async_stop() nor __init__.py clears
+        # it themselves.
+        _clear_registration()
 
 
 async def _reader_loop() -> None:
