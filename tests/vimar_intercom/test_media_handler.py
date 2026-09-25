@@ -6,6 +6,7 @@ the stub package tests/conftest.py installs.
 
 import asyncio
 import logging
+import os
 import socket
 import struct
 import threading
@@ -29,6 +30,13 @@ IDR = bytes([0x65, 0x11, 0x22, 0x33])
 def run(coro):
     """Run one coroutine to completion on a private event loop."""
     return asyncio.run(coro)
+
+
+async def settle() -> None:
+    """Let the module's background tasks finish before asserting."""
+    while media._background_tasks:
+        await asyncio.gather(*list(media._background_tasks),
+                             return_exceptions=True)
 
 
 @pytest.fixture
@@ -339,6 +347,127 @@ def test_no_keyframe_means_no_snapshot(monkeypatch):
     assert run(media.snapshot_jpeg()) is None
 
 
+# ─── decoding that still ─────────────────────────────────────────────
+
+class _FakeChild:
+    """Enough of an asyncio subprocess for snapshot_jpeg."""
+
+    def __init__(self, output=b"jpeg", delay=0.0, fail=None):
+        self.returncode = None
+        self.killed = False
+        self._output = output
+        self._delay = delay
+        self._fail = fail
+
+    async def communicate(self, _input=None):
+        if self._fail is not None:
+            raise self._fail
+        await asyncio.sleep(self._delay)
+        self.returncode = 0
+        return self._output, b""
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.fixture
+def fake_decoder(monkeypatch):
+    """Stand in for the ffmpeg a snapshot spawns, and count the spawns."""
+    children: list[_FakeChild] = []
+    settings: dict = {"output": b"jpeg", "delay": 0.0, "fail": None}
+
+    async def _exec(*_args, **_kwargs):
+        child = _FakeChild(settings["output"], settings["delay"],
+                           settings["fail"])
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(media.asyncio, "create_subprocess_exec", _exec)
+    monkeypatch.setattr(media, "_snapshot_cache", None)
+    return children, settings
+
+
+def _registry_with_keyframe(monkeypatch):
+    registry = media.VideoStreamRegistry()
+    for nal in (SPS, PPS, IDR):
+        registry.push_nal(nal)
+    monkeypatch.setattr(media, "video_registry", registry)
+    return registry
+
+
+def test_a_cancelled_snapshot_leaves_no_ffmpeg_behind(fake_decoder,
+                                                      monkeypatch):
+    """Home Assistant cancels the request whenever a dashboard tab
+    closes or navigates mid-fetch: an every-day event, and the child
+    outlived every one of them."""
+    children, settings = fake_decoder
+    settings["delay"] = 30
+    _registry_with_keyframe(monkeypatch)
+
+    async def scenario():
+        task = asyncio.create_task(media.snapshot_jpeg())
+        await asyncio.sleep(0.05)  # let it reach communicate()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    run(scenario())
+    assert len(children) == 1
+    assert children[0].killed, "the aborted decode left a child running"
+
+
+def test_a_snapshot_that_errors_leaves_no_ffmpeg_behind(fake_decoder,
+                                                        monkeypatch):
+    """The OSError branch returned without touching the child at all."""
+    children, settings = fake_decoder
+    settings["fail"] = OSError("write to a closed pipe")
+    _registry_with_keyframe(monkeypatch)
+
+    assert run(media.snapshot_jpeg()) is None
+    assert children[0].killed
+
+
+def test_simultaneous_snapshots_decode_once_and_share_the_result(
+        fake_decoder, monkeypatch):
+    """A dashboard polling the thumbnail spawned one ffmpeg per poll for
+    a picture that is bit-identical until the next IDR — real CPU on a
+    two-core 7 W box, for nothing."""
+    children, settings = fake_decoder
+    settings["delay"] = 0.02
+    _registry_with_keyframe(monkeypatch)
+
+    async def scenario():
+        return await asyncio.gather(*(media.snapshot_jpeg()
+                                      for _ in range(12)))
+
+    results = run(scenario())
+    assert results == [b"jpeg"] * 12
+    assert len(children) == 1
+
+
+def test_a_new_keyframe_is_decoded_again(fake_decoder, monkeypatch):
+    """The cache must follow the picture, not outlive it."""
+    children, settings = fake_decoder
+    registry = _registry_with_keyframe(monkeypatch)
+
+    async def scenario():
+        first = await media.snapshot_jpeg()
+        settings["output"] = b"jpeg2"
+        cached = await media.snapshot_jpeg()
+        registry.push_nal(IDR)  # a new keyframe, a new picture
+        return first, cached, await media.snapshot_jpeg()
+
+    first, cached, refreshed = run(scenario())
+    assert (first, cached, refreshed) == (b"jpeg", b"jpeg", b"jpeg2")
+    assert len(children) == 2
+
+
 # ─── socket ownership ────────────────────────────────────────────────
 
 def test_setup_transports_leaves_nothing_open_when_the_video_bind_fails(cfg):
@@ -382,24 +511,31 @@ class _FakeProc:
 
 @pytest.fixture
 def fake_av(monkeypatch):
-    """Pretend ffmpeg starts and stops, and count both."""
+    """Pretend ffmpeg starts and is reaped, and count both.
+
+    Only the two ends of the pipeline's life are stubbed: the lifecycle
+    lock, the detach and the subscriber bookkeeping are the real ones,
+    so these tests still run the code that keeps them consistent.
+    """
     events: list[str] = []
     monkeypatch.setattr(media, "_av_subscribers", [])
     monkeypatch.setattr(media, "_av_reader_task", None)
+    monkeypatch.setattr(media, "_av_consumer", None)
+    monkeypatch.setattr(media, "_av_sdp_path", None)
     monkeypatch.setattr(media, "av_ffmpeg_proc", None)
 
     async def _start():
         events.append("start")
         media.av_ffmpeg_proc = _FakeProc()
 
-    async def _stop():
-        if media.av_ffmpeg_proc is not None:
+    async def _reap(proc, reader_task, sdp_path, leaving,
+                    cancel_reader=True):
+        if proc is not None:
             events.append("stop")
-            media.av_ffmpeg_proc = None
-        media._signal_av_end()
+        media._signal_av_end(leaving)
 
-    monkeypatch.setattr(media, "start_av_ffmpeg", _start)
-    monkeypatch.setattr(media, "stop_av_ffmpeg", _stop)
+    monkeypatch.setattr(media, "_start_av_pipeline", _start)
+    monkeypatch.setattr(media, "_reap_av_pipeline", _reap)
     return events
 
 
@@ -437,12 +573,27 @@ class _ChunkProc:
         self._chunks = list(chunks)
         self.stdout = self
         self.stdin = None
+        self.stderr = None
+        self.reaped = False
 
     def poll(self):
-        return None
+        return None if self._chunks else 0
 
-    def read(self, _size):
+    def read1(self, _size):
         return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self):
+        pass
+
+    def terminate(self):
+        pass
+
+    def kill(self):  # pragma: no cover - only on the error path
+        pass
+
+    def wait(self, timeout=None):
+        self.reaped = True
+        return 0
 
 
 def _drain(queue: asyncio.Queue) -> list:
@@ -452,22 +603,34 @@ def _drain(queue: asyncio.Queue) -> list:
     return items
 
 
-def test_the_reader_fans_every_chunk_out_to_every_viewer(monkeypatch):
+@pytest.fixture
+def detached_av(monkeypatch):
+    """Isolate the module's AV globals for a test that drives the reader."""
+    monkeypatch.setattr(media, "_av_subscribers", [])
+    monkeypatch.setattr(media, "_av_reader_task", None)
+    monkeypatch.setattr(media, "_av_consumer", None)
+    monkeypatch.setattr(media, "_av_sdp_path", None)
+    monkeypatch.setattr(media, "av_ffmpeg_proc", None)
+
+
+def test_the_reader_fans_every_chunk_out_to_every_viewer(detached_av,
+                                                         monkeypatch):
     """The real fan-out: one reader on ffmpeg's stdout, N viewer queues.
 
     Two viewers reading that pipe themselves would each get half of the
     transport stream and neither would decode.
     """
-    monkeypatch.setattr(media, "_av_subscribers", [])
-    monkeypatch.setattr(media, "av_ffmpeg_proc",
-                        _ChunkProc([b"one", b"two", b"three"]))
+    proc = _ChunkProc([b"one", b"two", b"three"])
+    monkeypatch.setattr(media, "av_ffmpeg_proc", proc)
 
     async def scenario():
         first: asyncio.Queue = asyncio.Queue(maxsize=media.AV_QUEUE_CHUNKS)
         second: asyncio.Queue = asyncio.Queue(maxsize=media.AV_QUEUE_CHUNKS)
         media._av_subscribers.extend([first, second])
-        await media._read_av_ffmpeg_stdout()
-        return _drain(first), _drain(second)
+        await media._read_av_ffmpeg_stdout(proc)
+        drained = _drain(first), _drain(second)
+        await settle()
+        return drained
 
     assert run(scenario()) == (
         [b"one", b"two", b"three", None],
@@ -475,18 +638,48 @@ def test_the_reader_fans_every_chunk_out_to_every_viewer(monkeypatch):
     )
 
 
-def test_a_viewer_that_cannot_keep_up_loses_its_oldest_chunk(monkeypatch):
+def test_a_pipeline_that_ends_on_its_own_leaves_no_dead_handle(detached_av,
+                                                               monkeypatch):
+    """ffmpeg exiting by itself — audio RTP stops, a fatal demuxer error —
+    used to leave a dead process in the globals. The next viewer then
+    found it, awaited its reap, and a viewer arriving during *that*
+    started a second pipeline nothing could ever stop."""
+    proc = _ChunkProc([b"one"])
+    monkeypatch.setattr(media, "av_ffmpeg_proc", proc)
+    monkeypatch.setattr(media, "_av_consumer", lambda data: None)
+    registry = media.VideoStreamRegistry()
+    registry.add_consumer(media._av_consumer)
+    monkeypatch.setattr(media, "video_registry", registry)
+
+    async def scenario():
+        viewer: asyncio.Queue = asyncio.Queue(maxsize=4)
+        media._av_subscribers.append(viewer)
+        await media._read_av_ffmpeg_stdout(proc)
+        await settle()
+        return _drain(viewer)
+
+    assert run(scenario()) == [b"one", None]
+    assert media.av_ffmpeg_proc is None
+    assert media._av_consumer is None
+    assert media._av_subscribers == []
+    assert registry._consumers == []
+    assert proc.reaped
+
+
+def test_a_viewer_that_cannot_keep_up_loses_its_oldest_chunk(detached_av,
+                                                             monkeypatch):
     """Its backlog must not stall the viewers that are keeping up."""
-    monkeypatch.setattr(media, "_av_subscribers", [])
-    monkeypatch.setattr(media, "av_ffmpeg_proc",
-                        _ChunkProc([b"one", b"two", b"three"]))
+    proc = _ChunkProc([b"one", b"two", b"three"])
+    monkeypatch.setattr(media, "av_ffmpeg_proc", proc)
 
     async def scenario():
         slow: asyncio.Queue = asyncio.Queue(maxsize=2)
         fast: asyncio.Queue = asyncio.Queue(maxsize=media.AV_QUEUE_CHUNKS)
         media._av_subscribers.extend([slow, fast])
-        await media._read_av_ffmpeg_stdout()
-        return _drain(slow), _drain(fast)
+        await media._read_av_ffmpeg_stdout(proc)
+        drained = _drain(slow), _drain(fast)
+        await settle()
+        return drained
 
     slow, fast = run(scenario())
     # The slow viewer keeps the newest chunks it has room for, and the
@@ -517,6 +710,8 @@ class _ReapedProc:
 
     def __init__(self, gate):
         self.stdin = None
+        self.stdout = None
+        self.stderr = None
         self._gate = gate
 
     def poll(self):
@@ -556,7 +751,7 @@ def test_a_viewer_arriving_during_teardown_starts_a_fresh_pipeline(
         started.append("start")
         media.av_ffmpeg_proc = _FakeProc()
 
-    monkeypatch.setattr(media, "start_av_ffmpeg", _start)
+    monkeypatch.setattr(media, "_start_av_pipeline", _start)
 
     async def scenario():
         leaving: asyncio.Queue = asyncio.Queue(maxsize=4)
@@ -613,7 +808,7 @@ def test_a_pipeline_started_during_teardown_keeps_its_consumer(monkeypatch):
         media._av_consumer = arriving.append
         media.video_registry.add_consumer(media._av_consumer)
 
-    monkeypatch.setattr(media, "start_av_ffmpeg", _start)
+    monkeypatch.setattr(media, "_start_av_pipeline", _start)
 
     async def scenario():
         stopping = asyncio.create_task(media.stop_media())
@@ -631,3 +826,219 @@ def test_a_pipeline_started_during_teardown_keeps_its_consumer(monkeypatch):
 
     assert arriving == [media.ANNEX_B_START + nal for nal in (SPS, PPS, IDR)]
     assert leaving == []
+
+
+# ─── a second viewer arriving while the pipeline is restarting ───────
+
+class _DeadProc:
+    """A Popen that has already exited, and whose reap takes a while.
+
+    That is the shape the reconnect leaves behind: ffmpeg exits on its
+    own, the reader's sentinel goes out, and a dead handle sits in the
+    globals until somebody reaps it.
+    """
+
+    def __init__(self, gate):
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+        self._gate = gate
+
+    def poll(self):
+        return 1
+
+    def terminate(self):
+        pass
+
+    def kill(self):  # pragma: no cover - only on the error path
+        pass
+
+    def wait(self, timeout=None):
+        self._gate.wait(timeout)
+        return 1
+
+
+class _LiveProc:
+    """A stand-in for a running ffmpeg, with a real pipe behind stdin."""
+
+    def __init__(self):
+        read_fd, write_fd = os.pipe()
+        self._read_fd = read_fd
+        self.stdin = os.fdopen(write_fd, "wb", buffering=0)
+        self.stdout = None
+        self.stderr = None
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def kill(self):  # pragma: no cover - only on the error path
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    def release(self):
+        self.stdin.close()
+        os.close(self._read_fd)
+
+
+def test_two_viewers_restarting_a_dead_pipeline_get_exactly_one_ffmpeg(
+        cfg, monkeypatch):
+    """`start_av_ffmpeg` is the one place that has to await with the
+    globals in an indeterminate state: finding a dead process, it reaps
+    it before spawning the replacement.
+
+    A second viewer arriving in that window saw no process in the
+    globals, took the fresh-start path, and the first caller then
+    overwrote all four globals with a third pipeline. What was left was
+    an ffmpeg nothing could ever stop — holding pipe:0 and a UDP port,
+    one more per reconnect until Home Assistant restarts — two stdout
+    readers interleaving their output into every viewer's stream, an
+    orphaned registry consumer and a leaked SDP file.
+    """
+    gate = threading.Event()
+    registry = media.VideoStreamRegistry()
+    monkeypatch.setattr(media, "video_registry", registry)
+    monkeypatch.setattr(media, "_av_subscribers", [])
+    monkeypatch.setattr(media, "_av_reader_task", None)
+    monkeypatch.setattr(media, "_av_consumer", None)
+    monkeypatch.setattr(media, "_av_sdp_path", None)
+    monkeypatch.setattr(media, "av_ffmpeg_proc", _DeadProc(gate))
+
+    spawned: list[_LiveProc] = []
+    sdp_paths: list[str] = []
+    real_write_sdp = media._write_av_sdp
+
+    def _spawn_proc(_cmd):
+        spawned.append(_LiveProc())
+        return spawned[-1]
+
+    def _write_sdp(port):
+        sdp_paths.append(real_write_sdp(port))
+        return sdp_paths[-1]
+
+    async def _no_reader(_proc):
+        return None
+
+    monkeypatch.setattr(media, "_spawn_av_ffmpeg", _spawn_proc)
+    monkeypatch.setattr(media, "_write_av_sdp", _write_sdp)
+    monkeypatch.setattr(media, "_read_av_ffmpeg_stdout", _no_reader)
+    monkeypatch.setattr(media, "_read_av_ffmpeg_stderr", _no_reader)
+
+    async def scenario():
+        # The reap finishes on its own, after both viewers have arrived.
+        asyncio.get_running_loop().call_later(0.05, gate.set)
+        first, second = await asyncio.gather(media.av_subscribe(),
+                                             media.av_subscribe())
+        await settle()
+        return first, second
+
+    try:
+        first, second = run(scenario())
+
+        assert len(spawned) == 1, "a second ffmpeg was spawned and orphaned"
+        assert media.av_ffmpeg_proc is spawned[0]
+        assert first is not None and second is not None
+        assert media._av_subscribers == [first, second]
+        assert len(registry._consumers) == 1
+        assert media._av_sdp_path == sdp_paths[-1]
+        leaked = [p for p in sdp_paths
+                  if p != media._av_sdp_path and os.path.exists(p)]
+        assert leaked == [], "an SDP file was left on disk"
+    finally:
+        for proc in spawned:
+            proc.release()
+        for path in sdp_paths:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
+# ─── what an unload has to release ───────────────────────────────────
+
+def test_unload_releases_the_keepalive_the_pipeline_and_the_config(
+        cfg, monkeypatch):
+    """`close_transports` is documented as *the* unload hook, and used to
+    release two UDP transports and nothing else: the STUN keepalive
+    looped forever, ffmpeg survived the reload holding the audio port
+    the new instance was about to bind, the registry kept consumers
+    pointing at the old pipeline, and CFG still described the entry that
+    had just gone away."""
+    gate = threading.Event()
+    gate.set()  # nothing to wait for; the reap returns at once
+    registry = media.VideoStreamRegistry()
+    for nal in (SPS, PPS, IDR):
+        registry.push_nal(nal)
+    monkeypatch.setattr(media, "video_registry", registry)
+    monkeypatch.setattr(media, "_av_subscribers", [])
+    monkeypatch.setattr(media, "_av_reader_task", None)
+    monkeypatch.setattr(media, "_av_sdp_path", None)
+    monkeypatch.setattr(media, "_snapshot_cache", None)
+    monkeypatch.setattr(media, "video_proto", None)
+
+    audio = media.RTPAudioProtocol()
+    monkeypatch.setattr(media, "audio_proto", audio)
+    proc = _ReapedProc(gate)
+    monkeypatch.setattr(media, "av_ffmpeg_proc", proc)
+    consumer = registry._consumers.append  # a sink that accepts anything
+    monkeypatch.setattr(media, "_av_consumer", consumer)
+    registry.add_consumer(consumer)
+
+    async def scenario():
+        media._stun_task = asyncio.create_task(media._stun_keepalive())
+        await asyncio.sleep(0)
+        stun_task = media._stun_task
+        viewer: asyncio.Queue = asyncio.Queue(maxsize=4)
+        media._av_subscribers.append(viewer)
+
+        media.close_transports()
+
+        await settle()
+        return stun_task, viewer
+
+    stun_task, viewer = run(scenario())
+
+    assert stun_task.cancelled() or stun_task.done()
+    assert media._stun_task is None
+    assert media.av_ffmpeg_proc is None
+    assert media._av_consumer is None
+    assert media._av_subscribers == []
+    assert _drain(viewer) == [None]
+    assert registry._consumers == []
+    assert registry.last_keyframe is None
+    assert media.audio_proto is None
+    assert media.CFG is None
+
+
+# ─── ffmpeg's own diagnostics ────────────────────────────────────────
+
+class _NoisyStderr:
+    """A stderr pipe that produces one warning per frame, then EOF."""
+
+    def __init__(self, count):
+        self._remaining = count
+
+    def readline(self):
+        if self._remaining <= 0:
+            return b""
+        self._remaining -= 1
+        return b"[h264 @ 0x1] error while decoding MB 4 20, bytestream -7\n"
+
+
+def test_ffmpeg_warnings_are_summarised_once_not_logged_per_frame(caplog):
+    """At -loglevel warning a lossy stream makes ffmpeg complain per
+    frame: one DEBUG line each is 1.3-2.6 M lines a day, the same order
+    as the incident this component's logging rules exist to prevent."""
+    proc = _ChunkProc([])
+    proc.stderr = _NoisyStderr(5000)
+
+    with caplog.at_level(logging.DEBUG, logger=media._LOGGER.name):
+        run(media._read_av_ffmpeg_stderr(proc))
+    caplog.records[:] = [r for r in caplog.records
+                         if r.name == media._LOGGER.name]
+
+    assert len(caplog.records) == 1
+    assert "5000" in caplog.records[0].getMessage()
+    assert caplog.records[0].levelno == logging.DEBUG

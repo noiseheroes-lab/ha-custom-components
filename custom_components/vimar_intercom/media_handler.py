@@ -575,16 +575,76 @@ _av_consumer = None
 # killing the first viewer's ffmpeg out from under it.
 _av_subscribers: list[asyncio.Queue] = []
 _av_reader_task: asyncio.Task | None = None
+# The last still decoded, with the keyframe it came from: (keyframe, jpeg).
+_snapshot_cache: tuple[bytes, bytes] | None = None
+
+# Strong references to fire-and-forget tasks. asyncio keeps only a weak
+# one, so a task nothing else holds can be collected mid-flight.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """Run a coroutine in the background and keep it alive until it ends."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+# asyncio's synchronisation primitives bind to the event loop that first
+# blocks on them and refuse to be used from any other one. Home
+# Assistant has a single loop for the life of the process, so these are
+# built once and reused there; rebuilding them happens only under a test
+# that gives each case a loop of its own.
+_sync_loop = None
+_sync_primitives: dict = {}
+
+
+def _per_loop(name: str, factory):
+    """Return the named primitive, built for the running loop."""
+    global _sync_loop
+    loop = asyncio.get_running_loop()
+    if loop is not _sync_loop:
+        _sync_primitives.clear()
+        _sync_loop = loop
+    primitive = _sync_primitives.get(name)
+    if primitive is None:
+        primitive = _sync_primitives[name] = factory()
+    return primitive
+
+
+def _av_lifecycle_lock() -> asyncio.Lock:
+    """The lock every change to the AV pipeline's lifetime is made under.
+
+    The pipeline's lifetime lives in four module globals, and the rest
+    of this file keeps them consistent by mutating them before its first
+    await. `start_av_ffmpeg` cannot: it has to reap a process that
+    exited on its own *before* it can spawn the replacement. Without
+    this lock, a second viewer arriving during that reap found no
+    process in the globals, started a pipeline of its own, and the first
+    caller then overwrote every global with a third — leaving an ffmpeg
+    nothing could ever stop, holding a pipe and a UDP port, and two
+    readers interleaving their output into one viewer's stream.
+    """
+    return _per_loop("av_lifecycle", asyncio.Lock)
+
+
+def _snapshot_slot() -> asyncio.Semaphore:
+    """Admit one still decode at a time; the rest wait for its result."""
+    return _per_loop("snapshot", lambda: asyncio.Semaphore(1))
 
 
 # ─── Transport setup ────────────────────────────────────────────────
 
 def _bind_udp(port: int) -> socket.socket:
     """Bind one UDP socket, closing it again if the bind fails."""
-    # SO_REUSEADDR avoids "Address in use" on a Home Assistant reload.
+    # No SO_REUSEADDR: UDP has no TIME_WAIT, so the only way to get
+    # EADDRINUSE on these ports is a socket of ours still being open.
+    # Allowing the duplicate bind would turn that leak into unspecified
+    # delivery between the two sockets — silent packet loss — instead of
+    # the loud failure that says the close path did not run.
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('0.0.0.0', port))
     except OSError:
         sock.close()
@@ -619,8 +679,16 @@ async def setup_transports():
         _, video_proto = await loop.create_datagram_endpoint(
             RTPVideoProtocol, sock=video_sock)
     except OSError:
+        # Close what this call opened, and only that. Calling the unload
+        # hook from here would also tear down whatever a previous,
+        # successful setup left behind — a failure path has no business
+        # depending on prior global state.
         video_sock.close()
-        close_transports()
+        if audio_proto is not None:
+            if audio_proto.transport:
+                audio_proto.transport.close()
+            audio_proto.close()
+            audio_proto = None
         raise
 
 
@@ -695,21 +763,51 @@ async def stop_media():
         video_proto._fua_started = False
         video_proto._fua_expected_seq = None
         video_proto.reset_counters()
-    # Before the await, for the same reason `stop_av_ffmpeg` detaches
-    # what it owns before its own: reaping ffmpeg takes up to three
-    # seconds, and a viewer arriving in that window starts a replacement
-    # pipeline and registers its consumer. Resetting afterwards cleared
-    # that consumer too, and the new ffmpeg then sat on `pipe:0`
-    # receiving no NALs — it emitted nothing, the reader produced no
-    # sentinel, and the viewer held a response body that never arrived
-    # and never ended.
-    video_registry.reset()
-    await stop_av_ffmpeg()
+    # Under the lifecycle lock, and before the reap: reaping ffmpeg
+    # takes up to three seconds, and a viewer arriving in that window
+    # starts a replacement pipeline and registers its consumer.
+    # Resetting afterwards cleared that consumer too, and the new ffmpeg
+    # then sat on `pipe:0` receiving no NALs — it emitted nothing, the
+    # reader produced no sentinel, and the viewer held a response body
+    # that never arrived and never ended.
+    async with _av_lifecycle_lock():
+        video_registry.reset()
+        detached = _detach_av_pipeline()
+    await _reap_av_pipeline(*detached)
 
 
 def close_transports():
-    """Close UDP transports — called on integration unload."""
-    global audio_proto, video_proto
+    """Release everything the media layer holds — the unload hook.
+
+    Everything, not just the two UDP transports: this is documented as
+    *the* unload function, and a reload that left the keepalive looping,
+    an ffmpeg holding the audio port the new instance is about to bind,
+    a registry full of consumers pointing at the old pipeline and a
+    `CFG` describing the unloaded entry is a reload that leaks all of
+    them, once per reload, until Home Assistant restarts.
+
+    Synchronous, because Home Assistant's unload calls it that way. The
+    happy path has already awaited `stop_media`, so there is normally no
+    pipeline left here; when there is, it is detached at once — nothing
+    can join it after this returns — and reaped in the background.
+    """
+    global audio_proto, video_proto, _stun_task, CFG, _snapshot_cache
+
+    if _stun_task:
+        _stun_task.cancel()
+        _stun_task = None
+
+    detached = _detach_av_pipeline()
+    if detached[0] is not None:
+        try:
+            _spawn(_reap_av_pipeline(*detached))
+        except RuntimeError:
+            # No running loop (a synchronous teardown in a test): kill
+            # the child outright rather than leave it running.
+            _kill_detached_pipeline(*detached)
+    video_registry.reset(keep_keyframe=False)
+    _snapshot_cache = None
+
     if audio_proto:
         if audio_proto.transport:
             audio_proto.transport.close()
@@ -721,6 +819,8 @@ def close_transports():
         if video_proto.transport:
             video_proto.transport.close()
         video_proto = None
+
+    CFG = None
 
 
 # ─── STUN keepalive ─────────────────────────────────────────────────
@@ -748,18 +848,28 @@ AV_CHUNK_BYTES = 4096
 AV_QUEUE_CHUNKS = 256
 
 
-def _create_av_sdp() -> str:
-    """Write the SDP that describes the audio RTP stream for ffmpeg."""
-    global _av_sdp_path
-    fd, _av_sdp_path = tempfile.mkstemp(prefix="vimar_av_", suffix=".sdp")
+def _write_av_sdp(port: int) -> str:
+    """Write the SDP that describes the audio RTP stream for ffmpeg.
+
+    Blocking: the caller runs it in an executor. Home Assistant's
+    blocking-I/O detector targets exactly a `mkstemp` on the loop.
+    """
+    fd, path = tempfile.mkstemp(prefix="vimar_av_", suffix=".sdp")
     with os.fdopen(fd, "w") as handle:
         handle.write(
             "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=AV\r\n"
             "c=IN IP4 127.0.0.1\r\nt=0 0\r\n"
-            f"m=audio {CFG.av_audio_port} RTP/AVP 0\r\n"
+            f"m=audio {port} RTP/AVP 0\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
         )
-    return _av_sdp_path
+    return path
+
+
+def _spawn_av_ffmpeg(cmd: list[str]):
+    """Start the ffmpeg child. Blocking: forking is not loop work."""
+    return subprocess.Popen(
+        cmd, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 async def start_av_ffmpeg():
@@ -768,15 +878,24 @@ async def start_av_ffmpeg():
     Idempotent: a pipeline that is already running is left alone, which
     is what makes `av_subscribe` safe to call for a second viewer.
     """
-    global av_ffmpeg_proc, _av_consumer, _av_reader_task
+    async with _av_lifecycle_lock():
+        await _start_av_pipeline()
+
+
+async def _start_av_pipeline() -> None:
+    """Start the pipeline. The lifecycle lock must already be held."""
+    global av_ffmpeg_proc, _av_consumer, _av_reader_task, _av_sdp_path
     if av_ffmpeg_proc is not None:
         if av_ffmpeg_proc.poll() is None:
             return
-        # It exited on its own. Clear the consumer and reader it left
-        # behind before putting a second set in their place.
-        await stop_av_ffmpeg()
+        # It exited on its own. Reap what it left behind before putting
+        # a second set of globals in its place — under the lock, because
+        # this reap is the one await that happens with the globals in an
+        # indeterminate state.
+        await _reap_av_pipeline(*_detach_av_pipeline())
 
-    sdp_path = _create_av_sdp()
+    loop = asyncio.get_running_loop()
+    sdp_path = await loop.run_in_executor(None, _write_av_sdp, CFG.av_audio_port)
     cmd = [
         "ffmpeg", "-y", "-loglevel", "warning",
         "-fflags", "+genpts+discardcorrupt",
@@ -789,15 +908,12 @@ async def start_av_ffmpeg():
         "pipe:1",
     ]
     try:
-        av_ffmpeg_proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = await loop.run_in_executor(None, _spawn_av_ffmpeg, cmd)
     except OSError as err:
         # Clean up the SDP we just wrote: this is the one exit path that
-        # never reaches stop_av_ffmpeg.
+        # never reaches a teardown.
         _LOGGER.error("Could not start ffmpeg: %s", err)
-        av_ffmpeg_proc = None
-        _cleanup_av_sdp()
+        _cleanup_av_sdp(sdp_path)
         return
 
     # Bound how long a stalled ffmpeg can hold up the event loop: a
@@ -806,12 +922,22 @@ async def start_av_ffmpeg():
     # the exposure at the kernel pipe buffer (tens of KB) and turns a
     # full pipe into BlockingIOError, which _send_one already treats
     # like any other dead consumer.
-    os.set_blocking(av_ffmpeg_proc.stdin.fileno(), False)
+    os.set_blocking(proc.stdin.fileno(), False)
 
-    asyncio.create_task(_read_av_ffmpeg_stderr())
-    _av_reader_task = asyncio.create_task(_read_av_ffmpeg_stdout())
-    _av_consumer = _make_ffmpeg_consumer(av_ffmpeg_proc)
-    video_registry.add_consumer(_av_consumer)
+    # Claim the globals only now, all together and with nothing left to
+    # await: from here a viewer joins this pipeline or none at all.
+    av_ffmpeg_proc = proc
+    _av_sdp_path = sdp_path
+    _av_reader_task = _spawn(_read_av_ffmpeg_stdout(proc))
+    _spawn(_read_av_ffmpeg_stderr(proc))
+    _av_consumer = _make_ffmpeg_consumer(proc)
+    if not video_registry.add_consumer(_av_consumer):
+        # Its stdin was already refusing data. Without this the pipeline
+        # would stay in the globals with no consumer feeding it, never
+        # emit a byte, and no later viewer would ever get video.
+        _LOGGER.warning("The AV pipeline's input closed as it started")
+        await _reap_av_pipeline(*_detach_av_pipeline())
+        return
     _LOGGER.info("AV pipeline started")
 
 
@@ -822,36 +948,49 @@ async def av_subscribe() -> asyncio.Queue | None:
     None when ffmpeg could not be started. A `None` item on the queue
     means the pipeline has ended and the viewer should stop.
     """
-    if av_ffmpeg_proc is None or av_ffmpeg_proc.poll() is not None:
-        await start_av_ffmpeg()
-        if av_ffmpeg_proc is None:
-            return None
-    queue: asyncio.Queue = asyncio.Queue(maxsize=AV_QUEUE_CHUNKS)
-    _av_subscribers.append(queue)
-    return queue
+    async with _av_lifecycle_lock():
+        if av_ffmpeg_proc is None or av_ffmpeg_proc.poll() is not None:
+            await _start_av_pipeline()
+            if av_ffmpeg_proc is None:
+                return None
+        queue: asyncio.Queue = asyncio.Queue(maxsize=AV_QUEUE_CHUNKS)
+        _av_subscribers.append(queue)
+        return queue
 
 
 async def av_unsubscribe(queue: asyncio.Queue) -> None:
     """Detach a viewer, stopping the pipeline once the last one leaves."""
-    if queue in _av_subscribers:
-        _av_subscribers.remove(queue)
-    if not _av_subscribers:
-        await stop_av_ffmpeg()
+    async with _av_lifecycle_lock():
+        if queue in _av_subscribers:
+            _av_subscribers.remove(queue)
+        if _av_subscribers:
+            return
+        detached = _detach_av_pipeline()
+    # Outside the lock: reaping takes up to three seconds, and a viewer
+    # arriving meanwhile should start a fresh pipeline at once rather
+    # than wait for this one's corpse.
+    await _reap_av_pipeline(*detached)
 
 
-async def _read_av_ffmpeg_stdout() -> None:
+async def _read_av_ffmpeg_stdout(proc) -> None:
     """Fan ffmpeg's MPEG-TS output out to every attached viewer.
 
     One reader for the process, not one per viewer: two viewers reading
     the same pipe from separate executor threads would each get half of
-    the transport stream and neither would decode.
+    the transport stream and neither would decode. The process is a
+    parameter, not the global, so a reader can never end up reading the
+    output of a pipeline that replaced the one it was started for.
     """
     loop = asyncio.get_running_loop()
-    proc = av_ffmpeg_proc
     try:
-        while proc and proc.poll() is None:
+        while True:
+            # read1, not read: read() on a BufferedReader blocks until it
+            # has the full 4 KB, which is 160 ms of added latency on a
+            # 200 kbps stream. Reading until EOF rather than while
+            # poll() is None also means the last buffered bytes of a
+            # pipeline that exits normally still reach the viewers.
             chunk = await loop.run_in_executor(
-                None, proc.stdout.read, AV_CHUNK_BYTES)
+                None, proc.stdout.read1, AV_CHUNK_BYTES)
             if not chunk:
                 break
             for queue in list(_av_subscribers):
@@ -876,7 +1015,15 @@ async def _read_av_ffmpeg_stdout() -> None:
         # that pipeline's viewers; signalling again from here would hit
         # whoever has since subscribed to the replacement.
         if proc is not None and proc is av_ffmpeg_proc:
-            _signal_av_end()
+            # ffmpeg ended on its own — audio RTP stopped, or a fatal
+            # demuxer error. Take the dead handle out of the globals
+            # here and now, synchronously, so the next viewer starts a
+            # fresh pipeline instead of finding a corpse in them, and
+            # reap the remains in the background. Leaving it there is
+            # what made the ordinary reconnect spawn a second ffmpeg.
+            dead, _, sdp_path, leaving = _detach_av_pipeline()
+            _signal_av_end(leaving)
+            _spawn(_reap_av_pipeline(dead, None, sdp_path, []))
 
 
 def _signal_av_end(queues: list[asyncio.Queue] | None = None) -> None:
@@ -904,13 +1051,33 @@ async def snapshot_jpeg(timeout: float = 5.0) -> bytes | None:
     Deliberately independent of the streaming pipeline: a still must
     never start a call, so this reads the keyframe the registry already
     cached from a call that is running and decodes that one picture.
+
+    One decode at a time, and the result is kept: the cached keyframe is
+    immutable, so every call between two IDRs would otherwise spawn an
+    ffmpeg to produce a byte-identical JPEG — on the reference two-core
+    7 W box that is a real fraction of a core per dashboard poll.
     """
     keyframe = video_registry.last_keyframe
     if not keyframe:
         return None
+
+    global _snapshot_cache
+    async with _snapshot_slot():
+        cached = _snapshot_cache
+        if cached is not None and cached[0] is keyframe:
+            return cached[1]
+        jpeg = await _decode_keyframe(keyframe, timeout)
+        if jpeg is not None:
+            _snapshot_cache = (keyframe, jpeg)
+        return jpeg
+
+
+async def _decode_keyframe(keyframe: bytes, timeout: float) -> bytes | None:
+    """Run one keyframe through ffmpeg, leaving no child behind."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "error",
+            "-probesize", "32", "-analyzeduration", "0",
             "-f", "h264", "-i", "pipe:0",
             "-frames:v", "1", "-f", "mjpeg", "pipe:1",
             stdin=asyncio.subprocess.PIPE,
@@ -924,13 +1091,24 @@ async def snapshot_jpeg(timeout: float = 5.0) -> bytes | None:
         async with asyncio.timeout(timeout):
             out, _ = await proc.communicate(keyframe)
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
         _LOGGER.debug("Snapshot decode timed out")
         return None
     except OSError as err:
         _LOGGER.debug("Snapshot decode failed: %s", err)
         return None
+    finally:
+        # Every exit path, cancellation included: Home Assistant cancels
+        # the request whenever a dashboard tab closes or navigates
+        # mid-fetch, and without this the child survived it. kill() is
+        # synchronous, so the process dies even if the wait below is
+        # itself cancelled.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            else:
+                await proc.wait()
     return out or None
 
 
@@ -962,16 +1140,27 @@ def _make_ffmpeg_consumer(proc):
 
 
 async def stop_av_ffmpeg():
-    """Stop the AV pipeline, detach it, and release every viewer.
+    """Stop the AV pipeline, detach it, and release every viewer."""
+    async with _av_lifecycle_lock():
+        detached = _detach_av_pipeline()
+    # The reap is deliberately outside the lock: it takes up to three
+    # seconds, and a viewer arriving meanwhile must be able to start a
+    # fresh pipeline at once instead of waiting for this one's corpse.
+    await _reap_av_pipeline(*detached)
 
-    Everything this pipeline owns is taken out of the module globals
-    synchronously, before the first await. Reaping ffmpeg takes up to
-    three seconds, and `terminate()` does not make `poll()` return at
-    once; a viewer arriving in that window used to see a process that
-    still looked alive, join it, and be handed the end-of-stream
-    sentinel by the teardown a moment later — an empty MPEG-TS body.
-    Detaching first means such a viewer finds no pipeline and starts a
-    fresh one.
+
+def _detach_av_pipeline():
+    """Take everything the current pipeline owns out of the globals.
+
+    Synchronous, so nothing can interleave: from the moment it returns,
+    a viewer arriving finds no pipeline and starts a fresh one. Reaping
+    ffmpeg takes up to three seconds and `terminate()` does not make
+    `poll()` return at once, so a viewer arriving during the reap used
+    to see a process that still looked alive, join it, and be handed the
+    end-of-stream sentinel a moment later — an empty MPEG-TS body.
+
+    Returns what the caller must then reap: the process, its stdout
+    reader, its SDP file and the viewers it leaves behind.
     """
     global av_ffmpeg_proc, _av_consumer, _av_sdp_path, _av_reader_task
 
@@ -988,25 +1177,77 @@ async def stop_av_ffmpeg():
     if consumer is not None:
         video_registry.remove_consumer(consumer)
 
+    return proc, reader_task, sdp_path, leaving
+
+
+async def _reap_av_pipeline(proc, reader_task, sdp_path, leaving,
+                            cancel_reader: bool = True) -> None:
+    """Wait for a detached pipeline to die and release what it held."""
+    loop = asyncio.get_running_loop()
+
     if proc:
         try:
-            if proc.stdin:
+            # stdin first: ffmpeg finishes the mux on EOF, and the
+            # terminate below is only there for one that does not.
+            if proc.stdin is not None:
                 proc.stdin.close()
             proc.terminate()
-            await asyncio.get_running_loop().run_in_executor(
-                None, proc.wait, 3)
         except Exception:  # noqa: BLE001 - the process may already be gone
+            pass
+        try:
+            await loop.run_in_executor(None, proc.wait, 3)
+        except subprocess.TimeoutExpired:
+            # terminate() was not enough. Killing without waiting again
+            # leaves a zombie until the garbage collector happens to
+            # reap it.
+            proc.kill()
             try:
-                proc.kill()
+                await loop.run_in_executor(None, proc.wait, 3)
             except Exception:  # noqa: BLE001
                 pass
-        _LOGGER.info("AV pipeline stopped")
+        except Exception:  # noqa: BLE001 - a fake or already-reaped process
+            pass
 
     # Cancel the reader only after the process is gone, so its blocking
-    # read in the executor has already returned.
-    if reader_task is not None:
+    # read in the executor has already returned, and await it so this
+    # cannot return while the reader is still in its own finally — or,
+    # worse, close the pipe it is reading out from under it.
+    if cancel_reader and reader_task is not None:
         reader_task.cancel()
+        try:
+            await reader_task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise  # our own cancellation, not the reader's
+        except Exception:  # noqa: BLE001 - the reader reports its own errors
+            pass
 
+    if proc:
+        # All three pipes, not just stdin: stdout and stderr are file
+        # objects of ours, and leaving them to refcounting keeps two fds
+        # per pipeline for as long as anything still references the
+        # Popen — a parked reader thread, for instance.
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:  # noqa: BLE001 - closing a dead pipe may raise
+                    pass
+        _LOGGER.info("AV pipeline stopped")
+
+    _signal_av_end(leaving)
+    _cleanup_av_sdp(sdp_path)
+
+
+def _kill_detached_pipeline(proc, reader_task, sdp_path, leaving) -> None:
+    """Last-resort synchronous teardown, when there is no loop to reap on."""
+    if proc:
+        try:
+            proc.kill()
+            proc.wait(3)
+        except Exception:  # noqa: BLE001 - the process may already be gone
+            pass
     _signal_av_end(leaving)
     _cleanup_av_sdp(sdp_path)
 
@@ -1029,15 +1270,34 @@ def _cleanup_av_sdp(path: str | None = None) -> None:
         pass
 
 
-async def _read_av_ffmpeg_stderr():
-    loop = asyncio.get_event_loop()
-    while av_ffmpeg_proc and av_ffmpeg_proc.poll() is None:
+async def _read_av_ffmpeg_stderr(proc) -> None:
+    """Drain ffmpeg's stderr, counting its lines instead of logging them.
+
+    One DEBUG line per warning was the same unbounded shape as the
+    per-packet logging this file is careful to avoid: at -loglevel
+    warning a lossy stream makes ffmpeg complain about corrupt data
+    per frame, which is millions of lines a day at 15-30 fps. Counted
+    here, summarised once when the pipeline ends. The first and last
+    lines are what a bug report needs; the 200 000 between them are not.
+    """
+    loop = asyncio.get_running_loop()
+    lines = 0
+    first = None
+    last = None
+    while True:
         try:
-            line = await loop.run_in_executor(None, av_ffmpeg_proc.stderr.readline)
-            if not line:
-                break
-            text = line.decode(errors="replace").strip()
-            if text:
-                _LOGGER.debug("AV ffmpeg: %s", text)
-        except Exception:
+            raw = await loop.run_in_executor(None, proc.stderr.readline)
+        except Exception:  # noqa: BLE001 - a closed pipe ends the summary
             break
+        if not raw:
+            break
+        text = raw.decode(errors="replace").strip()
+        if not text:
+            continue
+        lines += 1
+        if first is None:
+            first = text
+        last = text
+    if lines:
+        _LOGGER.debug("AV ffmpeg wrote %d stderr line(s); first: %s | last: %s",
+                      lines, first, last)
