@@ -8,6 +8,7 @@ import asyncio
 import logging
 import socket
 import struct
+import threading
 
 import pytest
 
@@ -245,15 +246,69 @@ def test_the_pipeline_stops_only_when_the_last_viewer_leaves(fake_av):
     assert media._av_subscribers == []
 
 
-def test_every_viewer_gets_every_chunk(fake_av):
-    async def scenario():
-        first = await media.av_subscribe()
-        second = await media.av_subscribe()
-        for queue in media._av_subscribers:
-            queue.put_nowait(b"ts-chunk")
-        return first.get_nowait(), second.get_nowait()
+class _ChunkProc:
+    """A Popen whose stdout hands out a fixed list of chunks, then EOF."""
 
-    assert run(scenario()) == (b"ts-chunk", b"ts-chunk")
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.stdout = self
+        self.stdin = None
+
+    def poll(self):
+        return None
+
+    def read(self, _size):
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+def _drain(queue: asyncio.Queue) -> list:
+    items = []
+    while not queue.empty():
+        items.append(queue.get_nowait())
+    return items
+
+
+def test_the_reader_fans_every_chunk_out_to_every_viewer(monkeypatch):
+    """The real fan-out: one reader on ffmpeg's stdout, N viewer queues.
+
+    Two viewers reading that pipe themselves would each get half of the
+    transport stream and neither would decode.
+    """
+    monkeypatch.setattr(media, "_av_subscribers", [])
+    monkeypatch.setattr(media, "av_ffmpeg_proc",
+                        _ChunkProc([b"one", b"two", b"three"]))
+
+    async def scenario():
+        first: asyncio.Queue = asyncio.Queue(maxsize=media.AV_QUEUE_CHUNKS)
+        second: asyncio.Queue = asyncio.Queue(maxsize=media.AV_QUEUE_CHUNKS)
+        media._av_subscribers.extend([first, second])
+        await media._read_av_ffmpeg_stdout()
+        return _drain(first), _drain(second)
+
+    assert run(scenario()) == (
+        [b"one", b"two", b"three", None],
+        [b"one", b"two", b"three", None],
+    )
+
+
+def test_a_viewer_that_cannot_keep_up_loses_its_oldest_chunk(monkeypatch):
+    """Its backlog must not stall the viewers that are keeping up."""
+    monkeypatch.setattr(media, "_av_subscribers", [])
+    monkeypatch.setattr(media, "av_ffmpeg_proc",
+                        _ChunkProc([b"one", b"two", b"three"]))
+
+    async def scenario():
+        slow: asyncio.Queue = asyncio.Queue(maxsize=2)
+        fast: asyncio.Queue = asyncio.Queue(maxsize=media.AV_QUEUE_CHUNKS)
+        media._av_subscribers.extend([slow, fast])
+        await media._read_av_ffmpeg_stdout()
+        return _drain(slow), _drain(fast)
+
+    slow, fast = run(scenario())
+    # The slow viewer keeps the newest chunks it has room for, and the
+    # sentinel displaces one more: the pipeline ending matters most.
+    assert slow == [b"three", None]
+    assert fast == [b"one", b"two", b"three", None]
 
 
 def test_ending_the_pipeline_releases_every_viewer(fake_av):
@@ -265,3 +320,78 @@ def test_ending_the_pipeline_releases_every_viewer(fake_av):
         return first.get_nowait(), second.get_nowait()
 
     assert run(scenario()) == (None, None)
+
+
+# ─── a viewer arriving while the pipeline is being torn down ─────────
+
+class _ReapedProc:
+    """A Popen that stays alive to `poll()` until its wait is released.
+
+    That is the real shape: `terminate()` is a signal, and `poll()` goes
+    on returning None until the process actually dies.
+    """
+
+    def __init__(self, gate):
+        self.stdin = None
+        self._gate = gate
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def kill(self):  # pragma: no cover - only on the error path
+        pass
+
+    def wait(self, timeout=None):
+        self._gate.wait(timeout)
+        return 0
+
+
+def test_a_viewer_arriving_during_teardown_starts_a_fresh_pipeline(
+        monkeypatch):
+    """It used to join the dying one and get its end-of-stream sentinel.
+
+    `stop_av_ffmpeg` yields for up to three seconds reaping ffmpeg, and
+    `poll()` still returns None throughout. A viewer subscribing in that
+    window took the "already running" branch, and the teardown then
+    pushed `None` into its brand-new queue: the HTTP handler broke out
+    at once and returned an empty MPEG-TS body.
+    """
+    gate = threading.Event()
+    monkeypatch.setattr(media, "_av_subscribers", [])
+    monkeypatch.setattr(media, "_av_reader_task", None)
+    monkeypatch.setattr(media, "_av_consumer", None)
+    monkeypatch.setattr(media, "_av_sdp_path", None)
+    monkeypatch.setattr(media, "av_ffmpeg_proc", _ReapedProc(gate))
+
+    started: list[str] = []
+
+    async def _start():
+        started.append("start")
+        media.av_ffmpeg_proc = _FakeProc()
+
+    monkeypatch.setattr(media, "start_av_ffmpeg", _start)
+
+    async def scenario():
+        leaving: asyncio.Queue = asyncio.Queue(maxsize=4)
+        media._av_subscribers.append(leaving)
+
+        stopping = asyncio.create_task(media.stop_av_ffmpeg())
+        await asyncio.sleep(0.05)  # let it reach the executor wait
+
+        newcomer = await media.av_subscribe()
+
+        gate.set()
+        await stopping
+        return leaving, newcomer
+
+    leaving, newcomer = run(scenario())
+
+    assert started == ["start"]
+    assert newcomer is not None
+    assert newcomer.empty(), "the newcomer was handed the old pipeline's end"
+    assert _drain(leaving) == [None]
+    assert media._av_subscribers == [newcomer]
+    assert media.av_ffmpeg_proc is not None

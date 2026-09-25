@@ -790,12 +790,22 @@ async def _read_av_ffmpeg_stdout() -> None:
     except Exception:  # noqa: BLE001 - a dead pipe must not kill the loop
         _LOGGER.debug("AV output reader stopped early", exc_info=True)
     finally:
-        _signal_av_end()
+        # Only when this reader still owns the live pipeline. A teardown
+        # cancels the reader after detaching, and has already released
+        # that pipeline's viewers; signalling again from here would hit
+        # whoever has since subscribed to the replacement.
+        if proc is not None and proc is av_ffmpeg_proc:
+            _signal_av_end()
 
 
-def _signal_av_end() -> None:
-    """Tell every attached viewer the pipeline has finished."""
-    for queue in list(_av_subscribers):
+def _signal_av_end(queues: list[asyncio.Queue] | None = None) -> None:
+    """Tell viewers the pipeline has finished.
+
+    With no argument this is every currently attached viewer. A teardown
+    passes the list it detached instead, so a viewer that subscribed to
+    the next pipeline while this one was being reaped is left alone.
+    """
+    for queue in list(_av_subscribers if queues is None else queues):
         try:
             queue.put_nowait(None)
         except asyncio.QueueFull:
@@ -871,47 +881,71 @@ def _make_ffmpeg_consumer(proc):
 
 
 async def stop_av_ffmpeg():
-    """Stop the AV pipeline, detach it, and release every viewer."""
+    """Stop the AV pipeline, detach it, and release every viewer.
+
+    Everything this pipeline owns is taken out of the module globals
+    synchronously, before the first await. Reaping ffmpeg takes up to
+    three seconds, and `terminate()` does not make `poll()` return at
+    once; a viewer arriving in that window used to see a process that
+    still looked alive, join it, and be handed the end-of-stream
+    sentinel by the teardown a moment later — an empty MPEG-TS body.
+    Detaching first means such a viewer finds no pipeline and starts a
+    fresh one.
+    """
     global av_ffmpeg_proc, _av_consumer, _av_sdp_path, _av_reader_task
 
-    if _av_consumer is not None:
-        video_registry.remove_consumer(_av_consumer)
-        _av_consumer = None
+    proc, av_ffmpeg_proc = av_ffmpeg_proc, None
+    consumer, _av_consumer = _av_consumer, None
+    reader_task, _av_reader_task = _av_reader_task, None
+    sdp_path, _av_sdp_path = _av_sdp_path, None
+    # These viewers belong to the pipeline being torn down. Anyone who
+    # subscribes from here on belongs to the next one and must not be
+    # handed this one's sentinel.
+    leaving = list(_av_subscribers)
+    _av_subscribers.clear()
 
-    if av_ffmpeg_proc:
+    if consumer is not None:
+        video_registry.remove_consumer(consumer)
+
+    if proc:
         try:
-            if av_ffmpeg_proc.stdin:
-                av_ffmpeg_proc.stdin.close()
-            av_ffmpeg_proc.terminate()
+            if proc.stdin:
+                proc.stdin.close()
+            proc.terminate()
             await asyncio.get_running_loop().run_in_executor(
-                None, av_ffmpeg_proc.wait, 3)
+                None, proc.wait, 3)
         except Exception:  # noqa: BLE001 - the process may already be gone
             try:
-                av_ffmpeg_proc.kill()
+                proc.kill()
             except Exception:  # noqa: BLE001
                 pass
-        av_ffmpeg_proc = None
         _LOGGER.info("AV pipeline stopped")
 
     # Cancel the reader only after the process is gone, so its blocking
     # read in the executor has already returned.
-    if _av_reader_task is not None:
-        _av_reader_task.cancel()
-        _av_reader_task = None
+    if reader_task is not None:
+        reader_task.cancel()
 
-    _signal_av_end()
-    _cleanup_av_sdp()
+    _signal_av_end(leaving)
+    _cleanup_av_sdp(sdp_path)
 
 
-def _cleanup_av_sdp() -> None:
-    """Remove the temporary SDP file, if one is still on disk."""
+def _cleanup_av_sdp(path: str | None = None) -> None:
+    """Remove a temporary SDP file, if one is still on disk.
+
+    With no argument this is the current pipeline's. A teardown passes
+    the path it detached, so it cannot delete the SDP of a pipeline that
+    started while it was reaping the old one.
+    """
     global _av_sdp_path
-    if _av_sdp_path:
-        try:
-            os.unlink(_av_sdp_path)
-        except OSError:
-            pass
-        _av_sdp_path = None
+    if path is None:
+        path, _av_sdp_path = _av_sdp_path, None
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 async def _read_av_ffmpeg_stderr():
