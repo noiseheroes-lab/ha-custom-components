@@ -38,9 +38,21 @@ Read energy consumption data from the **Daikin Madoka BRC1H** smart thermostat v
 
 ### 🔔 [Vimar Intercom](custom_components/vimar_intercom/)
 
-Integrate **Vimar Elvox** video door entry systems (verified on Tab 5S Plus, 40515/40517) into Home Assistant. Configure by pasting the QR code from the Vimar View app: doorbell events, live camera, door release, and call control.
+> **Status: v2 is not released.** It is a rewrite of the 1.x integration and has not been through a release. Read the [integration README](custom_components/vimar_intercom/README.md) before installing it.
 
-**Entities:** camera, doorbell event, locks, call and door buttons, SIP registration sensor
+Integrate **Vimar Elvox** video door entry systems into Home Assistant. Configure by pasting the QR code from the Vimar View app: doorbell events, door release, call control, and a camera.
+
+Developed against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due Fili Plus system. Other panels speak the same protocol and may work, but are untested.
+
+**Limitations you should know before installing:**
+
+- **The camera has never been verified against a live panel.** It is built and unit tested; nothing more than that is claimed. The Vimar cloud accepts one SIP registration per account, so a second instance deregisters the first and takes down a real house's intercom, which is why end-to-end validation is a scheduled session rather than something done casually.
+- **Snapshots only work during a call.** Outside a call the panel sends no video, so the camera has no image to give and returns none. A still request never places a call of its own.
+- **A call is cut after five minutes**, as a safety net against a call left open forever.
+- **Audio flows from the panel only.** There is no talk-back.
+- **Upgrading from 1.x is a reinstall, not a migration.** Remove the old entry and add the integration again; most entity IDs change.
+
+**Entities:** camera, doorbell event, lock, call and door buttons, SIP registration sensor
 
 **IoT class:** Local push (SIP) · **Version:** 2.0.0
 

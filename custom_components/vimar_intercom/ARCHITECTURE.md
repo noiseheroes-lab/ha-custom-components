@@ -25,7 +25,7 @@ can break the day Vimar changes something on their end.
 | `srtp.py` | SRTP (RFC 3711) encrypt/decrypt for the audio and video RTP streams |
 | `media_handler.py` | RTP/SRTP transport for audio and video, G.711 decoding, H.264 depacketisation, the AV ffmpeg process |
 | `config_flow.py` | Config, reconfigure and options flows — QR paste in, panel list and door command out |
-| `camera.py` | Camera entity |
+| `camera.py` | Camera entity — the live stream and the keyframe-derived still |
 | `event.py` | Doorbell event entity, also the source of the `vimar_intercom_ring` bus event |
 | `lock.py` | Door lock entity (opens the relay group from the QR) |
 | `button.py` | Call, door, answer, hang-up and reconnect buttons |
@@ -78,12 +78,14 @@ Audio and video arrive as SRTP over RTP/UDP once a call is established,
 on separate ports (`RTPAudioProtocol`, `RTPVideoProtocol` in
 `media_handler.py`):
 
-- **Audio** is decrypted, decoded from G.711 μ-law, and buffered for
-  internal use; the decrypted RTP is also forwarded locally so an ffmpeg
-  process can remux it into MPEG-TS for the `/api/vimar_intercom/av` HTTP
-  view. ffmpeg runs with `-c copy` — never `-c:v libx264` or any other
-  transcode — because the reference deployment is a fanless two-core
-  machine that a live re-encode would saturate.
+- **Audio** is decrypted and the plain RTP forwarded to a local UDP port,
+  where ffmpeg picks it up and remuxes it into the MPEG-TS served by the
+  `/api/vimar_intercom/av` HTTP view. Nothing else consumes it: there is
+  no decode to PCM and no buffer, because Home Assistant has no
+  talk-back path and nothing ever read one. ffmpeg runs with `-c copy` —
+  never `-c:v libx264` or any other transcode — because the reference
+  deployment is a fanless two-core machine that a live re-encode would
+  saturate.
 - **Video** is decrypted, depacketised from RTP H.264 (FU-A and STAP-A)
   into Annex-B NAL units, and handed to `VideoStreamRegistry`
   (`media_handler.py`), which fans them out to consumers. It caches the
@@ -93,14 +95,29 @@ on separate ports (`RTPAudioProtocol`, `RTPVideoProtocol` in
   stalls transiently gets a small backlog (capped at 256 KB) to catch up
   from; one that cannot recover, or was never seen again, is dropped.
 
-The one consumer wired up today is ffmpeg's stdin: the `/api/vimar_intercom/av`
-HTTP view starts ffmpeg when it is first opened, which remuxes (`-c
-copy`, never a transcode) the H.264 arriving on stdin with the PCMU audio
-arriving over a local RTP port into MPEG-TS on stdout. The camera entity
-exposes that view through a **signed path** — `async_sign_path` from
-`homeassistant.components.http.auth`, ten-minute expiry — because Home
-Assistant's `stream` component fetches `stream_source()` without
-carrying a bearer token, and the view still sets `requires_auth = True`.
+The one consumer wired up today is ffmpeg's stdin: the
+`/api/vimar_intercom/av` HTTP view starts ffmpeg when the first viewer
+attaches, which remuxes (`-c copy`, never a transcode) the H.264
+arriving on stdin with the PCMU audio arriving over a local RTP port
+into MPEG-TS on stdout. The pipeline is **reference counted** and its
+output is **fanned out**: one reader task reads ffmpeg's stdout and
+pushes each chunk to a queue per viewer, so a second dashboard joins the
+running pipeline instead of restarting it, and the last viewer to leave
+is the one that stops it. The camera entity exposes the view through a
+**signed path** — `async_sign_path` from
+`homeassistant.components.http.auth` — because Home Assistant's `stream`
+component fetches `stream_source()` without carrying a bearer token, and
+the view still sets `requires_auth = True`. The signature outlives the
+maximum call duration, so a stream cannot outlive its own URL.
+
+The registry also caches the most recent SPS + PPS + IDR as a
+self-contained Annex-B keyframe. That is what a **still** is decoded
+from: `async_camera_image` turns it into one JPEG with a single ffmpeg
+invocation while a call is running, and returns `None` otherwise.
+`use_stream_for_stills` is deliberately False — taking a still through
+the stream would fetch the AV view, and the AV view places a SIP call to
+the entrance panel, so a dashboard polling the still would ring the door
+every few seconds.
 
 **This is built and unit tested but not verified against a real panel.**
 Whether the `stream` component's ffmpeg opens a signed internal URL
@@ -124,16 +141,31 @@ something to try casually.
   that URL with `async_sign_path` (ten-minute expiry) instead of
   disabling auth; the view itself is unchanged and still requires it.
 - The integration never opens an inbound port on the internet. It
-  maintains one outbound TLS connection to the Vimar cloud proxy; nothing
-  listens for connections from outside the local network.
+  maintains one outbound TLS connection to the Vimar cloud proxy. It
+  does bind two UDP sockets on `0.0.0.0` for the RTP media streams
+  (`rtp_port_base` and `rtp_port_base + 2000`), reachable from the local
+  network: `datagram_received` does not check the source address, so
+  while SRTP is negotiated a forged datagram fails authentication and is
+  counted, but a panel that offers no crypto leaves the stream in
+  plaintext and any host on the LAN could inject frames into the video
+  the camera shows. No inbound TCP port is opened, and nothing from
+  outside the local network can reach either socket.
+- The AV stream view is reachable by any authenticated Home Assistant
+  user, including non-admins and users for whom the camera entity is
+  hidden: entity permissions do not apply to a `HomeAssistantView`. That
+  is how Home Assistant works rather than something introduced here, but
+  fetching the view places a call to the entrance panel, so it is worth
+  knowing about.
 - The QR payload and the SIP password are excluded from logging by
   design (see `qr.py`); no module sets a logging level or attaches a
   handler — Home Assistant's own `logger:` configuration is the only
-  authority on verbosity.
+  authority on verbosity. No log statement lives on a path executed per
+  packet or per NAL, at any level: the RTP receive paths count what they
+  see and `stop_media` emits a single DEBUG summary per call.
 
 ## Known compatibility
 
-Tested against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due
+Developed against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due
 Fili Plus system. The protocol dialect is shared across Vimar/Elvox SIP
 video door entry panels that pair with the Vimar View app, so other
 models are likely to work, but none have been verified.

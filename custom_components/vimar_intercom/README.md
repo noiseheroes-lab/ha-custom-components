@@ -1,18 +1,23 @@
 # Vimar Intercom — Home Assistant Integration
 
 > **Status: in active development.** This is the v2 rewrite and it is not
-> released yet. Do not point HACS at this branch. The stable version is 1.x
-> on the `main` branch. This notice is removed when v2.0.0 ships.
+> released yet. The 1.x release users are running lives on `origin/main`;
+> this work lives on the `v2` branch until it has been verified on real
+> hardware. Do not point HACS at a branch carrying v2. This notice is
+> removed when v2.0.0 ships.
 
 Integrate a **Vimar Elvox** video door entry system into Home Assistant:
 doorbell events, live video (with audio from the panel), door release and
 call control, over the same cloud SIP protocol the Vimar View app uses.
 
-## Verified hardware
+## Hardware
 
-Developed and tested against a Vimar Elvox Tab 5S Plus (40515/40517) on a
-2-wire Due Fili Plus system. Other panels speak the same protocol and may
-work, but are untested — please open an issue with your results.
+Developed against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due
+Fili Plus system. Other panels speak the same protocol and may work, but
+are untested — please open an issue with your results.
+
+The camera has never been run against a live panel; see Limitations
+below. Nothing in this repository claims it is verified.
 
 ## Before you install: only one registration exists per account
 
@@ -49,7 +54,7 @@ no panel IP, port or credential needs typing.
 
 | Entity | Type | Notes |
 |---|---|---|
-| `camera.vimar_intercom_intercom` | camera | Opening the stream places a call to the panel |
+| `camera.vimar_intercom_intercom` | camera | Opening the stream places a call to the panel, or answers one that is ringing. Stills come from the call in progress; outside a call there is none |
 | `event.vimar_intercom_doorbell` | event | Event type `ring`, attribute `panel` |
 | `lock.vimar_intercom_door` | lock | Unlock opens the main entrance; re-locks itself. Needs no configuration — it addresses the relay group from your QR code |
 | `button.vimar_intercom_call_<panel>` | button | Call that panel |
@@ -93,12 +98,22 @@ automation:
       - trigger: event
         event_type: vimar_intercom_ring
     actions:
+      # The panel sends no video until the call is answered, so answer
+      # it first. `camera.snapshot` on its own would find no call in
+      # progress and no image to save.
+      - action: button.press
+        target:
+          entity_id: button.vimar_intercom_answer
+      - delay: "00:00:03"
       - action: camera.snapshot
         target:
           entity_id: camera.vimar_intercom_intercom
         data:
           filename: "/media/doorbell_{{ now().timestamp() | int }}.jpg"
 ```
+
+Answering takes the call, exactly as pressing Answer in the Home
+Assistant UI would: the panel stops ringing elsewhere in the house.
 
 ## Options
 
@@ -129,15 +144,29 @@ automation:
   Call and Answer control the call — they do not open a conversation.
 - **One Vimar system per Home Assistant installation.** The integration
   declares `single_config_entry`.
-- **The camera is implemented but not yet verified end to end against a
-  live panel.** It streams the panel's H.264 video and PCMU audio,
-  remuxed to MPEG-TS by ffmpeg, over a signed URL that Home Assistant's
-  `stream` component fetches without a bearer token. The pipeline that
-  feeds it — depacketisation, SPS/PPS replay, the ffmpeg consumer — is
-  built and unit tested, but has never run against a real Vimar panel;
-  see "Before you install" above for why that has not been tried yet.
-  Remove this sentence once a validation session against real hardware
-  confirms it.
+- **The camera is implemented but not verified end to end against a live
+  panel.** It streams the panel's H.264 video and PCMU audio, remuxed to
+  MPEG-TS by ffmpeg, over a signed URL that Home Assistant's `stream`
+  component fetches without a bearer token. The pipeline that feeds it —
+  depacketisation, SPS/PPS replay, the ffmpeg consumer — is built and
+  unit tested, but has never run against a real Vimar panel; see "Before
+  you install" above for why that has not been tried yet. Remove this
+  sentence once a validation session against real hardware confirms it.
+- **There is no still image outside a call.** The panel only sends video
+  inside a call, so a snapshot is taken from the call in progress, and
+  outside one the camera has nothing to return. A still request never
+  places a call of its own: a dashboard card polling the camera every
+  ten seconds would otherwise ring the entrance panel every ten seconds.
+- **A call is hung up after five minutes.** It is a safety net against a
+  call nobody closes, and it applies to calls the camera placed as well
+  as to answered ones. Open the stream again to place a new one.
+- **The AV stream is reachable by any authenticated Home Assistant
+  user.** Entity permissions do not apply to an HTTP view, so hiding the
+  camera entity from a user does not stop them fetching
+  `/api/vimar_intercom/av` with their own token — and fetching it places
+  a call to the panel. This is how Home Assistant views work rather than
+  something this integration introduces, but it is worth knowing if you
+  have non-admin users.
 - **Only one SIP registration exists per Vimar account.** Running a
   second client — a test instance, or the Vimar View app configured with
   the same credentials — will deregister this one.
@@ -172,6 +201,11 @@ bugs:
 - **No video** — video only flows inside a call, so the camera is black
   until something opens the stream; check `ffmpeg` is present; check the
   RTP base port is not firewalled. See also the camera limitation above.
+- **A snapshot saves nothing** — there is no image outside a call.
+  Answer or place a call first; see the "Doorbell snapshot" automation
+  above.
+- **The video cut out after five minutes** — that is the maximum call
+  duration, not a fault. Open the stream again.
 - **Door does not open** — the lock addresses the relay group from your
   QR code, so it should work untouched. While a call is up it opens the
   relay of the panel that is calling; otherwise it sends the configured

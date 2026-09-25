@@ -26,6 +26,31 @@ edited by hand any more.
   Assistant restarted.
 - SIP responses are correlated per transaction, so a REGISTER reply
   arriving during a call is no longer discarded as stale.
+- A camera stream that never connected, or a call the panel ended
+  itself, no longer leaves the integration suppressing every subsequent
+  doorbell press. The record of a locally placed call now has one owner
+  and is cleared on every path out of a call.
+- The SIP layer's state is reset when the integration starts and a live
+  call is hung up when it stops, so reloading the entry mid-call no
+  longer leaves the in-call sensor stuck on and the camera unable to
+  place another call.
+- The inbound SIP request loop survives a failure while answering a
+  request. It used to die silently on a dropped connection, leaving the
+  connectivity sensor green and the doorbell permanently deaf.
+- A second viewer joins the running AV pipeline instead of destroying
+  the first viewer's ffmpeg and splitting the transport stream.
+- The AV HTTP view is registered once rather than once per setup, so an
+  options change no longer leaves camera opens routed through a
+  torn-down hub, firing a spurious `vimar_intercom_ring` each time.
+- Opening the door while the cloud is unreachable fails fast with an
+  explanation and asks for a reconnect, instead of leaking one TLS
+  socket per attempt.
+- The RTP receive paths no longer log per packet or per NAL. A few
+  percent of packet loss on residential Wi-Fi used to produce thousands
+  of WARNING lines per call; the media layer now emits one DEBUG
+  summary when the call ends.
+- The RTP sockets are all closed on unload, and a failed bind during
+  setup cleans up after itself and surfaces as a retryable setup error.
 - Registration state follows the lifetime granted by the registrar, with
   a refresh at half that lifetime.
 - Video depacketisation holds the most recent SPS/PPS and replays them
@@ -38,13 +63,32 @@ edited by hand any more.
   the camera entity fetches it over a signed URL, so the underlying HTTP
   view still requires authentication.
 
+#### Changed
+- **A camera snapshot no longer places a call.** Stills used to be taken
+  by building a stream, which fetched the AV view, which called the
+  entrance panel: a dashboard card polling the still every ten seconds
+  occupied the household's intercom for as long as it was open. A still
+  is now decoded from the keyframe of a call already in progress, and
+  outside a call the camera honestly returns no image.
+- **Opening the camera while a panel is ringing answers that call**
+  instead of placing a second, colliding one to the default panel.
+- **The maximum call duration (five minutes) is documented.** A call
+  this integration placed or answered is hung up after five minutes as
+  a safety net.
+- **Upgrading from 1.x now explains itself.** A 1.x config entry raises
+  a repair issue naming the remove-and-re-add step instead of failing
+  with "Migration handler not found for entry".
+
 #### Known limitations
-- The camera is implemented but not yet verified end to end against a
-  live panel: it is built and unit tested, but a second SIP registration
+- The camera is implemented but not verified end to end against a live
+  panel: it is built and unit tested, but a second SIP registration
   would deregister the production panel, so real-hardware validation is
   a scheduled session, not something to try casually.
+- There is no still image outside a call.
 - Audio flows from the panel only. There is no talk-back.
 - One Vimar system per Home Assistant installation.
+- The AV stream view is reachable by any authenticated Home Assistant
+  user; entity permissions do not apply to an HTTP view.
 
 #### Security
 - Every HTTP view requires authentication. The audio WebSocket, MJPEG
@@ -55,9 +99,17 @@ edited by hand any more.
 - Apple push (APNs/PushKit) support and the `/api/vimar_intercom/push_token`
   endpoint. The integration stops at the `vimar_intercom_ring` event;
   subscribe to it from a notification service or a companion app.
+- `connectProfiles` registration against the Vimar cloud. It sent a
+  locally generated random push token — and used that same invented
+  token as the digest password — to register a push channel this
+  integration has no way to receive. It could not succeed by
+  construction, and it left the SIP socket unread for up to 45 seconds
+  after every reconnect.
 - The audio WebSocket, MJPEG and debug endpoints.
 - The import-time debug log handler that forced every installation to
   DEBUG.
+- The unused audio decode buffer, the unused RTP send path, and the
+  unused panel probe and scan helpers.
 
 ## [1.1.0] — 2026-03-12
 
