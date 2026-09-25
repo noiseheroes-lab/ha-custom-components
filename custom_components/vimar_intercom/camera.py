@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import timedelta
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
@@ -13,12 +12,17 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.network import get_url
 
+from . import media_handler as media
 from .const import DOMAIN, MANUFACTURER, MODEL
-
-_LOGGER = logging.getLogger(__name__)
+from .hub import MAX_CALL_DURATION
 
 AV_PATH = "/api/vimar_intercom/av"
-SIGNATURE_LIFETIME = timedelta(minutes=10)
+
+# Comfortably longer than MAX_CALL_DURATION. A stream still running when
+# the signature expires cannot renew it, and the restart Home
+# Assistant's `stream` component attempts would get a 401 it has no way
+# to recover from.
+SIGNATURE_LIFETIME = timedelta(seconds=MAX_CALL_DURATION + 120)
 
 
 async def async_setup_entry(
@@ -29,6 +33,16 @@ async def async_setup_entry(
     """Set up the intercom camera."""
     hub = hass.data[DOMAIN][entry.entry_id]["hub"]
     async_add_entities([VimarIntercomCamera(hub, entry.entry_id)])
+
+
+def _device_info(entry_id: str) -> DeviceInfo:
+    """The one intercom device every entity of this entry belongs to."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry_id)},
+        name="Vimar Intercom",
+        manufacturer=MANUFACTURER,
+        model=MODEL,
+    )
 
 
 class VimarIntercomCamera(Camera):
@@ -50,12 +64,7 @@ class VimarIntercomCamera(Camera):
         super().__init__()
         self._hub = hub
         self._attr_unique_id = f"{entry_id}_camera"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
-            name="Vimar Intercom",
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-        )
+        self._attr_device_info = _device_info(entry_id)
 
     @property
     def is_streaming(self) -> bool:
@@ -69,13 +78,29 @@ class VimarIntercomCamera(Camera):
 
     @property
     def use_stream_for_stills(self) -> bool:
-        """Take stills from the stream.
+        """Never take a still by building a stream.
 
-        The panel sends H.264, never JPEG, so there is no still image to
-        fetch. Without this, Home Assistant would call `camera_image` and
-        get NotImplementedError for every snapshot and dashboard preview.
+        Building a stream fetches the AV view, and the AV view places a
+        SIP call to the entrance panel. A picture-glance card polling
+        the still every ten seconds would ring the door every ten
+        seconds and occupy the household's intercom for as long as the
+        dashboard stayed open.
         """
-        return True
+        return False
+
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        """Return a still from the call in progress, or None.
+
+        No path from here can start a call: the picture is decoded from
+        the keyframe the video registry already cached for a call that
+        is running. Outside a call there is honestly no image to give,
+        and `None` is what the camera platform expects to hear.
+        """
+        if not self._hub.in_call:
+            return None
+        return await media.snapshot_jpeg()
 
     async def stream_source(self) -> str | None:
         """Signed URL of the MPEG-TS stream."""

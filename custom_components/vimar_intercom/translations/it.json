@@ -50,30 +50,54 @@
   },
   "entity": {
     "camera": {
-      "intercom": { "name": "Videocitofono" }
+      "intercom": {
+        "name": "Videocitofono"
+      }
     },
     "lock": {
-      "door": { "name": "Porta" }
+      "door": {
+        "name": "Porta"
+      }
     },
     "button": {
-      "call": { "name": "Chiama" },
-      "answer": { "name": "Rispondi" },
-      "hang_up": { "name": "Riaggancia" },
-      "open_door": { "name": "Apri porta" },
-      "reconnect": { "name": "Riconnetti" }
+      "call": {
+        "name": "Chiama"
+      },
+      "answer": {
+        "name": "Rispondi"
+      },
+      "hang_up": {
+        "name": "Riaggancia"
+      },
+      "open_door": {
+        "name": "Apri porta"
+      },
+      "reconnect": {
+        "name": "Riconnetti"
+      }
     },
     "event": {
-      "doorbell": { "name": "Campanello" }
+      "doorbell": {
+        "name": "Campanello"
+      }
     },
     "binary_sensor": {
-      "sip_registration": { "name": "Registrazione SIP" },
-      "in_call": { "name": "In chiamata" }
+      "sip_registration": {
+        "name": "Registrazione SIP"
+      },
+      "in_call": {
+        "name": "In chiamata"
+      }
     }
   },
   "issues": {
     "registration_down": {
       "title": "Il videocitofono Vimar non è registrato",
       "description": "Il videocitofono non risulta registrato al cloud Vimar da più di cinque minuti, quindi il campanello non suonerà in Home Assistant. Home Assistant continua a riprovare. Verifica che il posto esterno sia acceso e che questo host raggiunga {proxy_host} sulla porta {proxy_port}."
+    },
+    "migration_required": {
+      "title": "Il videocitofono Vimar va riconfigurato",
+      "description": "Questo Home Assistant usava Vimar Intercom 1.x e la versione 2 non può riutilizzarne la configurazione: le credenziali prima venivano scritte nel codice dell'integrazione e ora provengono dal codice QR esportato dall'app Vimar View, che Home Assistant non può recuperare al posto tuo. Il videocitofono non funzionerà finché non fai così: apri Impostazioni > Dispositivi e servizi, elimina la voce Vimar Intercom, poi aggiungi di nuovo l'integrazione e incolla il contenuto del QR dall'app Vimar View (Impostazioni > Sistema > Esporta configurazione). Quasi tutti gli ID delle entità cambiano: leggi il README dell'integrazione prima di riscrivere le tue automazioni."
     }
   }
 }

@@ -37,6 +37,7 @@ EVENT_RING = "vimar_intercom_ring"
 # ─── Repair issues ───────────────────────────────────────────────
 ISSUE_REGISTRATION_DOWN = "registration_down"
 REGISTRATION_DOWN_GRACE = 300  # seconds before raising the repair issue
+ISSUE_MIGRATION_REQUIRED = "migration_required"
 
 # ─── Config entry keys ───────────────────────────────────────────
 CONF_SIP_USER = "sip_user"

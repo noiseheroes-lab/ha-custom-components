@@ -50,30 +50,54 @@
   },
   "entity": {
     "camera": {
-      "intercom": { "name": "Intercom" }
+      "intercom": {
+        "name": "Intercom"
+      }
     },
     "lock": {
-      "door": { "name": "Door" }
+      "door": {
+        "name": "Door"
+      }
     },
     "button": {
-      "call": { "name": "Call" },
-      "answer": { "name": "Answer" },
-      "hang_up": { "name": "Hang up" },
-      "open_door": { "name": "Open door" },
-      "reconnect": { "name": "Reconnect" }
+      "call": {
+        "name": "Call"
+      },
+      "answer": {
+        "name": "Answer"
+      },
+      "hang_up": {
+        "name": "Hang up"
+      },
+      "open_door": {
+        "name": "Open door"
+      },
+      "reconnect": {
+        "name": "Reconnect"
+      }
     },
     "event": {
-      "doorbell": { "name": "Doorbell" }
+      "doorbell": {
+        "name": "Doorbell"
+      }
     },
     "binary_sensor": {
-      "sip_registration": { "name": "SIP registration" },
-      "in_call": { "name": "In call" }
+      "sip_registration": {
+        "name": "SIP registration"
+      },
+      "in_call": {
+        "name": "In call"
+      }
     }
   },
   "issues": {
     "registration_down": {
       "title": "Vimar Intercom is not registered",
       "description": "The intercom has not been registered with the Vimar cloud for more than five minutes, so the doorbell will not ring in Home Assistant. Home Assistant keeps retrying. Check that the panel is online and that this host can reach {proxy_host} on port {proxy_port}."
+    },
+    "migration_required": {
+      "title": "Vimar Intercom must be set up again",
+      "description": "This Home Assistant was using Vimar Intercom 1.x, and version 2 cannot reuse its configuration: the credentials used to be edited into the integration's source and now come from the QR code the Vimar View app exports, which Home Assistant cannot fetch for you. The intercom will not work until you do this: go to Settings > Devices & services, delete the Vimar Intercom entry, then add the integration again and paste the QR payload from the Vimar View app (Settings > System > Export configuration). Most entity IDs change; see the integration's README before rewriting your automations."
     }
   }
 }
