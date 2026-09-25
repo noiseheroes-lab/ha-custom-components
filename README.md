@@ -44,6 +44,8 @@ Integrate **Vimar Elvox** video intercom panels (Tab 5S Plus and compatible) int
 
 **IoT class:** Local push (SIP) · **Version:** 1.3.0
 
+> 🚧 **v2 is under active development on `main`.** QR-code setup, configurable entrance panels, per-transaction SIP correlation, Apple-specific code removed. It is not feature-complete and has not been verified on a clean install — see the [component README](custom_components/vimar_intercom/README.md) for exactly what works and what does not, and for how to get the previous 1.x behaviour.
+
 ---
 
 ### 🎛️ [Universal Audio Apollo](custom_components/universal_audio/)
