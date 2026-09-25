@@ -2,179 +2,122 @@
 
 ## Overview
 
-This integration connects Home Assistant to a **Vimar Elvox** video intercom panel using the **SIP** (Session Initiation Protocol, RFC 3261) and **RTSP** (Real Time Streaming Protocol, RFC 2326) standard protocols.
+This integration speaks the SIP dialect the Vimar cloud uses for the
+Vimar View app. It is not a generic SIP client for local Vimar/Elvox
+panels: the panel is reached through Vimar's own cloud proxy
+(`ipvdes.vimar.cloud:7042` by default), the same path the phone app uses,
+using a user agent string and REGISTER/INVITE shape the cloud is known to
+accept. This dialect is not documented by Vimar; it was reverse
+engineered from the app and from captured traffic. It works today and it
+can break the day Vimar changes something on their end.
 
-No cloud dependency. No reverse engineering of proprietary protocols — Vimar panels expose SIP natively and document the RTSP stream endpoint in their installation manual.
+## Module map
 
----
+| Module | Responsibility |
+|---|---|
+| `__init__.py` | Entry setup/teardown, wires the hub to Home Assistant, registers the AV stream HTTP view |
+| `hub.py` | Orchestrates SIP registration, calls, door control and media lifecycle; the only module that talks to both `sip_client` and Home Assistant |
+| `sip_client.py` | The SIP stack itself: connection, digest auth, REGISTER/INVITE/BYE/MESSAGE, transaction correlation, reconnection |
+| `sip_parser.py` | Pure text handling: header parsing, transaction keys, registration expiry parsing — no I/O, no Home Assistant |
+| `backoff.py` | The jittered exponential reconnect delay schedule |
+| `qr.py` | Decrypts and parses the QR configuration payload exported by the Vimar View app |
+| `runtime.py` | `RuntimeConfig` — every value the integration needs, derived once from the config entry; no Home Assistant import, fully unit testable |
+| `srtp.py` | SRTP (RFC 3711) encrypt/decrypt for the audio and video RTP streams |
+| `media_handler.py` | RTP/SRTP transport for audio and video, G.711 decoding, H.264 depacketisation, the AV ffmpeg process |
+| `config_flow.py` | Config, reconfigure and options flows — QR paste in, panel list and door command out |
+| `camera.py` | Camera entity |
+| `event.py` | Doorbell event entity, also the source of the `vimar_intercom_ring` bus event |
+| `lock.py` | Door lock entity (opens the relay group from the QR) |
+| `button.py` | Call, door, answer, hang-up and reconnect buttons |
+| `binary_sensor.py` | SIP registration and in-call sensors |
+| `const.py` | True constants — protocol values, config keys, defaults. Installation-specific values live in the config entry, not here |
+| `manifest.json`, `strings.json`, `translations/` | Integration metadata and UI strings |
 
-## File structure
-
-```text
-vimar_intercom/
-├── __init__.py           Entry setup / teardown, SIP stack lifecycle
-├── sip_client.py         SIP stack (registration, call handling, door unlock)
-├── config_flow.py        UI config flow (SIP credentials entry)
-├── camera.py             Camera entity (RTSP stream via ffmpeg)
-├── event.py              Event entity (doorbell press)
-├── lock.py               Lock entity (door/gate opener)
-├── button.py             Button entities (call, hangup)
-├── binary_sensor.py      Binary sensors (SIP registered, in-call)
-├── const.py              SIP message templates, default ports
-├── manifest.json
-├── strings.json
-├── translations/en.json
-├── README.md
-├── ARCHITECTURE.md       This file
-└── icon.svg
-```
-
----
-
-## Protocol overview
-
-### SIP (RFC 3261)
-
-SIP is a signalling protocol used for establishing, managing, and terminating multimedia sessions (calls). Vimar/Elvox intercoms act as SIP endpoints on the local network.
-
-This integration acts as a **SIP User Agent** (UA) that:
-
-1. **Registers** with the intercom panel as an extension (`REGISTER`)
-2. **Receives** incoming `INVITE` from the panel when the doorbell is pressed
-3. **Sends** `MESSAGE` to the panel to trigger door unlock
-4. **Sends** outbound `INVITE` to call the panel
-5. **Sends** `BYE` to hang up
-
-The SIP stack runs as a background asyncio task, maintaining registration with periodic `REGISTER` refreshes (every 60–120s, per the panel's `expires` parameter).
-
-### RTSP (RFC 2326)
-
-The intercom panel streams live video over RTSP. HA's `camera` platform wraps this as an FFmpeg-proxied camera entity:
+## Connection state machine
 
 ```
-rtsp://<panel_ip>:<port>/stream
+disconnected → connecting → registering → registered → (call) → registered
+      ^                                        |
+      |                                        |
+      └──────────── backoff, forever ──────────┘
 ```
 
-The RTSP URL is configurable in the config flow (default follows Elvox Tab 5S Plus documentation).
+Every edge back to `disconnected` — a TCP failure, a TLS failure, a
+rejected REGISTER, or the server closing the connection — goes through
+`connection_supervisor()`'s jittered exponential backoff
+(`backoff.reconnect_delay`). There is no terminal failure state by
+design: the supervisor retries forever, because the SIP connection is the
+whole integration and giving up would mean the doorbell silently stops
+working until Home Assistant is restarted. A connection that stays up for
+at least `STABLE_CONNECTION_SECONDS` before failing again resets the
+backoff ladder, so a momentary blip does not leave the next real outage
+waiting at the ceiling delay.
 
----
+Registration itself has its own lifetime: `is_registered()` reflects the
+`expires` value the registrar actually granted, not just whether a
+`200 OK` was ever seen, and a refresh is scheduled before that lifetime
+runs out. A registration that stays down for more than five minutes
+raises a Home Assistant repair issue; it clears itself automatically once
+registration recovers.
 
-## SIP stack implementation
+## Transaction model
 
-The integration implements a minimal SIP stack in Python using asyncio — no external SIP library dependency.
+Responses are correlated to the request that caused them, not just
+matched by method. The primary key is `branch|CSeq|method` — a fresh
+branch on every retry means an authenticated retry is a distinct
+transaction from the challenge that preceded it, so a stale or duplicate
+response cannot be mistaken for the answer to the wrong request. The
+Call-ID is kept as a fallback key for messages where the branch is not
+authoritative. This replaces an earlier design that only checked the
+method, which discarded a REGISTER reply that happened to arrive while a
+call was active.
 
-### Registration
+## Media pipeline
 
-```
-REGISTER sip:<panel_ip> SIP/2.0
-From: sip:<extension>@<panel_ip>
-To: sip:<extension>@<panel_ip>
-Contact: sip:<extension>@<ha_ip>:<sip_port>
-Expires: 120
-Authorization: Digest ...
-```
+Audio and video arrive as SRTP over RTP/UDP once a call is established,
+on separate ports (`RTPAudioProtocol`, `RTPVideoProtocol` in
+`media_handler.py`):
 
-Registration is renewed before expiry. The `binary_sensor.sip_registered` entity reflects the current registration state.
+- **Audio** is decrypted, decoded from G.711 μ-law, and buffered for
+  internal use; the decrypted RTP is also forwarded locally so an ffmpeg
+  process can remux it into MPEG-TS for the `/api/vimar_intercom/av` HTTP
+  view. ffmpeg runs with `-c copy` — never `-c:v libx264` or any other
+  transcode — because the reference deployment is a fanless two-core
+  machine that a live re-encode would saturate.
+- **Video** is decrypted, depacketised from RTP H.264 (FU-A and STAP-A)
+  into Annex-B NAL units, with the most recent SPS/PPS held and replayed
+  ahead of every IDR so a consumer attaching mid-stream can still decode.
 
-### Doorbell event (incoming INVITE)
+**This is where the integration stops today.** The depacketised NAL
+queue has no consumer: `media_handler._nal_sender` reads it and discards
+every frame, and the AV ffmpeg pipeline currently only carries audio — no
+video track reaches it. The camera entity's `stream_source()` points at
+the AV view, but there is no video to show. Wiring a real video consumer
+into this path, and finishing end-to-end delivery to the camera entity,
+is deliberately left to Tasks 12-13 rather than folded into this task.
 
-When the doorbell is pressed, the panel sends a SIP `INVITE` to the registered HA extension:
+## Threat model
 
-```
-INVITE sip:<ha_extension>@<ha_ip> SIP/2.0
-From: sip:<panel_extension>@<panel_ip>
-...
-```
+- The config entry holds the SIP account credentials in Home Assistant's
+  own config entry store; anyone with access to `.storage` on the host
+  has them, the same as for any other integration's credentials.
+- Every `HomeAssistantView` this integration registers sets
+  `requires_auth = True`, with no exception — the door release is
+  reachable through the SIP stack these views front, so an
+  unauthenticated view would let anyone on the network that can reach
+  Home Assistant open the door. There is no separate signed-path scheme
+  yet; that is part of the unfinished camera work above.
+- The integration never opens an inbound port on the internet. It
+  maintains one outbound TLS connection to the Vimar cloud proxy; nothing
+  listens for connections from outside the local network.
+- The QR payload and the SIP password are excluded from logging by
+  design (see `qr.py`); no module sets a logging level or attaches a
+  handler — Home Assistant's own `logger:` configuration is the only
+  authority on verbosity.
 
-The integration:
+## Known compatibility
 
-1. Sends `200 OK` (auto-answers at SIP level — no audio negotiation)
-2. Fires HA event `vimar_intercom_campanello`
-3. Sets `binary_sensor.in_call = True`
-4. Sets `event.campanello` state
-
-Automations can respond (e.g., send a push notification, trigger a camera view).
-
-### Door unlock (outbound MESSAGE)
-
-```
-MESSAGE sip:<door_extension>@<panel_ip> SIP/2.0
-Content-Type: application/dtmf-relay
-Signal=*
-Duration=250
-```
-
-The specific signal/duration to trigger the door relay is configurable and panel-dependent. The Elvox Tab 5S Plus uses a DTMF relay via `*`.
-
-### Call / Hangup
-
-- **Call**: sends `INVITE` to the panel extension — triggers the panel's screen and audio
-- **Hangup**: sends `BYE` to terminate the active dialog
-
----
-
-## Config flow
-
-```
-Step 1: user_input(panel_ip, sip_extension, sip_password, rtsp_url)
-  → attempt SIP REGISTER to validate credentials
-  → if 200 OK: create entry
-  → if 401/403: show authentication error
-  → if timeout: show cannot_connect error
-```
-
-No multi-step flow needed — all config is entered at once. The config is stored in the entry as:
-
-```python
-{
-    "host": "192.168.1.x",
-    "sip_extension": "55001",
-    "sip_password": "...",
-    "sip_port": 5060,
-    "rtsp_url": "rtsp://192.168.1.x:554/stream",
-    "door_extension": "55001"
-}
-```
-
----
-
-## Entity model
-
-| Entity | HA type | Update mechanism |
-| ------ | ------- | ---------------- |
-| Camera | `camera` | Passive RTSP stream (always on) |
-| Doorbell | `event` | Fired on incoming INVITE |
-| Lock | `lock` | Write-only (open = SIP MESSAGE), no state feedback |
-| Call button | `button` | Sends outbound INVITE |
-| Hangup button | `button` | Sends BYE |
-| SIP Registered | `binary_sensor` | SIP registration state machine |
-| In Call | `binary_sensor` | SIP dialog state machine |
-
-The lock entity has no physical feedback — it always shows as "unlocked" after the open action (the panel has no state reply for the door sensor). If door sensor state is needed, a separate `binary_sensor` connected to a door contact sensor would be required.
-
----
-
-## Notes on SIP compatibility
-
-The integration has been tested with the **Elvox Tab 5S Plus** (also sold as Vimar K40945). Other Vimar/Elvox SIP-based panels should work if they implement standard SIP REGISTER + INVITE + MESSAGE. The following are known working:
-
-- Elvox Tab 5S Plus
-- Vimar VIEW IP series (2-wire SIP gateway)
-
-For panels with non-standard SIP behaviour, the `sip_client.py` can be extended.
-
----
-
-## Legal and protocol notes
-
-SIP is an open IETF standard (RFC 3261). RTSP is an open IETF standard (RFC 2326). Vimar panels expose SIP as a documented feature. There is no proprietary protocol reverse engineering, no DRM circumvention, and no security bypass in this integration. Users provide their own device credentials. This integration is equivalent in nature to any other SIP client (softphone, door intercom app).
-
----
-
-## Future improvements
-
-- QR code scan in config flow to auto-fill SIP credentials (Elvox QR codes encode SIP config)
-- Two-way audio via RTP (requires audio codec negotiation in SIP)
-- Multi-panel support in a single entry (esterna + interna)
-- DTMF tones for gate automation sequences
-- Auto-answer mode with notification-triggered accept/decline
+Tested against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due
+Fili Plus system. The protocol dialect is shared across Vimar/Elvox SIP
+video door entry panels that pair with the Vimar View app, so other
+models are likely to work, but none have been verified.

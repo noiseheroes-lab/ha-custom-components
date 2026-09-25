@@ -1,5 +1,56 @@
 # Changelog
 
+## [2.0.0] — 2026-09-10
+
+### vimar_intercom v2.0.0
+
+**Breaking:** credentials no longer live in `const.py`. Upgrading from 1.x
+requires removing the existing entry and adding the integration again,
+pasting the QR payload from the Vimar View app. Nothing needs to be
+edited by hand any more.
+
+#### Added
+- QR-based config flow, with reconfigure and options flows.
+- `vimar_intercom_ring` event on the Home Assistant bus, carrying the
+  panel address and name.
+- Reconnect button and a repair issue raised when registration has been
+  down for more than five minutes.
+- Configurable panel addresses; one lock and one call button per panel.
+- Unit tests for QR decryption, configuration derivation, SIP
+  transaction correlation, the reconnect schedule and SPS/PPS replay,
+  running in CI.
+
+#### Fixed
+- Reconnection is unbounded with jittered exponential backoff. Previously
+  the client gave up after five attempts and stayed silent until Home
+  Assistant restarted.
+- SIP responses are correlated per transaction, so a REGISTER reply
+  arriving during a call is no longer discarded as stale.
+- Registration state follows the lifetime granted by the registrar, with
+  a refresh at half that lifetime.
+- Every new video consumer receives the cached SPS and PPS, so a client
+  attaching mid-stream can decode.
+
+#### Known limitations
+- The camera is not finished: the SIP/RTP transport and H.264
+  depacketisation exist, but nothing yet delivers video to a Home
+  Assistant consumer. Tracked as follow-up work.
+- Audio flows from the panel only. There is no talk-back.
+- One Vimar system per Home Assistant installation.
+
+#### Security
+- Every HTTP view requires authentication. The audio WebSocket, MJPEG
+  and AV views previously did not, which let anyone on the network open
+  the street gate.
+
+#### Removed
+- Apple push (APNs/PushKit) support and the `/api/vimar_intercom/push_token`
+  endpoint. The integration stops at the `vimar_intercom_ring` event;
+  subscribe to it from a notification service or a companion app.
+- The audio WebSocket, MJPEG and debug endpoints.
+- The import-time debug log handler that forced every installation to
+  DEBUG.
+
 ## [1.1.0] — 2026-03-12
 
 ### dreame_h15pro v2.0.0

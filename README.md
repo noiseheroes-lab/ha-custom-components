@@ -38,13 +38,11 @@ Read energy consumption data from the **Daikin Madoka BRC1H** smart thermostat v
 
 ### 🔔 [Vimar Intercom](custom_components/vimar_intercom/)
 
-Integrate **Vimar Elvox** video intercom panels (Tab 5S Plus and compatible) into Home Assistant. Doorbell events, live camera, door unlock, SIP call control.
+Integrate **Vimar Elvox** video door entry systems (verified on Tab 5S Plus, 40515/40517) into Home Assistant. Configure by pasting the QR code from the Vimar View app: doorbell events, live camera, door release, and call control.
 
-**Entities:** camera, doorbell event, lock, call buttons, SIP status
+**Entities:** camera, doorbell event, locks, call and door buttons, SIP registration sensor
 
-**IoT class:** Local push (SIP) · **Version:** 1.3.0
-
-> 🚧 **v2 is under active development on `main`.** QR-code setup, configurable entrance panels, per-transaction SIP correlation, Apple-specific code removed. It is not feature-complete and has not been verified on a clean install — see the [component README](custom_components/vimar_intercom/README.md) for exactly what works and what does not, and for how to get the previous 1.x behaviour.
+**IoT class:** Local push (SIP) · **Version:** 2.0.0
 
 ---
 
