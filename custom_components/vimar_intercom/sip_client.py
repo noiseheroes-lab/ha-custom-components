@@ -279,11 +279,12 @@ async def connection_supervisor() -> None:
 
     try:
         while True:
+            connected_at: float | None = None
             try:
                 await connect()
                 if not await do_register():
                     raise ConnectionError("registration was refused")
-                attempt = 0
+                connected_at = time.monotonic()
                 try:
                     await do_connect_profiles()
                 except Exception as err:  # noqa: BLE001 - optional, never fatal
@@ -296,8 +297,16 @@ async def connection_supervisor() -> None:
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - any failure means retry
-                _set_registered(False)
-                _cancel_reregister()
+                _clear_registration()
+                if (connected_at is not None
+                        and time.monotonic() - connected_at
+                        >= C.STABLE_CONNECTION_SECONDS):
+                    # The connection was genuinely healthy for a while, so this
+                    # is a fresh problem rather than a continuation. Resetting
+                    # on every accepted REGISTER instead would let a registrar
+                    # that accepts and then immediately drops us cycle roughly
+                    # every two seconds, forever, with the ladder never engaging.
+                    attempt = 0
                 attempt += 1
                 delay = reconnect_delay(attempt)
                 _LOGGER.warning(
@@ -477,16 +486,29 @@ def parse_sdp(sdp_text):
 REGISTER_EXPIRY_SAFETY = 0.5  # re-register at half the granted lifetime
 
 
-def _accept_registration(msg: ParsedMessage) -> None:
-    """Record a successful registration and schedule the refresh."""
+def _accept_registration(msg: ParsedMessage) -> bool:
+    """Record a successful registration and schedule the refresh.
+
+    Returns False when the registrar granted no lifetime at all: a 200 with
+    `expires=0` means it has de-registered us, and scheduling a refresh at
+    half of zero would re-REGISTER in a tight loop for as long as the
+    registrar kept answering that way.
+    """
     global registration_expiry, registered_since
     granted = granted_expiry(msg, CFG.sip_user, C.DEFAULT_REGISTER_EXPIRY)
+    if granted <= 0:
+        _LOGGER.warning(
+            "Registrar granted a zero lifetime; treating as not registered")
+        _clear_registration()
+        return False
+    granted = max(granted, C.MIN_REGISTER_EXPIRY)
     now = time.monotonic()
     registration_expiry = now + granted
     registered_since = now
     _set_registered(True)
     _LOGGER.info("SIP registered for %ds", granted)
     _schedule_reregister(granted * REGISTER_EXPIRY_SAFETY)
+    return True
 
 
 def _schedule_reregister(delay: float) -> None:
@@ -497,12 +519,27 @@ def _schedule_reregister(delay: float) -> None:
 
 
 def _cancel_reregister() -> None:
-    global _reregister_task, registration_expiry, registered_since
+    """Cancel a pending refresh. Says nothing about whether we are registered."""
+    global _reregister_task
     if _reregister_task is not None:
         _reregister_task.cancel()
         _reregister_task = None
+
+
+def _clear_registration() -> None:
+    """Record that the registration is gone, and stop refreshing it.
+
+    Keep this separate from `_cancel_reregister`. Folding the two together
+    is how the first version of this code wiped `registration_expiry`
+    immediately after setting it — `_schedule_reregister` begins by
+    cancelling the previous timer — leaving `is_registered()` permanently
+    False and the connectivity sensor stuck off.
+    """
+    global registration_expiry, registered_since
+    _cancel_reregister()
     registration_expiry = None
     registered_since = None
+    _set_registered(False)
 
 
 async def _reregister_after(delay: float) -> None:
@@ -578,12 +615,10 @@ async def do_register():
             for raw2 in await _wait_final(key2, cid, seq2, "REGISTER"):
                 msg2 = parse_message(raw2)
                 if msg2.code == 200:
-                    _accept_registration(msg2)
-                    return True
+                    return _accept_registration(msg2)
             return False
         elif msg.code == 200:
-            _accept_registration(msg)
-            return True
+            return _accept_registration(msg)
     return False
 
 

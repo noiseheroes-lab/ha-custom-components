@@ -68,3 +68,5 @@ DEFAULT_PANELS = "55001"
 DEFAULT_DOOR_COMMAND = "OPEN_2F"
 DEFAULT_RTP_PORT_BASE = 7200
 DEFAULT_REGISTER_EXPIRY = 3600
+MIN_REGISTER_EXPIRY = 60  # floor for a clamped registration lifetime, seconds
+STABLE_CONNECTION_SECONDS = 60  # a connection must stay up this long before a fresh failure resets the backoff ladder
