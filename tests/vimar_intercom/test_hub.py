@@ -195,6 +195,61 @@ def test_an_established_call_is_hung_up_when_nobody_waited(sip_stub):
     assert run(scenario()) is not None
 
 
+def test_a_bye_that_cannot_be_sent_still_clears_the_auto_call(
+        sip_stub, monkeypatch):
+    """The grace period expires while the SIP socket is gone.
+
+    `sip.send` raises on a closed writer, which is the normal state
+    during the outage this timer is most likely to fire in. If that
+    escaped, `_auto_called` would survive and every later doorbell press
+    would be declined as the echo of a call that ended long ago.
+    """
+    h = _hub()
+    h._auto_called = True
+    monkeypatch.setattr(sip, "in_call", True)
+    monkeypatch.setattr(hub, "STREAM_HANGUP_DELAY", 0)
+
+    async def _raises():
+        raise ConnectionResetError("the SIP socket has gone")
+
+    monkeypatch.setattr(sip, "do_hangup", _raises)
+
+    run(h._delayed_hangup())
+    assert h._auto_called is False
+
+
+def test_the_duration_limit_clears_the_auto_call_even_if_the_bye_fails(
+        sip_stub, monkeypatch):
+    h = _hub()
+    h._auto_called = True
+    monkeypatch.setattr(sip, "in_call", True)
+    monkeypatch.setattr(hub, "MAX_CALL_DURATION", 0)
+
+    async def _raises():
+        raise ConnectionResetError("the SIP socket has gone")
+
+    monkeypatch.setattr(sip, "do_hangup", _raises)
+
+    run(h._call_timeout())
+    assert h._auto_called is False
+
+
+def test_a_viewer_returning_inside_the_grace_period_keeps_the_call(sip_stub):
+    """A cancelled grace period must not forget that the call is ours."""
+    h = _hub()
+
+    async def scenario():
+        h._auto_called = True
+        h._schedule_delayed_hangup()
+        await asyncio.sleep(0)
+        h._hangup_task.cancel()
+        await asyncio.gather(h._hangup_task, return_exceptions=True)
+
+    run(scenario())
+    assert h._auto_called is True
+    assert "hangup" not in sip_stub
+
+
 # ─── SIP glare: answer what is already ringing ───────────────────────
 
 def test_opening_the_stream_during_a_ring_answers_it(sip_stub):

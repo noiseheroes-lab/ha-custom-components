@@ -219,15 +219,37 @@ class VimarIntercomHub:
             # clear the flag, so clear it here.
             self._clear_auto_call()
 
+    async def _hangup_and_clear(self, hang_up: bool, reason: str) -> None:
+        """End the call this hub placed, then forget it — whatever happens.
+
+        `sip.send` raises whenever the SIP socket has gone, and that is
+        exactly the state these timers fire in during an outage. An
+        exception escaping here would kill the task before it reached
+        `_clear_auto_call`, and a stale `_auto_called` declines every
+        later visitor with a 603 — the very wedge that flag's single
+        reset point exists to prevent.
+        """
+        try:
+            if hang_up and sip.in_call:
+                _LOGGER.info("%s; hanging up", reason)
+                await sip.do_hangup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a BYE we cannot send is not fatal
+            _LOGGER.debug("Hang-up after %s failed", reason, exc_info=True)
+        finally:
+            self._clear_auto_call()
+
     async def _delayed_hangup(self):
         try:
             await asyncio.sleep(STREAM_HANGUP_DELAY)
-            if self._stream_viewers == 0 and self._auto_called and sip.in_call:
-                _LOGGER.info("No viewers, hanging up auto-call")
-                await sip.do_hangup()
-            self._clear_auto_call()
         except asyncio.CancelledError:
-            pass
+            # A viewer came back inside the grace period. The call stays
+            # up and stays ours, so the flag stays set.
+            return
+        await self._hangup_and_clear(
+            self._stream_viewers == 0 and self._auto_called,
+            "no viewers left on the call this hub placed")
 
     def _start_call_timeout(self):
         """Start max call duration timer."""
@@ -242,12 +264,12 @@ class VimarIntercomHub:
     async def _call_timeout(self):
         try:
             await asyncio.sleep(MAX_CALL_DURATION)
-            if sip.in_call:
-                _LOGGER.info("Max call duration (%ds) reached, hanging up", MAX_CALL_DURATION)
-                await sip.do_hangup()
-            self._clear_auto_call()
         except asyncio.CancelledError:
-            pass
+            # The call ended on its own; `call_ended` has already cleared
+            # the flag.
+            return
+        await self._hangup_and_clear(
+            True, f"the maximum call duration ({MAX_CALL_DURATION}s) was reached")
 
     def _start_keyframe_loop(self):
         """Send periodic keyframe requests during calls for video recovery."""
