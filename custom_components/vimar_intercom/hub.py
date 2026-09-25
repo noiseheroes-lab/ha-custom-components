@@ -33,6 +33,10 @@ class VimarIntercomHub:
         self._keyframe_task: asyncio.Task | None = None
         self._auto_called = False
         self._auto_call_target: str | None = None
+        # Fire-and-forget work started from callbacks. Kept so an unload
+        # cannot leave an auto-call or a decline running against a SIP
+        # layer that has just been reset.
+        self._background: set[asyncio.Task] = set()
         self._raise_issue: Callable | None = None
         self._clear_issue: Callable | None = None
         self._hass = None
@@ -63,10 +67,6 @@ class VimarIntercomHub:
     @property
     def in_call(self) -> bool:
         return sip.in_call
-
-    @property
-    def is_ringing(self) -> bool:
-        return sip.pending_incoming["active"]
 
     def register_ring_callback(self, callback: Callable) -> None:
         self._ring_callbacks.append(callback)
@@ -119,6 +119,25 @@ class VimarIntercomHub:
         except asyncio.CancelledError:
             pass
 
+    def _track(self, coro) -> asyncio.Task:
+        """Run a coroutine in the background without losing track of it."""
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return task
+
+    def _clear_auto_call(self) -> None:
+        """Forget that the live call was one this hub placed itself.
+
+        Every path out of an auto-call comes through here. A stale
+        `_auto_called` is not a cosmetic leak: `_handle_broadcast` reads
+        it to tell a real doorbell press from the PBX echoing our own
+        INVITE, so leaving it set declines every visitor with a 603 and
+        fires no ring event until Home Assistant is restarted.
+        """
+        self._auto_called = False
+        self._auto_call_target = None
+
     async def stream_opened(self, target: str | None = None):
         self._stream_viewers += 1
         _LOGGER.debug("Stream opened (%d viewers)", self._stream_viewers)
@@ -127,36 +146,72 @@ class VimarIntercomHub:
             self._hangup_task.cancel()
             self._hangup_task = None
 
-        if sip.in_call or sip.calling:
+        # `_auto_called` is part of the guard, not just a record: it is
+        # set synchronously here, before any await, so a second viewer
+        # arriving before the first auto-call task has even run sees a
+        # call is already being placed. Without it both viewers call
+        # `do_call`, the loser gets "Already in a call" and clears the
+        # flag mid-call, and the echo INVITE becomes a phantom ring.
+        if sip.in_call or sip.calling or self._auto_called:
             return
 
-        if sip.is_registered():
-            self._auto_called = True
-            self._auto_call_target = target
-            # Fire auto-call as background task — don't block the HTTP response
-            asyncio.create_task(self._do_auto_call(target))
+        if not sip.is_registered():
+            return
+
+        self._auto_called = True
+        self._auto_call_target = target
+        # Fire in the background — don't block the HTTP response.
+        self._track(self._do_auto_call(target))
 
     async def _do_auto_call(self, target: str | None):
-        """Background auto-call when video stream opens without active call."""
+        """Answer or place the call a newly opened stream needs.
+
+        A panel that is ringing us right now already has an INVITE
+        pending: answering it is what the user meant. Placing a second,
+        outgoing INVITE to the default panel instead — which is what
+        this used to do — is a call collision, and it is exactly what
+        the README's own "snapshot on ring" automation triggers.
+        """
         try:
-            if target:
-                uri = self._cfg.panel_uri(target)
-                ok, msg = await sip.do_call(target=uri)
+            if sip.pending_incoming["active"]:
+                ok, msg = await sip.do_answer_incoming()
+            elif target:
+                ok, msg = await sip.do_call(target=self._cfg.panel_uri(target))
             else:
                 ok, msg = await sip.do_call()
             if not ok:
                 _LOGGER.error("Auto-call failed: %s", msg)
-                self._auto_called = False
-        except Exception as e:
+                self._clear_auto_call()
+            elif self._stream_viewers == 0:
+                # The viewer gave up while the INVITE was still in
+                # flight — the HTTP view waits 15 s, `do_call` allows
+                # 45 s. Without this the call establishes with nobody
+                # watching and runs to MAX_CALL_DURATION, holding the
+                # account's single registration the whole time.
+                self._hangup_task = asyncio.create_task(self._delayed_hangup())
+        except asyncio.CancelledError:
+            self._clear_auto_call()
+            raise
+        except Exception as e:  # noqa: BLE001 - reported, never fatal
             _LOGGER.error("Auto-call error: %s", e)
-            self._auto_called = False
+            self._clear_auto_call()
 
     async def stream_closed(self):
         self._stream_viewers = max(0, self._stream_viewers - 1)
-        _LOGGER.info("Stream viewer disconnected (%d remaining)", self._stream_viewers)
+        _LOGGER.debug("Stream viewer disconnected (%d remaining)",
+                      self._stream_viewers)
 
-        if self._stream_viewers == 0 and self._auto_called and sip.in_call:
+        if self._stream_viewers or not self._auto_called:
+            return
+
+        if sip.in_call:
             self._hangup_task = asyncio.create_task(self._delayed_hangup())
+        elif not sip.calling:
+            # There is no call to hang up and none on its way: the
+            # auto-call never established (the view gave up waiting), or
+            # the panel ended it first. Nothing else will ever arrive to
+            # clear the flag, so clear it here.
+            self._clear_auto_call()
 
     async def _delayed_hangup(self):
         try:
@@ -164,7 +219,7 @@ class VimarIntercomHub:
             if self._stream_viewers == 0 and self._auto_called and sip.in_call:
                 _LOGGER.info("No viewers, hanging up auto-call")
                 await sip.do_hangup()
-                self._auto_called = False
+            self._clear_auto_call()
         except asyncio.CancelledError:
             pass
 
@@ -184,7 +239,7 @@ class VimarIntercomHub:
             if sip.in_call:
                 _LOGGER.info("Max call duration (%ds) reached, hanging up", MAX_CALL_DURATION)
                 await sip.do_hangup()
-                self._auto_called = False
+            self._clear_auto_call()
         except asyncio.CancelledError:
             pass
 
@@ -216,10 +271,19 @@ class VimarIntercomHub:
                 await sip.send_keyframe_request()
         except asyncio.CancelledError:
             pass
+        except Exception:  # noqa: BLE001 - one failed INFO is not fatal
+            # Without this the task dies on the first send failure with
+            # "Task exception was never retrieved" and the call gets no
+            # further keyframe requests, so video never recovers.
+            _LOGGER.debug("Keyframe request loop stopped early", exc_info=True)
 
     async def async_start(self):
         if self._running:
             return
+
+        # The SIP and media layers keep their state in module globals,
+        # which survive an entry reload. Start from a known-clean slate.
+        sip.reset_state()
 
         sip.configure(self._cfg)
         media.configure(self._cfg)
@@ -245,6 +309,21 @@ class VimarIntercomHub:
 
     async def async_stop(self):
         self._running = False
+
+        # Hang up before tearing the tasks down: after this the socket
+        # is gone and no BYE can be sent, leaving the panel holding a
+        # call it thinks is live and the account's single registration
+        # occupied.
+        if sip.in_call:
+            try:
+                await sip.do_hangup()
+            except Exception:  # noqa: BLE001 - shutdown must not fail here
+                _LOGGER.debug("Hang-up on unload failed", exc_info=True)
+
+        for t in list(self._background):
+            t.cancel()
+        self._background.clear()
+
         for t in self._tasks:
             t.cancel()
         if self._tasks:
@@ -262,8 +341,10 @@ class VimarIntercomHub:
         if sip.writer:
             try:
                 sip.writer.close()
-            except Exception:
+            except Exception:  # noqa: BLE001 - closing a dead socket may raise
                 pass
+        self._clear_auto_call()
+        self._stream_viewers = 0
         _LOGGER.info("Hub stopped")
 
     async def async_reconnect(self) -> None:
@@ -272,7 +353,7 @@ class VimarIntercomHub:
         sip.request_reconnect()
 
     async def async_call(self, target: str | None = None) -> tuple[bool, str]:
-        self._auto_called = False
+        self._clear_auto_call()
         if target:
             uri = self._cfg.panel_uri(target)
             return await sip.do_call(target=uri)
@@ -285,7 +366,7 @@ class VimarIntercomHub:
         await sip.do_decline_incoming()
 
     async def async_hangup(self):
-        self._auto_called = False
+        self._clear_auto_call()
         self._cancel_call_timeout()
         await sip.do_hangup()
 
@@ -324,11 +405,19 @@ class VimarIntercomHub:
             _LOGGER.info("Door %s opened", uri)
             return True, msg
 
-        _LOGGER.warning("Door command to %s failed (%s); re-registering and retrying",
-                        uri, msg)
+        if not sip.is_registered():
+            # Re-registering from here would call `connect()` outside the
+            # supervisor, opening a TLS socket whose responses nobody
+            # reads — one leaked connection per door press for as long as
+            # the outage lasts, and a 15 s wait before failing anyway.
+            _LOGGER.warning("Door command to %s failed (%s); not registered, "
+                            "asking the supervisor to reconnect", uri, msg)
+            sip.request_reconnect()
+            return False, ("Not connected to the intercom. A reconnect has "
+                           "been requested; try again in a few seconds.")
+
+        _LOGGER.warning("Door command to %s failed (%s); retrying once", uri, msg)
         try:
-            if not await sip.do_register():
-                return False, "Re-registration failed"
             ok, msg = await sip.do_system_message(
                 uri, body, extra_headers={"Panda": "command"})
             if ok:
@@ -340,22 +429,6 @@ class VimarIntercomHub:
             _LOGGER.error("Door retry error: %s", err)
             return False, str(err)
 
-    async def async_probe(self, target: str) -> tuple[bool, str]:
-        uri = self._cfg.panel_uri(target)
-        return await sip.do_options(target=uri)
-
-    async def async_scan(self, start: int, end: int) -> list[dict]:
-        results = []
-        for addr in range(start, end + 1):
-            uri = self._cfg.panel_uri(str(addr))
-            try:
-                ok, msg = await sip.do_options(target=uri)
-                results.append({"addr": addr, "ok": ok, "msg": msg})
-            except Exception as e:
-                results.append({"addr": addr, "ok": False, "msg": str(e)})
-            await asyncio.sleep(0.3)
-        return results
-
     async def _handle_broadcast(self, msg_type, msg):
         """React to a SIP-layer event."""
         _LOGGER.debug("[%s] %s", msg_type, msg)
@@ -366,6 +439,10 @@ class VimarIntercomHub:
         elif msg_type == "call_ended":
             self._cancel_call_timeout()
             self._cancel_keyframe_loop()
+            # The panel, the cloud or our own BYE ended the call. This is
+            # the one place every ending converges, so it is where the
+            # auto-call record is torn down.
+            self._clear_auto_call()
 
         if msg_type == "ring":
             # When we placed the call ourselves the panel INVITEs us back.
@@ -375,7 +452,7 @@ class VimarIntercomHub:
                     "Suppressing ring: call initiated locally "
                     "(auto_called=%s, in_call=%s, calling=%s)",
                     self._auto_called, sip.in_call, sip.calling)
-                asyncio.create_task(sip.do_decline_incoming())
+                self._track(sip.do_decline_incoming())
                 return
 
             address, name = self._panel_for(
