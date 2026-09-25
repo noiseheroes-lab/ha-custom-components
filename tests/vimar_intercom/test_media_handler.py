@@ -118,6 +118,173 @@ def test_stop_media_reports_the_whole_call_in_one_line(cfg, caplog,
         audio.close()
 
 
+def test_an_unloaded_entry_does_not_raise_once_per_packet(cfg, caplog,
+                                                          monkeypatch):
+    """`CFG` is dereferenced on the audio path and cleared on unload.
+
+    Anything escaping a protocol callback is logged by asyncio's default
+    handler as a full traceback, once per datagram — 50 a second, which
+    is the million-line log this rewrite was published to fix.
+    """
+    monkeypatch.setattr(media, "CFG", None)
+    proto = media.RTPAudioProtocol()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            for seq in range(200):
+                proto.datagram_received(
+                    rtp_packet(seq, b"\x00" * 160, payload_type=0),
+                    ("192.0.2.10", 5004))
+        assert caplog.records == []
+        assert proto.pkt_count == 0
+    finally:
+        proto.close()
+
+
+def test_a_failing_forward_is_counted_not_logged(cfg, caplog):
+    """A dead forwarding socket raises OSError on every single packet."""
+    proto = media.RTPAudioProtocol()
+    proto.close()  # the forwarding socket is gone; sendto will raise
+    with caplog.at_level(logging.DEBUG):
+        for seq in range(200):
+            proto.datagram_received(
+                rtp_packet(seq, b"\x00" * 160, payload_type=0),
+                ("192.0.2.10", 5004))
+    assert caplog.records == []
+    assert proto.rx_errors == 200
+    assert "rx_errors=200" in proto.stats()
+
+
+# ─── the RTP reorder buffer ──────────────────────────────────────────
+
+def recorder(proto):
+    """Record the sequence numbers the protocol releases, in order."""
+    seen: list[int] = []
+    proto._depacketize = lambda payload, seq: seen.append(seq)
+    return seen
+
+
+def feed(proto, *seqs: int) -> None:
+    """Deliver one video packet per sequence number given."""
+    for seq in seqs:
+        proto.datagram_received(rtp_packet(seq, IDR), ("192.0.2.10", 5004))
+
+
+def test_packets_in_order_are_released_once_each():
+    proto = media.RTPVideoProtocol()
+    seen = recorder(proto)
+    feed(proto, *range(100, 106))
+    assert seen == list(range(100, 106))
+    assert proto._reorder_buf == {}
+    assert proto._next_seq == 106
+    assert proto.rx_errors == 0
+
+
+def test_an_out_of_order_packet_is_put_back_in_place():
+    proto = media.RTPVideoProtocol()
+    seen = recorder(proto)
+    feed(proto, 100, 102, 101)
+    assert seen == [100, 101, 102]
+    assert proto._reorder_buf == {}
+
+
+def test_a_late_packet_is_dropped_instead_of_buffered():
+    """Buffered, its key could only leave the map when the window wrapped
+    the whole 16-bit space — and the overflow drain walked it there."""
+    proto = media.RTPVideoProtocol()
+    seen = recorder(proto)
+    feed(proto, 100, 101, 102, 101)
+    assert seen == [100, 101, 102]
+    assert proto._reorder_buf == {}
+    assert proto._late_pkts == 1
+
+
+def test_a_duplicate_of_a_held_packet_is_counted_not_held_twice():
+    proto = media.RTPVideoProtocol()
+    seen = recorder(proto)
+    feed(proto, 100, 102, 102)
+    assert seen == [100]
+    assert list(proto._reorder_buf) == [102]
+    assert proto._dup_pkts == 1
+
+
+def test_the_window_wraps_past_65535():
+    proto = media.RTPVideoProtocol()
+    seen = recorder(proto)
+    feed(proto, 65534, 65535, 0, 1)
+    assert seen == [65534, 65535, 0, 1]
+    assert proto._next_seq == 2
+
+
+def test_reordering_still_works_across_the_wrap():
+    proto = media.RTPVideoProtocol()
+    seen = recorder(proto)
+    feed(proto, 65534, 0, 65535)
+    assert seen == [65534, 65535, 0]
+    assert proto._next_seq == 1
+    assert proto._late_pkts == 0
+
+
+def test_a_lost_packet_resyncs_the_window_to_the_oldest_held_one():
+    """Stepping the window forward one sequence number at a time made
+    the cost of a loss the distance to the next packet, not the size of
+    the buffer."""
+    proto = media.RTPVideoProtocol()
+    seen = recorder(proto)
+    feed(proto, 100)          # 101 is lost
+    feed(proto, *range(102, 108))
+    assert seen == [100, *range(102, 108)]
+    assert proto._next_seq == 108
+    assert proto._resyncs == 1
+    assert proto._reorder_buf == {}
+
+
+def test_a_late_packet_never_rewinds_the_window():
+    """The pathological case, reproduced: a loss, then the lost packet
+    arriving too late to use, twice over, and a third loss after them.
+
+    Each stale key used to stay in the buffer until the window wrapped
+    round to it, and the overflow drain walked it there one sequence
+    number at a time — 65 000 iterations inside a single UDP callback,
+    leaving the window thousands of packets *behind* the live stream and
+    re-releasing sequence numbers it had already released.
+    """
+    proto = media.RTPVideoProtocol()
+    seen = recorder(proto)
+
+    feed(proto, 1000)                    # 1001 lost
+    feed(proto, *range(1002, 1008))      # overflow: resync past it
+    feed(proto, 1001)                    # arrives far too late
+
+    feed(proto, *range(1009, 1015))      # 1008 lost, overflow again
+    feed(proto, 1008)                    # too late again
+
+    feed(proto, *range(1016, 1022))      # 1015 lost, overflow again
+
+    assert seen == [1000, *range(1002, 1008),
+                    *range(1009, 1015), *range(1016, 1022)]
+    assert seen == sorted(seen), "the window went backwards"
+    assert len(seen) == len(set(seen)), "a sequence number was released twice"
+    assert proto._next_seq == 1022
+    assert proto._late_pkts == 2
+    assert proto.rx_errors == 0
+
+
+def test_a_gap_inside_a_fragmented_nal_discards_it():
+    """The pipeline remuxes rather than decodes, so a slice with a hole
+    in it reaches every client decoder with nothing able to see it."""
+    proto = media.RTPVideoProtocol()
+    proto.datagram_received(fua_packet(1, start=True, end=False),
+                            ("192.0.2.10", 5004))
+    # Packet 2 is lost; 3 arrives, and the window releases it once the
+    # reorder buffer gives up on 2.
+    for seq in range(3, 10):
+        proto.datagram_received(fua_packet(seq, start=False, end=(seq == 9)),
+                                ("192.0.2.10", 5004))
+    assert proto._fua_discards == 1
+    assert proto._nal_count == 0
+    assert proto._fua_started is False
+
+
 # ─── the keyframe a still is decoded from ────────────────────────────
 
 def test_the_registry_caches_a_self_contained_keyframe():

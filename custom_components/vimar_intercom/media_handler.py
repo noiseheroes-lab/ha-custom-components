@@ -55,6 +55,7 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         self.remote_addr = None
         self.pkt_count = 0
         self.srtp_fail = 0
+        self.rx_errors = 0
         self.srtp_rx: SRTPContext | None = None
         # Forward decrypted RTP to the local port ffmpeg reads audio from.
         self.ffmpeg_av_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -63,6 +64,20 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
+        # Anything escaping a protocol callback is logged by asyncio's
+        # default handler as a full traceback, once per datagram: 50 a
+        # second, which is the flood the rest of this class is careful
+        # to avoid. A reload clearing CFG, or a transient error from
+        # sendto, is enough to reach it — so it is counted, not logged.
+        try:
+            self._receive(data)
+        except Exception:  # noqa: BLE001 - counted here, reported once per call
+            self.rx_errors += 1
+
+    def _receive(self, data):
+        cfg = CFG
+        if cfg is None:
+            return
         if len(data) < 4:
             return
         if (data[0] & 0xC0) == 0x00:  # STUN
@@ -86,12 +101,13 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         if len(rtp) <= hlen:
             return
         # Forward decrypted RTP to AV ffmpeg port
-        self.ffmpeg_av_sock.sendto(rtp, ('127.0.0.1', CFG.av_audio_port))
+        self.ffmpeg_av_sock.sendto(rtp, ('127.0.0.1', cfg.av_audio_port))
         self.pkt_count += 1
 
     def stats(self) -> str:
         """One-line summary of what this protocol saw during the call."""
-        return f"audio pkts={self.pkt_count} srtp_fail={self.srtp_fail}"
+        return (f"audio pkts={self.pkt_count} srtp_fail={self.srtp_fail} "
+                f"rx_errors={self.rx_errors}")
 
     def close(self) -> None:
         """Release the forwarding socket."""
@@ -337,13 +353,24 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         self._nal_count = 0
         self._fua_restarts = 0   # a new FU-A start while one was in flight
         self._fua_orphans = 0    # a continuation whose start packet was lost
-        self._fua_discards = 0   # a NAL thrown away over too large a gap
-        self._fua_gaps = 0       # a small gap ridden out
+        self._fua_discards = 0   # a NAL thrown away over a gap
+        self._late_pkts = 0      # arrived behind the window, dropped
+        self._dup_pkts = 0       # already buffered, dropped
+        self._resyncs = 0        # reorder buffer overflowed, window moved
+        self.rx_errors = 0       # escaped the receive path, see below
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, addr):
+        # Same guard, and the same reason, as RTPAudioProtocol's: an
+        # unhandled exception here is one asyncio traceback per datagram.
+        try:
+            self._receive(data)
+        except Exception:  # noqa: BLE001 - counted here, reported once per call
+            self.rx_errors += 1
+
+    def _receive(self, data):
         if len(data) < 4:
             return
         if (data[0] & 0xC0) != 0x80:  # not RTP/SRTP
@@ -376,30 +403,43 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         payload = rtp[hlen:]
 
         # RTP reorder buffer — hold packets briefly to fix out-of-order UDP
-        self._reorder_buf[seq] = payload
-
         if self._next_seq is None:
             self._next_seq = seq
+        elif ((seq - self._next_seq) & 0xFFFF) > 0x8000:
+            # Behind the window: a duplicate, or a late copy of a packet
+            # the overflow drain already gave up on. Buffering it put a
+            # key in the map that only a wrap of the whole 16-bit space
+            # could remove, and the drain below then walked _next_seq
+            # backwards over that space — inside this one callback, and
+            # re-emitting every sequence number on the way.
+            self._late_pkts += 1
+            return
+        if seq in self._reorder_buf:
+            self._dup_pkts += 1
+            return
 
-        # Emit all consecutive packets starting from _next_seq
-        while self._next_seq in self._reorder_buf:
-            p = self._reorder_buf.pop(self._next_seq)
-            self._depacketize(p, self._next_seq)
-            self._next_seq = (self._next_seq + 1) & 0xFFFF
+        self._reorder_buf[seq] = payload
 
-        # If buffer grows too large, flush oldest to avoid stalling
+        self._drain_reorder_buf()
+
+        # The packet the window is waiting for is late enough to be lost.
+        # Resync to the oldest packet actually held — oldest in modular
+        # terms, so a window that has just wrapped still finds it — which
+        # bounds the work by the size of the buffer instead of by the
+        # sequence space.
         if len(self._reorder_buf) > self.REORDER_BUF_SIZE:
-            # Find the lowest seq in buffer and emit from there
-            while self._reorder_buf:
-                if self._next_seq in self._reorder_buf:
-                    p = self._reorder_buf.pop(self._next_seq)
-                    self._depacketize(p, self._next_seq)
-                    self._next_seq = (self._next_seq + 1) & 0xFFFF
-                else:
-                    # Skip missing packet
-                    self._next_seq = (self._next_seq + 1) & 0xFFFF
-                if len(self._reorder_buf) <= 1:
-                    break
+            self._resyncs += 1
+            self._next_seq = min(
+                self._reorder_buf,
+                key=lambda s: (s - self._next_seq) & 0xFFFF)
+            self._drain_reorder_buf()
+
+    def _drain_reorder_buf(self) -> None:
+        """Emit every buffered packet consecutive from `_next_seq`."""
+        while self._next_seq in self._reorder_buf:
+            payload = self._reorder_buf.pop(self._next_seq)
+            self._depacketize(payload, self._next_seq)
+            self._next_seq = (self._next_seq + 1) & 0xFFFF
 
     def _depacketize(self, payload, seq):
         """Depacketize RTP H.264 payload → hand NAL units to the video registry."""
@@ -446,18 +486,19 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                 self._fua_orphans += 1
                 return
             else:
-                # Check sequence continuity — tolerate small gaps (1-3 missing pkts)
+                # Any gap means a fragment of this NAL was lost, and the
+                # pipeline remuxes rather than decodes: a slice with a
+                # hole in it travels straight through to every client
+                # decoder, where +discardcorrupt cannot see it. Riding
+                # out small gaps bought artifacts and occasional decoder
+                # desync; one discarded frame costs less. Reordering is
+                # the reorder buffer's job, not this one's.
                 if self._fua_expected_seq is not None and seq != self._fua_expected_seq:
-                    gap = (seq - self._fua_expected_seq) & 0xFFFF
-                    if gap > 5:
-                        # Too many missing packets — discard entire NAL
-                        self._fua_discards += 1
-                        self._fua_buf = bytearray()
-                        self._fua_started = False
-                        self._fua_expected_seq = None
-                        return
-                    # Small gap — keep going, the NAL might still decode
-                    self._fua_gaps += 1
+                    self._fua_discards += 1
+                    self._fua_buf = bytearray()
+                    self._fua_started = False
+                    self._fua_expected_seq = None
+                    return
                 self._fua_buf.extend(fragment)
                 self._fua_expected_seq = (seq + 1) & 0xFFFF
 
@@ -481,7 +522,8 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                 f"fua_restarts={self._fua_restarts} "
                 f"fua_orphans={self._fua_orphans} "
                 f"fua_discards={self._fua_discards} "
-                f"fua_gaps={self._fua_gaps}")
+                f"late_pkts={self._late_pkts} dup_pkts={self._dup_pkts} "
+                f"resyncs={self._resyncs} rx_errors={self.rx_errors}")
 
     def send_stun(self):
         if not self.transport or not self.remote_addr:
@@ -568,6 +610,7 @@ async def setup_media(remote_sdp):
         audio_proto.remote_addr = (aip, audio["port"])
         audio_proto.pkt_count = 0
         audio_proto.srtp_fail = 0
+        audio_proto.rx_errors = 0
         if remote_audio_key:
             audio_proto.srtp_rx = SRTPContext(remote_audio_key)
         audio_proto.send_stun()
@@ -613,6 +656,7 @@ async def stop_media():
         audio_proto.remote_addr = None
         audio_proto.pkt_count = 0
         audio_proto.srtp_fail = 0
+        audio_proto.rx_errors = 0
         audio_proto.srtp_rx = None
     if video_proto:
         video_proto.remote_addr = None
