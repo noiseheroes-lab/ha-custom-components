@@ -307,12 +307,29 @@ def test_an_idr_arriving_before_its_parameter_sets_is_still_cached():
         media.ANNEX_B_START + nal for nal in (SPS, PPS, IDR))
 
 
-def test_the_keyframe_is_forgotten_when_the_call_ends():
+def test_the_keyframe_outlives_the_call_it_came_from():
+    """For a doorbell the last frame of a call is the most valuable
+    image there is; clearing it left the camera with no still at all
+    between calls, while its docstring promised one."""
     registry = media.VideoStreamRegistry()
     registry.push_nal(SPS)
     registry.push_nal(PPS)
     registry.push_nal(IDR)
     registry.reset()
+    assert registry.last_keyframe == b"".join(
+        media.ANNEX_B_START + nal for nal in (SPS, PPS, IDR))
+    # The rest of the call state does go.
+    assert registry.parameter_sets is None
+    assert registry._consumers == []
+
+
+def test_an_unload_forgets_the_keyframe():
+    """Nothing should outlive the config entry it belongs to."""
+    registry = media.VideoStreamRegistry()
+    registry.push_nal(SPS)
+    registry.push_nal(PPS)
+    registry.push_nal(IDR)
+    registry.reset(keep_keyframe=False)
     assert registry.last_keyframe is None
 
 

@@ -53,7 +53,13 @@ def test_idr_before_parameter_sets_is_held_until_they_arrive():
     assert received == annex_b(SPS, PPS, IDR)
 
 
-def test_a_late_consumer_gets_the_cached_parameter_sets_first():
+def test_a_late_consumer_gets_the_cached_keyframe_first():
+    """Primed with the parameter sets alone, a decoder attaching
+    mid-stream has nothing to predict from: the next thing it receives
+    is a P-slice referencing a picture it never got, and the pipeline
+    remuxes rather than decodes, so it shows grey until the panel's next
+    IDR — seconds, on a doorbell. The cached keyframe is SPS, PPS and
+    the IDR they describe, already framed, so it starts on frame one."""
     registry = VideoStreamRegistry()
     first_sink, _ = collector()
     registry.add_consumer(first_sink)
@@ -64,10 +70,38 @@ def test_a_late_consumer_gets_the_cached_parameter_sets_first():
 
     late_sink, late_received = collector()
     registry.add_consumer(late_sink)
-    assert late_received == annex_b(SPS, PPS)
+    # One raw write of already-framed bytes, not three framed NALs.
+    assert late_received == [b"".join(annex_b(SPS, PPS, IDR))]
 
     registry.push_nal(SLICE)
-    assert late_received == annex_b(SPS, PPS, SLICE)
+    assert late_received[-1] == ANNEX_B_START + SLICE
+
+
+def test_a_late_consumer_with_no_keyframe_yet_still_gets_the_parameter_sets():
+    """Between the parameter sets and the first IDR there is no keyframe
+    to prime with, and the pair is still better than nothing."""
+    registry = VideoStreamRegistry()
+    registry.push_nal(SPS)
+    registry.push_nal(PPS)
+
+    late_sink, late_received = collector()
+    assert registry.add_consumer(late_sink) is True
+    assert late_received == annex_b(SPS, PPS)
+
+
+def test_a_consumer_whose_sink_dies_while_priming_is_reported_as_dropped():
+    """The caller holds its own reference to the consumer; without the
+    answer it would keep feeding a pipeline the registry has dropped."""
+    registry = VideoStreamRegistry()
+    registry.push_nal(SPS)
+    registry.push_nal(PPS)
+    registry.push_nal(IDR)
+
+    def broken(_data: bytes) -> None:
+        raise OSError("pipe closed")
+
+    assert registry.add_consumer(broken) is False
+    assert broken not in registry._consumers
 
 
 def test_a_late_consumer_with_no_cached_parameter_sets_gets_nothing():
@@ -90,6 +124,8 @@ def test_parameter_sets_are_replayed_before_every_idr():
 
 
 def test_updated_parameter_sets_replace_the_cache():
+    """A new SPS describes the pictures from the next IDR onwards, which
+    is when the registry replays it and rebuilds the cached keyframe."""
     registry = VideoStreamRegistry()
     sink, received = collector()
     registry.add_consumer(sink)
@@ -99,9 +135,15 @@ def test_updated_parameter_sets_replace_the_cache():
 
     new_sps = bytes([0x67, 0x42, 0x80, 0x28])
     registry.push_nal(new_sps)
+    assert registry.parameter_sets == (new_sps, PPS)
+
+    received.clear()
+    registry.push_nal(IDR)
+    assert received == annex_b(new_sps, PPS, IDR)
+
     late_sink, late_received = collector()
     registry.add_consumer(late_sink)
-    assert late_received == annex_b(new_sps, PPS)
+    assert late_received == [b"".join(annex_b(new_sps, PPS, IDR))]
 
 
 def test_removed_consumers_stop_receiving():
@@ -199,9 +241,13 @@ def test_a_transiently_blocking_consumer_gets_everything_once_it_recovers():
 
 
 def test_a_consumer_that_never_accepts_is_dropped_once_the_cap_is_exceeded():
-    """A consumer stuck in BlockingIOError forever is kept only while its
-    backlog fits the cap; a chunk that blows through it drops the
-    consumer for good."""
+    """The cap is on the accumulated backlog, not on the NAL in hand.
+
+    Every slice pushed here is a quarter of the cap, so no single one
+    could ever exceed it: only the backlog they pile up can, and the
+    consumer must survive until it does and be dropped for good when it
+    has. A cap applied to the NAL alone would keep this consumer
+    forever, and with it an unbounded buffer."""
     registry = VideoStreamRegistry()
     calls = []
 
@@ -216,10 +262,18 @@ def test_a_consumer_that_never_accepts_is_dropped_once_the_cap_is_exceeded():
     registry.push_nal(PPS)
     registry.push_nal(IDR)  # started; backlog still tiny, well under cap
 
-    oversized_slice = SLICE[:1] + bytes(MAX_CONSUMER_BACKLOG_BYTES)
-    registry.push_nal(oversized_slice)  # blows straight through the cap
-    calls_after_drop = len(calls)
+    quarter = SLICE[:1] + bytes(MAX_CONSUMER_BACKLOG_BYTES // 4)
+    assert len(quarter) < MAX_CONSUMER_BACKLOG_BYTES
+    for _ in range(3):
+        registry.push_nal(quarter)
+        assert refuses in registry._consumers, (
+            "dropped over a single NAL that fits the cap")
+    # The fourth takes the accumulated backlog past the cap.
+    registry.push_nal(quarter)
+    assert refuses not in registry._consumers
+    assert calls[-1] > MAX_CONSUMER_BACKLOG_BYTES
 
+    calls_after_drop = len(calls)
     registry.push_nal(SLICE)  # a dropped consumer must not be called again
     assert len(calls) == calls_after_drop
 

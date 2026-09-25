@@ -186,13 +186,31 @@ class VideoStreamRegistry:
         """
         return self._last_keyframe
 
-    def add_consumer(self, consumer) -> None:
-        """Register a consumer and prime it with the parameter sets."""
+    def add_consumer(self, consumer) -> bool:
+        """Register a consumer, priming it so it can start decoding.
+
+        The parameter sets alone are not enough: the very next thing a
+        consumer attaching mid-stream receives is a predicted slice,
+        which references a picture it never got, and the pipeline
+        remuxes rather than decodes so nothing downstream notices —
+        the viewer sees grey until the panel's next IDR, seconds away.
+        The cached keyframe is SPS, PPS and the IDR they describe, so a
+        late viewer starts on its first frame instead. It is already
+        Annex-B framed, hence the raw write.
+
+        Returns False if priming dropped the consumer straight away,
+        which tells the caller its sink was dead before it began.
+        """
         self._consumers.append(consumer)
-        pair = self.parameter_sets
-        if pair is not None:
-            for nal in pair:
-                self._send_one(consumer, nal)
+        keyframe = self._last_keyframe
+        if keyframe is not None:
+            self._send_framed(consumer, keyframe)
+        else:
+            pair = self.parameter_sets
+            if pair is not None:
+                for nal in pair:
+                    self._send_one(consumer, nal)
+        return consumer in self._consumers
 
     def remove_consumer(self, consumer) -> None:
         """Stop sending to a consumer."""
@@ -200,15 +218,23 @@ class VideoStreamRegistry:
             self._consumers.remove(consumer)
         self._backlog.pop(consumer, None)
 
-    def reset(self) -> None:
-        """Forget consumers and cached state, e.g. when a call ends."""
+    def reset(self, *, keep_keyframe: bool = True) -> None:
+        """Forget consumers and cached state, e.g. when a call ends.
+
+        The last keyframe survives a call ending: for a doorbell the
+        final frame of a call is the most valuable image there is, and
+        clearing it left the camera entity with no still at all between
+        calls. An unload passes `keep_keyframe=False`, because nothing
+        should outlive the config entry it belongs to.
+        """
         self._consumers.clear()
         self._backlog.clear()
         self._sps = None
         self._pps = None
         self._pending_idr = None
         self._started = False
-        self._last_keyframe = None
+        if not keep_keyframe:
+            self._last_keyframe = None
 
     def push_nal(self, nal: bytes) -> None:
         """Feed one complete NAL unit into the stream."""
@@ -276,7 +302,11 @@ class VideoStreamRegistry:
             self._send_one(consumer, nal)
 
     def _send_one(self, consumer, nal: bytes) -> None:
-        """Send one NAL (as Annex-B) to a consumer, honoring its backlog.
+        """Frame one NAL as Annex-B and send it to a consumer."""
+        self._send_framed(consumer, ANNEX_B_START + nal)
+
+    def _send_framed(self, consumer, data: bytes) -> None:
+        """Send already-framed Annex-B bytes, honoring the backlog.
 
         A consumer with backlogged bytes never gets new data ahead of
         them — the pending bytes and the new NAL are written as one
@@ -288,7 +318,6 @@ class VideoStreamRegistry:
         other exception means the sink is genuinely gone and is dropped
         immediately.
         """
-        data = ANNEX_B_START + nal
         backlog = self._backlog.get(consumer)
         pending = backlog + data if backlog else data
         try:
