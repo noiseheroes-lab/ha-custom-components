@@ -28,8 +28,10 @@ edited by hand any more.
   arriving during a call is no longer discarded as stale.
 - Registration state follows the lifetime granted by the registrar, with
   a refresh at half that lifetime.
-- Every new video consumer receives the cached SPS and PPS, so a client
-  attaching mid-stream can decode.
+- Video depacketisation holds the most recent SPS/PPS and replays them
+  ahead of every IDR, so a consumer attaching mid-stream could decode —
+  this machinery exists but is unused: nothing consumes the depacketised
+  NAL queue yet (see Known limitations).
 
 #### Known limitations
 - The camera is not finished: the SIP/RTP transport and H.264

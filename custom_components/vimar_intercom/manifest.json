@@ -1,21 +1,20 @@
 {
   "domain": "vimar_intercom",
   "name": "Vimar Intercom",
-  "version": "2.0.0",
+  "codeowners": [
+    "@noiseheroes-lab"
+  ],
   "config_flow": true,
-  "single_config_entry": true,
-  "integration_type": "hub",
-  "iot_class": "local_push",
-  "requirements": [],
   "dependencies": [
     "ffmpeg",
     "http",
     "stream"
   ],
-  "codeowners": [
-    "@noiseheroes-lab"
-  ],
   "documentation": "https://github.com/noiseheroes-lab/ha-custom-components/blob/main/custom_components/vimar_intercom/README.md",
+  "integration_type": "hub",
+  "iot_class": "local_push",
   "issue_tracker": "https://github.com/noiseheroes-lab/ha-custom-components/issues",
-  "homeassistant": "2026.9.0"
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "2.0.0"
 }

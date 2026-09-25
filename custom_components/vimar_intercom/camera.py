@@ -34,8 +34,8 @@ class VimarIntercomCamera(Camera):
     (e.g. from Apple Home), the hub auto-calls the intercom.
     """
 
-    _attr_has_entity_name = False
-    _attr_name = "Intercom"
+    _attr_has_entity_name = True
+    _attr_translation_key = "intercom"
     _attr_icon = "mdi:doorbell-video"
 
     def __init__(self, hub, entry_id: str, hass: HomeAssistant) -> None:

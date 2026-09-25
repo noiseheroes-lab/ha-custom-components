@@ -54,7 +54,7 @@ no panel IP, port or credential needs typing.
 | `lock.vimar_intercom_door` | lock | Unlock opens the main entrance; re-locks itself. Needs no configuration — it addresses the relay group from your QR code |
 | `button.vimar_intercom_call_<panel>` | button | Call that panel |
 | `button.vimar_intercom_open_<panel>` | button | Open that panel's door |
-| `button.vimar_intercom_answer` / `_hangup` | button | Answer or end a call |
+| `button.vimar_intercom_answer` / `_hang_up` | button | Answer or end a call |
 | `button.vimar_intercom_reconnect` | button | Rebuild the SIP connection |
 | `binary_sensor.vimar_intercom_sip_registration` | binary_sensor | Connectivity; on only while registered |
 | `binary_sensor.vimar_intercom_in_call` | binary_sensor | A call is up |
@@ -145,9 +145,16 @@ remove the 1.x config entry and add the integration again, pasting the
 QR payload from the Vimar View app. Two things will otherwise look like
 bugs:
 
-- **Entity IDs change.** Per-panel buttons are now keyed by the panel's
-  SIP address instead of the old `_ext` / `_int` suffixes. Any 1.x
-  automation referencing the old entity IDs will need updating.
+- **Nearly every entity ID changes, not just the per-panel buttons.**
+  1.x entities carried no device-name prefix and used Italian names —
+  for example `binary_sensor.intercom_sip`, `event.doorbell`,
+  `button.rispondi`, `button.riaggancia`, `camera.intercom`, and
+  `lock.street_gate` / `lock.building_door`. v2 prefixes every entity
+  with `vimar_intercom_` and uses English names throughout — see the
+  Entities table above for the current IDs. Per-panel buttons are also
+  keyed differently: they are now keyed by the panel's SIP address
+  instead of the old `_ext` / `_int` suffixes. Any 1.x automation
+  referencing the old entity IDs will need rewriting, not patching.
 - **The two 1.x lock entities become one.** v2 has a single door lock.
   The old two entities are left behind in the entity registry, showing as
   unavailable, until you delete them by hand.
