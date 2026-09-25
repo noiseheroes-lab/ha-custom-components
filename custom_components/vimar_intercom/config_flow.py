@@ -34,18 +34,26 @@ from .const import (
     DEFAULT_SIP_PORT,
     DOMAIN,
 )
-from .qr import QRDecodeError, decode_qr
-from .runtime import entry_data_from_qr, parse_panels
+from .qr import decode_qr
+from .runtime import entry_data_from_qr, parse_panels, valid_door_command
 
 _LOGGER = logging.getLogger(__name__)
 
 CONF_QR_PAYLOAD = "qr_payload"
 
-QR_SCHEMA = vol.Schema({
-    vol.Required(CONF_QR_PAYLOAD): selector.TextSelector(
-        selector.TextSelectorConfig(multiline=True)
-    ),
-})
+def _qr_schema(payload: str = "") -> vol.Schema:
+    """The QR form, pre-filled with what the user last pasted.
+
+    Rebuilding it empty on `invalid_qr` threw away a long base64 blob the
+    user had to find in the app and paste again to see the same error.
+    """
+    field = (vol.Required(CONF_QR_PAYLOAD, default=payload) if payload
+             else vol.Required(CONF_QR_PAYLOAD))
+    return vol.Schema({
+        field: selector.TextSelector(
+            selector.TextSelectorConfig(multiline=True)
+        ),
+    })
 
 
 class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -65,12 +73,14 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
-                fields = decode_qr(user_input[CONF_QR_PAYLOAD])
-            except QRDecodeError as err:
-                _LOGGER.debug("QR decode rejected: %s", err)
+                # `entry_data_from_qr` validates too, and raises the same
+                # ValueError QRDecodeError already is, so both the
+                # decoding and the field checks fail the same way here.
+                data = entry_data_from_qr(decode_qr(user_input[CONF_QR_PAYLOAD]))
+            except ValueError as err:
+                _LOGGER.debug("QR payload rejected: %s", err)
                 errors["base"] = "invalid_qr"
             else:
-                data = entry_data_from_qr(fields)
                 await self.async_set_unique_id(
                     data[CONF_MAC] or data[CONF_SIP_USER])
                 self._abort_if_unique_id_configured()
@@ -78,7 +88,9 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
                 return await self.async_step_confirm()
 
         return self.async_show_form(
-            step_id="user", data_schema=QR_SCHEMA, errors=errors)
+            step_id="user",
+            data_schema=_qr_schema((user_input or {}).get(CONF_QR_PAYLOAD, "")),
+            errors=errors)
 
     async def async_step_confirm(
         self, user_input: dict[str, Any] | None = None
@@ -105,12 +117,11 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
-                fields = decode_qr(user_input[CONF_QR_PAYLOAD])
-            except QRDecodeError as err:
-                _LOGGER.debug("QR decode rejected: %s", err)
+                data = entry_data_from_qr(decode_qr(user_input[CONF_QR_PAYLOAD]))
+            except ValueError as err:
+                _LOGGER.debug("QR payload rejected: %s", err)
                 errors["base"] = "invalid_qr"
             else:
-                data = entry_data_from_qr(fields)
                 # Keep the identity generated at first setup: the Vimar
                 # cloud tracks the registration by it.
                 for key in (CONF_DEVICE_ID, CONF_DEVICE_UUID, CONF_PUSH_TOKEN):
@@ -121,7 +132,9 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_update_reload_and_abort(entry, data=data)
 
         return self.async_show_form(
-            step_id="reconfigure", data_schema=QR_SCHEMA, errors=errors)
+            step_id="reconfigure",
+            data_schema=_qr_schema((user_input or {}).get(CONF_QR_PAYLOAD, "")),
+            errors=errors)
 
     @staticmethod
     @callback
@@ -145,7 +158,13 @@ class VimarIntercomOptionsFlow(OptionsFlow):
             except ValueError as err:
                 _LOGGER.debug("Panel list rejected: %s", err)
                 errors[CONF_PANELS] = "invalid_panels"
-            else:
+            # This string is sent as the body of a SIP MESSAGE. Free text
+            # there is how a CRLF, or a non-ASCII character the
+            # Content-Length would then mis-count, gets onto the wire.
+            if not valid_door_command(user_input[CONF_DOOR_COMMAND]):
+                _LOGGER.debug("Door command rejected")
+                errors[CONF_DOOR_COMMAND] = "invalid_door_command"
+            if not errors:
                 return self.async_create_entry(data=user_input)
 
         # Redisplay what the user actually submitted, falling back to the

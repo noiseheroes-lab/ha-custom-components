@@ -16,7 +16,6 @@ import base64
 import binascii
 from urllib.parse import unquote
 
-from cryptography.exceptions import InvalidKey
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -24,6 +23,11 @@ KEY_LENGTH = 32
 IV_LENGTH = 16
 BLOCK_SIZE_BITS = 128
 MIN_PAYLOAD_LENGTH = KEY_LENGTH + IV_LENGTH + 16
+# A real payload is a few hundred bytes. The ceiling is here because
+# this runs on the event loop during the config flow: base64-decoding
+# and AES-decrypting a multi-megabyte paste would stall Home Assistant
+# for as long as it took.
+MAX_PAYLOAD_LENGTH = 8 * 1024
 
 REQUIRED_FIELDS: tuple[str, ...] = ("ID", "PWD", "CDOMAIN")
 
@@ -40,10 +44,14 @@ def decrypt_payload(payload: str) -> str:
     """Return the plaintext of a base64 Vimar QR payload.
 
     Raises QRDecodeError if the payload is not valid base64, is too
-    short, or does not decrypt to valid UTF-8.
+    short or too long, or does not decrypt to valid UTF-8.
     """
+    payload = payload.strip()
+    if len(payload) > MAX_PAYLOAD_LENGTH:
+        raise QRDecodeError("payload is too long to be a Vimar QR code")
+
     try:
-        raw = base64.b64decode(payload.strip(), validate=True)
+        raw = base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError) as err:
         raise QRDecodeError("payload is not valid base64") from err
 
@@ -62,7 +70,7 @@ def decrypt_payload(payload: str) -> str:
         padded = decryptor.update(ciphertext) + decryptor.finalize()
         unpadder = padding.PKCS7(BLOCK_SIZE_BITS).unpadder()
         plaintext = unpadder.update(padded) + unpadder.finalize()
-    except (ValueError, InvalidKey) as err:
+    except ValueError as err:
         raise QRDecodeError("payload could not be decrypted") from err
 
     try:

@@ -92,8 +92,60 @@ def test_decode_qr_requires_mandatory_fields(missing):
         qr.decode_qr(build_payload("\n".join(lines)))
 
 
-def test_error_message_never_contains_plaintext():
-    payload = build_payload(PLAINTEXT.replace("ID=60901\n", ""))
+# Every message `qr.py` is allowed to raise. All of them are built from
+# constants; none can carry anything decrypted from the payload. The
+# previous version of this test built a payload that decrypts cleanly
+# and fails only the missing-field check, so plaintext could have been
+# added to the two raises beside it and the test would still have
+# passed. Pinning the whole set is what makes that impossible.
+SAFE_MESSAGES = {
+    "payload is not valid base64",
+    "payload is too short to be a Vimar QR code",
+    "payload is too long to be a Vimar QR code",
+    "payload has an unexpected length",
+    "payload could not be decrypted",
+}
+MISSING_FIELDS_PREFIX = "QR code is missing required fields: "
+
+SECRETS = ("examplepassword", "60901", "ipvdes.vimar.cloud",
+           "00:00:5E:00:53:00", "40515")
+
+
+def _corrupt_key(plaintext: str) -> str:
+    """A payload whose embedded key no longer decrypts its ciphertext."""
+    raw = bytearray(base64.b64decode(build_payload(plaintext)))
+    raw[0] ^= 0xFF
+    return base64.b64encode(bytes(raw)).decode()
+
+
+def _truncated(plaintext: str) -> str:
+    """A payload whose ciphertext is not a whole number of blocks."""
+    raw = base64.b64decode(build_payload(plaintext))
+    return base64.b64encode(raw[:-17] + raw[-16:]).decode()
+
+
+@pytest.mark.parametrize("make_payload", [
+    lambda text: "not base64 $$$",
+    lambda text: base64.b64encode(b"tooshort").decode(),
+    lambda text: build_payload(text) * 400,
+    _corrupt_key,
+    _truncated,
+    lambda text: build_payload(text.replace("ID=60901\n", "")),
+])
+def test_no_decrypted_content_ever_reaches_the_error_message(make_payload):
+    """Every failure mode, not just the one that never decrypts anything."""
     with pytest.raises(qr.QRDecodeError) as excinfo:
-        qr.decode_qr(payload)
-    assert "examplepassword" not in str(excinfo.value)
+        qr.decode_qr(make_payload(PLAINTEXT))
+
+    message = str(excinfo.value)
+    assert (message in SAFE_MESSAGES
+            or message.startswith(MISSING_FIELDS_PREFIX)), message
+    for secret in SECRETS:
+        assert secret not in message
+
+
+def test_a_multi_megabyte_paste_is_refused_before_it_is_decrypted():
+    """Decoding runs on the event loop during the config flow."""
+    with pytest.raises(qr.QRDecodeError) as excinfo:
+        qr.decode_qr("A" * (qr.MAX_PAYLOAD_LENGTH + 4))
+    assert "too long" in str(excinfo.value)

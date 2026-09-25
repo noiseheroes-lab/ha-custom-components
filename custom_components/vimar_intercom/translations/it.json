@@ -45,7 +45,8 @@
       }
     },
     "error": {
-      "invalid_panels": "Gli indirizzi devono essere interni SIP numerici, separati da virgola."
+      "invalid_panels": "Gli indirizzi devono essere interni SIP numerici, separati da virgola.",
+      "invalid_door_command": "Il comando di apertura porta può contenere solo lettere, cifre e trattini bassi, ad esempio OPEN_2F. Viene inviato al posto esterno esattamente come scritto."
     }
   },
   "entity": {

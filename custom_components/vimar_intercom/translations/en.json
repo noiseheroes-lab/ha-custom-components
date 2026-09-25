@@ -45,7 +45,8 @@
       }
     },
     "error": {
-      "invalid_panels": "Panel addresses must be numeric SIP extensions, comma separated."
+      "invalid_panels": "Panel addresses must be numeric SIP extensions, comma separated.",
+      "invalid_door_command": "The door open command must be letters, digits and underscores only, for example OPEN_2F. It is sent to the panel exactly as written."
     }
   },
   "entity": {

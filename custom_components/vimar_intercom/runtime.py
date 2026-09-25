@@ -8,6 +8,7 @@ than mutating it.
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import uuid
 from collections.abc import Mapping
@@ -137,20 +138,94 @@ def parse_panels(raw: str) -> tuple[PanelConfig, ...]:
     return tuple(panels)
 
 
+# A SIP extension or relay group as it may appear in a URI's user part.
+# Deliberately narrower than RFC 3261 allows: every value this
+# integration has ever seen is digits, and nothing wider is needed to
+# talk to a Vimar plant.
+_SIP_TOKEN_RE = re.compile(r"\A[A-Za-z0-9]{1,32}\Z")
+
+# One hostname label, per RFC 1123. A dotted-quad IP address matches
+# this too, which is what the local panel address usually is.
+_HOST_LABEL_RE = re.compile(r"\A[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+
+# A MAC address as the Vimar app writes it. Only ever used as the config
+# entry's unique ID and shown back to the user in the setup dialog.
+_MAC_RE = re.compile(r"\A[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}\Z")
+
+
+def _checked_token(value: str, field: str) -> str:
+    """Return `value` if it is safe in a SIP URI's user part."""
+    if not _SIP_TOKEN_RE.match(value):
+        raise ValueError(
+            f"the QR field '{field}' is not a valid SIP extension")
+    return value
+
+
+def _checked_host(value: str, field: str) -> str:
+    """Return `value` if it is a hostname or an IP address."""
+    if not value or len(value) > 253:
+        raise ValueError(f"the QR field '{field}' is not a valid host name")
+    if not all(_HOST_LABEL_RE.match(label) for label in value.split(".")):
+        raise ValueError(f"the QR field '{field}' is not a valid host name")
+    return value
+
+
+def _checked_mac(value: str) -> str:
+    """Return `value` if it is a MAC address, or "" if it is absent."""
+    if value and not _MAC_RE.match(value):
+        raise ValueError("the QR field 'MAC' is not a valid MAC address")
+    return value
+
+
+# The door command is sent verbatim as the body of a SIP MESSAGE, so it
+# is held to the shape of the commands the panels actually accept
+# (OPEN_2F, OPEN_CURRENT, OPEN_1F...). That excludes the CR and LF that
+# would forge a second request, and the non-ASCII characters that would
+# make Content-Length under-count the body and corrupt the stream.
+_DOOR_COMMAND_RE = re.compile(r"\A[A-Za-z0-9_]{1,32}\Z")
+
+
+def valid_door_command(command: str) -> bool:
+    """True if `command` is safe to send as a SIP MESSAGE body."""
+    return bool(_DOOR_COMMAND_RE.match(command or ""))
+
+
 def entry_data_from_qr(fields: Mapping[str, str]) -> dict[str, Any]:
     """Build the config entry `data` dict from decoded QR fields.
+
+    Every value that reaches a SIP message is checked against a strict
+    charset here and rejected, not escaped — the same thing
+    `parse_panels` does for panel addresses, and for the same reason.
+    `qr.parse_fields` percent-decodes what it reads, so `%0D%0A` in a QR
+    field arrives as a real CRLF; interpolated into an f-string that
+    builds a request it forges whole SIP headers, and `CPROXY` is both
+    the connection host and the TLS SNI, so one hostile payload could
+    redirect the entire session. Reaching this needs the user to paste a
+    payload they were given, which is exactly what people do with
+    configuration snippets swapped on a forum.
+
+    Rejecting also keeps the values safe to render: the confirm step
+    shows the SIP user, the domain and the MAC as markdown.
+
+    Raises ValueError, which the config flow reports as `invalid_qr`. The
+    message names the field and never the value, so nothing decrypted
+    from the payload can reach a log or a dialog.
 
     The device identity is generated once, here, and then reused for the
     life of the entry. It must never be a constant in source.
     """
     return {
-        CONF_SIP_USER: fields["ID"],
+        CONF_SIP_USER: _checked_token(fields["ID"], "ID"),
         CONF_SIP_PASSWORD: fields["PWD"],
-        CONF_SIP_DOMAIN: fields["CDOMAIN"],
-        CONF_CLOUD_PROXY: fields.get("CPROXY") or DEFAULT_CLOUD_PROXY,
-        CONF_LOCAL_PROXY: fields.get("PROXY", ""),
-        CONF_GROUP_ID: fields.get("GID") or DEFAULT_GROUP_ID,
-        CONF_MAC: fields.get("MAC", ""),
+        CONF_SIP_DOMAIN: _checked_host(fields["CDOMAIN"], "CDOMAIN"),
+        CONF_CLOUD_PROXY: _checked_host(
+            fields.get("CPROXY") or DEFAULT_CLOUD_PROXY, "CPROXY"),
+        CONF_LOCAL_PROXY: (
+            _checked_host(fields["PROXY"], "PROXY")
+            if fields.get("PROXY") else ""),
+        CONF_GROUP_ID: _checked_token(
+            fields.get("GID") or DEFAULT_GROUP_ID, "GID"),
+        CONF_MAC: _checked_mac(fields.get("MAC", "")),
         CONF_PLANT_TYPE: fields.get("PLANTTYPE", ""),
         CONF_PRODUCT_CODE: fields.get("PC", ""),
         CONF_DEVICE_ID: "".join(
@@ -158,6 +233,21 @@ def entry_data_from_qr(fields: Mapping[str, str]) -> dict[str, Any]:
         CONF_DEVICE_UUID: str(uuid.UUID(bytes=secrets.token_bytes(16), version=4)),
         CONF_PUSH_TOKEN: secrets.token_hex(32),
     }
+
+
+def _door_command_of(options: Mapping[str, Any]) -> str:
+    """The configured door command, or the default if it is unusable.
+
+    The options flow validates this now, but an entry saved before it did
+    can still hold anything. Falling back to the default keeps the
+    intercom working; refusing to load would leave the door unreachable
+    over a field the user can no longer reach except through the same
+    options flow.
+    """
+    command = options.get(CONF_DOOR_COMMAND) or DEFAULT_DOOR_COMMAND
+    if not valid_door_command(command):
+        return DEFAULT_DOOR_COMMAND
+    return command
 
 
 def build_runtime_config(
@@ -200,7 +290,7 @@ def build_runtime_config(
         device_uuid=data[CONF_DEVICE_UUID],
         push_token=data[CONF_PUSH_TOKEN],
         panels=parse_panels(options.get(CONF_PANELS) or DEFAULT_PANELS),
-        door_command=options.get(CONF_DOOR_COMMAND) or DEFAULT_DOOR_COMMAND,
+        door_command=_door_command_of(options),
         rtp_audio_port=rtp_base,
         rtp_video_port=rtp_base + VIDEO_PORT_OFFSET,
         av_audio_port=rtp_base + AV_AUDIO_PORT_OFFSET,

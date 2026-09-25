@@ -1,6 +1,5 @@
 """Tests for RuntimeConfig derivation."""
 
-import dataclasses
 import hashlib
 
 import pytest
@@ -80,14 +79,88 @@ def test_door_uri_uses_the_group_id_from_the_qr():
     assert cfg.door_uri == "sip:21@abcdef123456.FFFFFFFFFF.ipvdes.vimar.cloud"
 
 
-def test_door_uri_with_an_empty_group_id_has_no_user_part():
-    # build_runtime_config never produces an empty group_id (it falls back
-    # to DEFAULT_GROUP_ID), so this only happens if a RuntimeConfig is
-    # built directly with group_id="". door_uri does no defensive
-    # handling of its own; it renders whatever group_id holds.
-    cfg = runtime.build_runtime_config(runtime.entry_data_from_qr(QR_FIELDS), {})
-    cfg = dataclasses.replace(cfg, group_id="")
-    assert cfg.door_uri == "sip:@abcdef123456.FFFFFFFFFF.ipvdes.vimar.cloud"
+# ─── QR values are checked before they can reach a SIP message ───────
+#
+# This replaces a test that asserted `door_uri` renders `sip:@domain`
+# for an empty group ID and commented that no validation is done. It
+# cemented the absence of the checks below rather than testing anything.
+
+CRLF_INJECTION = "21\r\nRoute: <sip:attacker.invalid;lr>"
+
+
+@pytest.mark.parametrize("field, value", [
+    ("ID", CRLF_INJECTION),
+    ("ID", "60901@evil.invalid"),
+    ("ID", ""),
+    ("GID", CRLF_INJECTION),
+    ("GID", "21 21"),
+    ("CDOMAIN", CRLF_INJECTION),
+    ("CDOMAIN", "plant.invalid;lr"),
+    ("CPROXY", CRLF_INJECTION),
+    ("CPROXY", "proxy.invalid:7042"),
+    ("PROXY", CRLF_INJECTION),
+    ("MAC", "[click me](https://evil.invalid)"),
+])
+def test_a_qr_field_that_could_forge_a_sip_message_is_rejected(field, value):
+    """`qr.parse_fields` percent-decodes, so `%0D%0A` arrives as a real
+    CRLF and an f-string builds it straight into a request. CPROXY is
+    both the connection host and the TLS SNI, so one hostile payload
+    could redirect the whole session."""
+    fields = dict(QR_FIELDS)
+    fields[field] = value
+    with pytest.raises(ValueError):
+        runtime.entry_data_from_qr(fields)
+
+
+def test_the_rejection_never_repeats_the_value_it_rejected():
+    """The message reaches a log and the setup dialog."""
+    fields = dict(QR_FIELDS, ID=CRLF_INJECTION)
+    with pytest.raises(ValueError) as excinfo:
+        runtime.entry_data_from_qr(fields)
+    assert CRLF_INJECTION not in str(excinfo.value)
+    assert "ID" in str(excinfo.value)
+
+
+def test_an_absent_optional_field_is_still_accepted():
+    data = runtime.entry_data_from_qr({
+        "ID": "60901", "PWD": "p", "CDOMAIN": "plant.invalid"})
+    assert data["local_proxy"] == ""
+    assert data["mac"] == ""
+    assert data["group_id"] == "21"
+
+
+def test_a_local_proxy_given_as_an_ip_address_is_accepted():
+    data = runtime.entry_data_from_qr(dict(QR_FIELDS, PROXY="192.0.2.10"))
+    assert data["local_proxy"] == "192.0.2.10"
+
+
+def test_the_door_uri_always_has_a_user_part():
+    """Every accepted group ID produces a routable URI."""
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(dict(QR_FIELDS, GID="7")), {})
+    assert cfg.door_uri == "sip:7@abcdef123456.FFFFFFFFFF.ipvdes.vimar.cloud"
+
+
+# ─── the door command is a SIP body ──────────────────────────────────
+
+@pytest.mark.parametrize("command", ["OPEN_2F", "OPEN_CURRENT", "OPEN1"])
+def test_a_plain_door_command_is_accepted(command):
+    assert runtime.valid_door_command(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    "", "OPEN 2F", "OPEN_2F\r\nMESSAGE sip:21@x SIP/2.0", "APRÌ_2F"])
+def test_a_door_command_that_would_corrupt_the_stream_is_rejected(command):
+    """A CRLF forges a second request; a non-ASCII character makes the
+    byte count of the body differ from what any character count says."""
+    assert runtime.valid_door_command(command) is False
+
+
+def test_an_unusable_stored_door_command_falls_back_to_the_default():
+    """Entries saved before the options flow checked this still load."""
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(QR_FIELDS), {"door_command": "APRÌ_2F"})
+    assert cfg.door_command == "OPEN_2F"
 
 
 def test_default_panels_is_a_single_entry():
