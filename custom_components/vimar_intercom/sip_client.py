@@ -330,6 +330,7 @@ async def connection_supervisor() -> None:
                 raise
             except Exception as err:  # noqa: BLE001 - any failure means retry
                 _clear_registration()
+                await _abandon_call()
                 if (connected_at is not None
                         and time.monotonic() - connected_at
                         >= C.STABLE_CONNECTION_SECONDS):
@@ -904,12 +905,58 @@ async def send_keyframe_request():
     _LOGGER.debug("Sent INFO picture_fast_update (keyframe request)")
 
 
+async def _end_call_locally() -> None:
+    """Forget the current call and tell everyone it is over.
+
+    The local half of ending a call is unconditional. A BYE that cannot
+    leave the machine — the socket is gone, which is the normal state
+    during the outage this rewrite exists for — still ends the call
+    here. Leaving `in_call` True with no dialog behind it sticks the
+    in-call sensor on, makes `stream_opened` refuse to place a call, and
+    makes the hub decline every real doorbell press with a 603 as the
+    echo of a call that no longer exists, until the entry is reloaded.
+    """
+    _set_calling(False)
+    _set_in_call(False)
+    call_state.update(call_id=None, from_tag=None, to_tag=None,
+                      remote_contact=None, remote_sdp=None,
+                      original_target=None)
+    try:
+        await media.stop_media()
+    except Exception:  # noqa: BLE001 - teardown must still reach the broadcast
+        _LOGGER.debug("Stopping media after a call failed", exc_info=True)
+    await broadcast("call_ended", "Call ended")
+
+
+async def _abandon_call() -> None:
+    """Drop the call state a dead connection took with it.
+
+    The dialog lived on the socket that just went: no BYE can be sent
+    for it and none will ever arrive. Only `_clear_registration` used to
+    run here, so a connection lost mid-call left `in_call` True with
+    nothing able to clear it.
+    """
+    if not (in_call or calling or call_state["call_id"]
+            or pending_incoming["active"]):
+        return
+    _LOGGER.info("The SIP connection went while a call was up; "
+                 "ending that call locally")
+    pending_incoming["active"] = False
+    try:
+        await _end_call_locally()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - the supervisor must keep retrying
+        _LOGGER.debug("Clearing the call state after a connection loss failed",
+                      exc_info=True)
+
+
 async def do_hangup():
+    """End the current call: send a BYE if the socket still allows it,
+    and clear the call locally whether or not it went out."""
     _set_calling(False)
     if not in_call or not call_state["call_id"]:
-        _set_in_call(False)
-        await media.stop_media()
-        await broadcast("call_ended", "Call ended")
+        await _end_call_locally()
         return
 
     cid = call_state["call_id"]
@@ -935,14 +982,14 @@ async def do_hangup():
            f"User-Agent: {CFG.user_agent}\r\n"
            f"Content-Length: 0\r\n\r\n")
     key = _open_transaction(branch, seq, "BYE", cid)
-    await send(bye)
-    await _wait_final(key, cid, seq, "BYE", timeout=5)
-
-    _set_in_call(False)
-    call_state.update(call_id=None, from_tag=None, to_tag=None,
-                      remote_contact=None, remote_sdp=None, original_target=None)
-    await media.stop_media()
-    await broadcast("call_ended", "Call ended")
+    try:
+        await send(bye)
+        await _wait_final(key, cid, seq, "BYE", timeout=5)
+    finally:
+        # `send` raises on a dead writer, and the caller swallows that.
+        # The call still has to end here, or nothing ever ends it.
+        _close_transaction(key, cid, seq, "BYE")
+        await _end_call_locally()
 
 
 # ─── Incoming SIP ───────────────────────────────────────────────────
@@ -1044,17 +1091,16 @@ async def handle_incoming_bye(raw):
     to_hdr = msg.headers.get("to", "")
     cseq = msg.headers.get("cseq", "1 BYE")
 
-    await send(
-        f"SIP/2.0 200 OK\r\n"
-        f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
-        f"Call-ID: {cid}\r\nCSeq: {cseq}\r\n"
-        f"Content-Length: 0\r\n\r\n")
-
-    _set_in_call(False)
-    call_state.update(call_id=None, from_tag=None, to_tag=None,
-                      remote_contact=None, remote_sdp=None, original_target=None)
-    await media.stop_media()
-    await broadcast("call_ended", "Call ended")
+    try:
+        await send(
+            f"SIP/2.0 200 OK\r\n"
+            f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+            f"Call-ID: {cid}\r\nCSeq: {cseq}\r\n"
+            f"Content-Length: 0\r\n\r\n")
+    finally:
+        # The panel has hung up. Whether our 200 OK reached it or the
+        # socket died under us, the call is over on this side.
+        await _end_call_locally()
 
 
 async def handle_incoming_options(raw):
