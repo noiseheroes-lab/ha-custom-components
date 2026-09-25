@@ -71,6 +71,14 @@ on the Home Assistant event bus. This is public API: the event name and
 its payload will not be renamed without agreement, so it is safe to build
 automations and companion apps against it.
 
+It fires for a doorbell press that arrives while you are already on a
+call, too. That call cannot be taken — the integration holds one call at
+a time — so the second one is answered with a SIP 486 Busy Here and the
+rest of the plant keeps ringing; but the event fires, so a notification
+still reaches you. The one INVITE that fires nothing is the Vimar cloud
+calling back the panel this integration just called itself, which is an
+echo of your own call rather than a visitor.
+
 Payload:
 
 ```json
@@ -125,7 +133,10 @@ Assistant UI would: the panel stops ringing elsewhere in the house.
   it is not guaranteed to match your plant.
 - **Door open command** — the SIP command sent to the door relay group
   outside a call. `OPEN_2F` by default; some plants want a different
-  command.
+  command. Letters, digits and underscores only: it goes onto the wire
+  exactly as written, and a space or an accented character would corrupt
+  the connection to the panel. A command saved before this was checked
+  falls back to `OPEN_2F`.
 - **Prefer local panel** — talk to the panel directly on the local
   network instead of through the Vimar cloud. Only takes effect if your
   QR code included a local panel address; there is no automatic fallback
@@ -194,6 +205,12 @@ bugs:
 
 ## Troubleshooting
 
+- **"That does not look like a Vimar QR payload"** — as well as a
+  payload that will not decrypt, this now covers one that decrypts to
+  values the integration will not put on the wire: the SIP user and the
+  relay group must be alphanumeric, and the domain and the proxy
+  addresses must be host names or IP addresses. Only paste a payload
+  your own Vimar View app produced.
 - **Registration stays off** — check the host can reach the proxy shown
   in the sensor's attributes; press the Reconnect button. The integration
   retries forever, so a repair issue after five minutes means the panel
@@ -211,7 +228,20 @@ bugs:
   relay of the panel that is calling; otherwise it sends the configured
   door command, `OPEN_2F` by default. Some plants want a different
   command — change it in the options. For a second entrance, use that
-  panel's door button.
+  panel's door button. A failure is now reported as an error on the
+  action, with the reason, rather than only written to the log — so an
+  automation can catch it and the UI shows it.
+- **"No reply from the intercom. The door may have opened anyway"** —
+  the command went out and nothing came back within the timeout. The
+  integration deliberately does not resend it: a command that reached
+  the panel and only lost its acknowledgement would pulse the relay a
+  second time, so the door would open, close and open again unattended.
+  Check the door before pressing again.
+- **"The Vimar CA certificate is missing"** — the integration refuses to
+  set up without `vimar_rootca.pem`, because the connection it verifies
+  with it is the one that carries the door command. Reinstall through
+  HACS. It previously carried on without verifying the certificate at
+  all.
 - **More detail in the log:**
 
   ```yaml

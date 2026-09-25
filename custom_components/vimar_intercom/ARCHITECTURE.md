@@ -143,6 +143,28 @@ something to try casually.
   derived from `MAX_CALL_DURATION`, so it always outlives the longest
   call the integration allows — a stream cannot be cut by its own URL
   expiring and then fail to restart on a 401 it could not recover from.
+- The SIP connection to the cloud proxy is TLS with the certificate
+  verified, and the integration refuses to set up at all when
+  `vimar_rootca.pem` is missing: it used to fall back to an unverified
+  connection, silently, on the socket that carries the door command and
+  the digest response. Verification is *not* certificate pinning.
+  `load_verify_locations` on top of `ssl.create_default_context()` adds
+  the Vimar CA to the system roots rather than replacing them, so any
+  publicly trusted certificate for the proxy host also validates. That
+  is deliberate: pinning cannot be tested here, it would break every
+  installation the day Vimar rotates to a different chain, and
+  `prefer_local` — which connects to a panel's LAN address while passing
+  the cloud proxy as the SNI — almost certainly could not satisfy it.
+- Digest authentication answers whatever realm the server names, rather
+  than requiring it to equal the configured SIP domain. A proxy can
+  therefore choose a realm and collect `MD5(user:realm:password)`, which
+  is offline-crackable; the password itself never leaves the host.
+  Reaching that position means being the real proxy or holding a
+  certificate the system roots trust for it. Requiring the realm to
+  match the domain would close it, and would also break any installation
+  whose registrar names a realm that is not its domain — which cannot be
+  checked from here. Left open deliberately, to be settled during live
+  validation.
 - The integration never opens an inbound port on the internet. It
   maintains one outbound TLS connection to the Vimar cloud proxy. It
   does bind two UDP sockets on `0.0.0.0` for the RTP media streams
