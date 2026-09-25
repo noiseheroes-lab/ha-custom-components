@@ -688,8 +688,12 @@ async def start_av_ffmpeg():
     is what makes `av_subscribe` safe to call for a second viewer.
     """
     global av_ffmpeg_proc, _av_consumer, _av_reader_task
-    if av_ffmpeg_proc is not None and av_ffmpeg_proc.poll() is None:
-        return
+    if av_ffmpeg_proc is not None:
+        if av_ffmpeg_proc.poll() is None:
+            return
+        # It exited on its own. Clear the consumer and reader it left
+        # behind before putting a second set in their place.
+        await stop_av_ffmpeg()
 
     sdp_path = _create_av_sdp()
     cmd = [
