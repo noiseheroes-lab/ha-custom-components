@@ -147,6 +147,130 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         _LOGGER.debug("STUN Audio → %s", self.remote_addr)
 
 
+ANNEX_B_START = b"\x00\x00\x00\x01"
+
+NAL_TYPE_SLICE = 1
+NAL_TYPE_IDR = 5
+NAL_TYPE_SPS = 7
+NAL_TYPE_PPS = 8
+
+
+class VideoStreamRegistry:
+    """Fan H.264 NAL units out to consumers, replaying parameter sets.
+
+    A decoder cannot start without the SPS and PPS that describe the
+    stream, and the panel only sends them next to an IDR. Every consumer
+    that attaches mid-stream therefore receives the cached pair first,
+    and the pair is repeated before every IDR so a decoder that lost
+    sync can recover.
+
+    Synchronous and lock-free on purpose: it is only ever driven from
+    the event loop thread by the RTP protocol.
+    """
+
+    def __init__(self) -> None:
+        """Start with no consumers and no cached parameter sets."""
+        self._consumers: list = []
+        self._sps: bytes | None = None
+        self._pps: bytes | None = None
+        self._pending_idr: bytes | None = None
+        self._started = False
+
+    @property
+    def parameter_sets(self) -> tuple[bytes, bytes] | None:
+        """The cached (SPS, PPS) pair, or None if not seen yet."""
+        if self._sps is None or self._pps is None:
+            return None
+        return self._sps, self._pps
+
+    def add_consumer(self, consumer) -> None:
+        """Register a consumer and prime it with the parameter sets."""
+        self._consumers.append(consumer)
+        pair = self.parameter_sets
+        if pair is not None:
+            for nal in pair:
+                self._send_one(consumer, nal)
+
+    def remove_consumer(self, consumer) -> None:
+        """Stop sending to a consumer."""
+        if consumer in self._consumers:
+            self._consumers.remove(consumer)
+
+    def reset(self) -> None:
+        """Forget consumers and cached state, e.g. when a call ends."""
+        self._consumers.clear()
+        self._sps = None
+        self._pps = None
+        self._pending_idr = None
+        self._started = False
+
+    def push_nal(self, nal: bytes) -> None:
+        """Feed one complete NAL unit into the stream."""
+        if not nal:
+            return
+
+        nal_type = nal[0] & 0x1F
+
+        if nal_type == NAL_TYPE_SPS:
+            self._sps = nal
+            self._flush_pending()
+            return
+
+        if nal_type == NAL_TYPE_PPS:
+            self._pps = nal
+            self._flush_pending()
+            return
+
+        if nal_type == NAL_TYPE_IDR:
+            if self.parameter_sets is None:
+                self._pending_idr = nal
+                return
+            self._broadcast_parameter_sets()
+            self._started = True
+            self._broadcast(nal)
+            return
+
+        if not self._started:
+            # A decoder cannot use a predicted slice before its keyframe.
+            return
+
+        self._broadcast(nal)
+
+    def _flush_pending(self) -> None:
+        """Emit the parameter sets, and any IDR that was waiting."""
+        if self.parameter_sets is None:
+            return
+        if self._pending_idr is not None:
+            self._broadcast_parameter_sets()
+            self._started = True
+            self._broadcast(self._pending_idr)
+            self._pending_idr = None
+
+    def _broadcast_parameter_sets(self) -> None:
+        """Send the cached SPS and PPS to every consumer."""
+        pair = self.parameter_sets
+        if pair is None:
+            return
+        for nal in pair:
+            self._broadcast(nal)
+
+    def _broadcast(self, nal: bytes) -> None:
+        """Send one NAL to every consumer, dropping the broken ones."""
+        for consumer in list(self._consumers):
+            self._send_one(consumer, nal)
+
+    def _send_one(self, consumer, nal: bytes) -> None:
+        """Send to one consumer; drop it if the sink has gone away."""
+        try:
+            consumer(ANNEX_B_START + nal)
+        except Exception:  # noqa: BLE001 - a dead sink must not stop the rest
+            _LOGGER.debug("Dropping a video consumer that stopped accepting data")
+            self.remove_consumer(consumer)
+
+
+video_registry = VideoStreamRegistry()
+
+
 class RTPVideoProtocol(asyncio.DatagramProtocol):
     """Video SRTP: decrypt → depacketize RTP H.264 → send NALs via WebSocket.
     No ffmpeg — direct pipeline like the official Vimar app."""
@@ -162,14 +286,6 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         self._fua_buf = bytearray()
         self._fua_started = False
         self._fua_expected_seq = None  # Track RTP seq for FU-A continuity
-        # Ordered NAL send queue — preserves SPS→PPS→IDR order
-        self._nal_queue: asyncio.Queue | None = None
-        self._nal_sender_task: asyncio.Task | None = None
-        # SPS/PPS reorder buffer — hold IDR until SPS+PPS received
-        self._last_sps = None
-        self._last_pps = None
-        self._sps_pps_sent = False  # True after first SPS+PPS pair sent
-        self._pending_idr = None   # IDR waiting for SPS+PPS
         # RTP reorder buffer — fixes out-of-order UDP packets
         self._reorder_buf = {}  # seq -> payload
         self._next_seq = None   # next expected sequence number
@@ -182,10 +298,6 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self.transport = transport
         _LOGGER.debug("RTP Video ready on :%d", CFG.rtp_video_port)
-        # Start ordered NAL sender
-        loop = asyncio.get_event_loop()
-        self._nal_queue = asyncio.Queue(maxsize=500)
-        self._nal_sender_task = loop.create_task(self._nal_sender())
 
     def datagram_received(self, data, addr):
         if len(data) < 4:
@@ -332,83 +444,11 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                 self._fua_expected_seq = None
 
     def _emit_nal(self, nal_data):
-        """Queue a complete NAL unit for ordered sending via WebSocket.
-
-        Ensures SPS→PPS→IDR ordering: if IDR arrives before SPS+PPS,
-        buffer it and emit after both parameter sets are received.
-        """
-        if not nal_data or not self._nal_queue:
+        """Hand a complete NAL unit to the video registry."""
+        if not nal_data:
             return
-        nal_type = nal_data[0] & 0x1F if nal_data else 0
         self._nal_count += 1
-        self._nal_types[nal_type] = self._nal_types.get(nal_type, 0) + 1
-
-        # Reorder: ensure SPS+PPS always precede IDR
-        if nal_type == 7:  # SPS
-            self._last_sps = nal_data
-            # If we have both SPS+PPS now, emit them + any pending IDR
-            if self._last_pps is not None:
-                self._flush_params_and_idr()
-            return
-        elif nal_type == 8:  # PPS
-            self._last_pps = nal_data
-            if self._last_sps is not None:
-                self._flush_params_and_idr()
-            return
-        elif nal_type == 5:  # IDR
-            if not self._sps_pps_sent:
-                # No SPS+PPS sent yet — buffer IDR
-                _LOGGER.debug("IDR buffered — waiting for SPS+PPS")
-                self._pending_idr = nal_data
-                return
-            else:
-                # Re-emit latest SPS+PPS before each IDR for robustness
-                if self._last_sps:
-                    self._queue_nal(self._last_sps)
-                if self._last_pps:
-                    self._queue_nal(self._last_pps)
-        elif nal_type == 1:  # P-frame
-            if not self._sps_pps_sent:
-                return  # Drop P-frames before first IDR
-
-        self._queue_nal(nal_data)
-
-    def _flush_params_and_idr(self):
-        """Emit SPS→PPS→(pending IDR) in correct order."""
-        if self._last_sps:
-            self._queue_nal(self._last_sps)
-        if self._last_pps:
-            self._queue_nal(self._last_pps)
-        self._sps_pps_sent = True
-        if self._pending_idr:
-            self._queue_nal(self._pending_idr)
-            self._pending_idr = None
-
-    def _queue_nal(self, nal_data):
-        """Low-level: queue NAL bytes to WebSocket send queue."""
-        msg = b'\x03\x00\x00\x00\x01' + nal_data
-        try:
-            self._nal_queue.put_nowait(msg)
-        except asyncio.QueueFull:
-            try:
-                self._nal_queue.get_nowait()
-                self._nal_queue.put_nowait(msg)
-            except Exception:
-                pass
-
-    async def _nal_sender(self):
-        """Drain the ordered NAL queue.
-
-        No consumer is wired up yet: Task 12 replaces this whole path
-        with a registry of media consumers (e.g. the camera platform).
-        """
-        try:
-            while True:
-                msg = await self._nal_queue.get()
-                # No consumer registered yet — see docstring.
-                continue
-        except asyncio.CancelledError:
-            pass
+        video_registry.push_nal(nal_data)
 
     def send_stun(self):
         if not self.transport or not self.remote_addr:
@@ -425,6 +465,7 @@ video_proto: RTPVideoProtocol | None = None
 av_ffmpeg_proc = None
 _stun_task = None
 _av_sdp_path: str | None = None
+_av_consumer = None
 
 
 # ─── Transport setup ────────────────────────────────────────────────
@@ -479,10 +520,6 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         video_proto._fua_buf = bytearray()
         video_proto._fua_started = False
         video_proto._fua_expected_seq = None
-        video_proto._last_sps = None
-        video_proto._last_pps = None
-        video_proto._sps_pps_sent = False
-        video_proto._pending_idr = None
         video_proto._reorder_buf = {}
         video_proto._next_seq = None
         video_proto._srtp_fail = 0
@@ -524,6 +561,7 @@ async def stop_media():
         video_proto._fua_started = False
         video_proto._fua_expected_seq = None
     await stop_av_ffmpeg()
+    video_registry.reset()
 
 
 def close_transports():
@@ -571,43 +609,87 @@ def _create_av_sdp() -> str:
 
 
 async def start_av_ffmpeg():
-    """Start ffmpeg that reads H264+PCMU RTP and outputs MPEG-TS to pipe."""
-    global av_ffmpeg_proc
+    """Start ffmpeg muxing H.264 from stdin and audio RTP into MPEG-TS."""
+    global av_ffmpeg_proc, _av_consumer
     await stop_av_ffmpeg()
 
     sdp_path = _create_av_sdp()
     cmd = [
         "ffmpeg", "-y", "-loglevel", "warning",
-        "-protocol_whitelist", "file,udp,rtp",
         "-fflags", "+genpts+discardcorrupt",
+        "-f", "h264", "-i", "pipe:0",
+        "-protocol_whitelist", "file,udp,rtp",
         "-i", sdp_path,
-        "-c:v", "copy",
-        "-c:a", "copy",
+        "-map", "0:v", "-map", "1:a",
+        "-c", "copy",
         "-f", "mpegts",
         "pipe:1",
     ]
     try:
         av_ffmpeg_proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        asyncio.create_task(_read_av_ffmpeg_stderr())
-        _LOGGER.info("AV ffmpeg started (MPEG-TS output)")
-    except Exception as e:
-        _LOGGER.error("AV ffmpeg start error: %s", e)
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as err:
+        # Clean up the SDP we just wrote: this is the one exit path that
+        # never reaches stop_av_ffmpeg.
+        _LOGGER.error("Could not start ffmpeg: %s", err)
+        av_ffmpeg_proc = None
+        _cleanup_av_sdp()
+        return
+
+    # Bound how long a stalled ffmpeg can hold up the event loop: a
+    # blocking write to a full pipe would stall push_nal, and with it
+    # every RTP datagram this process receives. Non-blocking mode caps
+    # the exposure at the kernel pipe buffer (tens of KB) and turns a
+    # full pipe into BlockingIOError, which _send_one already treats
+    # like any other dead consumer.
+    os.set_blocking(av_ffmpeg_proc.stdin.fileno(), False)
+
+    asyncio.create_task(_read_av_ffmpeg_stderr())
+    _av_consumer = _make_ffmpeg_consumer(av_ffmpeg_proc)
+    video_registry.add_consumer(_av_consumer)
+    _LOGGER.info("AV pipeline started")
+
+
+def _make_ffmpeg_consumer(proc):
+    """Return a consumer that writes Annex-B NALs into ffmpeg's stdin."""
+    def _write(data: bytes) -> None:
+        if proc.poll() is not None or proc.stdin is None:
+            raise BrokenPipeError("ffmpeg has exited")
+        proc.stdin.write(data)
+        proc.stdin.flush()
+    return _write
 
 
 async def stop_av_ffmpeg():
-    global av_ffmpeg_proc, _av_sdp_path
+    """Stop the AV pipeline and detach it from the video registry."""
+    global av_ffmpeg_proc, _av_consumer, _av_sdp_path
+
+    if _av_consumer is not None:
+        video_registry.remove_consumer(_av_consumer)
+        _av_consumer = None
+
     if av_ffmpeg_proc:
         try:
+            if av_ffmpeg_proc.stdin:
+                av_ffmpeg_proc.stdin.close()
             av_ffmpeg_proc.terminate()
-            await asyncio.get_event_loop().run_in_executor(None, av_ffmpeg_proc.wait, 3)
-        except Exception:
+            await asyncio.get_running_loop().run_in_executor(
+                None, av_ffmpeg_proc.wait, 3)
+        except Exception:  # noqa: BLE001 - the process may already be gone
             try:
                 av_ffmpeg_proc.kill()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
         av_ffmpeg_proc = None
-        _LOGGER.info("AV ffmpeg stopped")
+        _LOGGER.info("AV pipeline stopped")
+
+    _cleanup_av_sdp()
+
+
+def _cleanup_av_sdp() -> None:
+    """Remove the temporary SDP file, if one is still on disk."""
+    global _av_sdp_path
     if _av_sdp_path:
         try:
             os.unlink(_av_sdp_path)
