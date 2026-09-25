@@ -1,6 +1,7 @@
 """Vimar Intercom — SIP signaling: transport, auth, operations."""
 
 import asyncio
+import base64
 import hashlib
 import os
 import random
@@ -48,12 +49,7 @@ def init(broadcast_fn):
     _broadcast = broadcast_fn
 
 
-_suppress_broadcast = False
-
 async def broadcast(msg_type, msg):
-    if _suppress_broadcast:
-        _LOGGER.debug("Broadcast suppressed: %s %s", msg_type, msg)
-        return
     if _broadcast:
         await _broadcast(msg_type, msg)
 
@@ -90,6 +86,47 @@ call_state = {
 
 pending_transactions: dict[str, asyncio.Queue] = {}
 incoming_requests: asyncio.Queue = None
+
+
+def reset_state() -> None:
+    """Forget every trace of a previous run of this module.
+
+    The SIP layer is module state, so a Home Assistant reload leaves it
+    exactly as the previous entry left it, while the socket that gave it
+    meaning is gone. An `in_call` surviving a reload sticks the in-call
+    sensor on, makes `stream_opened` refuse to place a call, and makes
+    the hub decline the next real doorbell press as the echo of a call
+    that no longer exists — and nothing can clear it, because the dialog
+    that would have produced a BYE died with the socket. `async_start`
+    calls this before anything else.
+    """
+    global reader, writer, lock, registered, in_call, calling
+    global cseq_counter, local_tag, registration_expiry
+    global _state_change_callback, _broadcast
+
+    _cancel_reregister()
+    # Drop the callbacks first. They still point at the torn-down hub
+    # and its removed entities; the new hub installs its own straight
+    # after this returns.
+    _state_change_callback = None
+    _broadcast = None
+    reader = None
+    writer = None
+    lock = None
+    registered = False
+    in_call = False
+    calling = False
+    cseq_counter = 0
+    local_tag = None
+    registration_expiry = None
+    call_state.update(call_id=None, from_tag=None, to_tag=None,
+                      remote_contact=None, remote_sdp=None,
+                      original_target=None)
+    pending_incoming.update(
+        active=False, cid=None, from_hdr=None, to_hdr=None, cseq=None,
+        via_block=None, my_tag=None, caller_uri=None, caller_tag=None,
+        body=None)
+    pending_transactions.clear()
 
 
 def _open_transaction(branch: str, seq: int, method: str, call_id: str) -> str:
@@ -287,13 +324,6 @@ async def connection_supervisor() -> None:
                 if not await do_register():
                     raise ConnectionError("registration was refused")
                 connected_at = time.monotonic()
-                try:
-                    await do_connect_profiles()
-                except Exception as err:  # noqa: BLE001 - optional, never fatal
-                    # A plant that rejects connectProfiles is still usable:
-                    # the registration is what matters. Failing here would
-                    # spin the supervisor forever on a healthy connection.
-                    _LOGGER.warning("connectProfiles failed (%s); continuing", err)
                 await _reader_loop()
                 raise ConnectionError("connection closed by the server")
             except asyncio.CancelledError:
@@ -415,16 +445,17 @@ async def _wait_final(key: str, call_id: str, seq: int, method: str,
 
 # ─── SDP ────────────────────────────────────────────────────────────
 
-_local_crypto_key = None
-_local_video_crypto_key = None
-
-
 def build_sdp():
-    global _local_crypto_key, _local_video_crypto_key
+    """Offer PCMU audio and H.264 video over SAVP.
+
+    The two `a=crypto` keys describe the streams this client would send.
+    It never sends media — Home Assistant has no talk-back path to the
+    panel — but SAVP requires the attribute, so a fresh random key is
+    offered for each and then discarded.
+    """
     sid = str(int(time.time()))
-    import base64 as _b64
-    _local_crypto_key = _b64.b64encode(os.urandom(30)).decode()
-    _local_video_crypto_key = _b64.b64encode(os.urandom(30)).decode()
+    audio_crypto_key = base64.b64encode(os.urandom(30)).decode()
+    video_crypto_key = base64.b64encode(os.urandom(30)).decode()
     return (
         f"v=0\r\n"
         f"o=- {sid} {sid} IN IP4 {MY_IP}\r\n"
@@ -440,7 +471,7 @@ def build_sdp():
         f"a=fmtp:101 0-15\r\n"
         f"a=ptime:20\r\n"
         f"a=sendrecv\r\n"
-        f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_local_crypto_key}\r\n"
+        f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{audio_crypto_key}\r\n"
         f"m=video {CFG.rtp_video_port} RTP/SAVP 96\r\n"
         f"b=AS:256\r\n"
         f"a=rtpmap:96 H264/90000\r\n"
@@ -449,7 +480,7 @@ def build_sdp():
         f"a=rtcp-fb:96 nack\r\n"
         f"a=rtcp-fb:96 nack pli\r\n"
         f"a=sendrecv\r\n"
-        f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_local_video_crypto_key}\r\n"
+        f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{video_crypto_key}\r\n"
     )
 
 
@@ -561,8 +592,16 @@ async def _reregister_after(delay: float) -> None:
 
 
 async def do_register():
+    """REGISTER over the connection the supervisor owns.
+
+    Never connects on its own. A socket opened here would have no
+    reader — `_reader_loop` only runs inside `connection_supervisor` —
+    so every response to this REGISTER would go unread, and the socket
+    would be orphaned the moment the supervisor opened its own.
+    """
     if not writer or writer.is_closing():
-        await connect()
+        _LOGGER.warning("REGISTER skipped: there is no SIP connection")
+        return False
 
     global local_tag
     local_tag = _gen("")
@@ -814,7 +853,7 @@ async def do_call(target=None):
                     remote = parse_sdp(msg.body)
                     call_state["remote_sdp"] = remote
                     _LOGGER.debug("SDP: audio=%s video=%s", remote.get('audio', {}), remote.get('video', {}))
-                    await media.setup_media(remote, _local_crypto_key, _local_video_crypto_key)
+                    await media.setup_media(remote)
 
                 _set_in_call(True)
                 _set_calling(False)
@@ -906,94 +945,6 @@ async def do_hangup():
     await broadcast("call_ended", "Call ended")
 
 
-async def do_options(target=None):
-    if not is_registered():
-        return False, "Not registered"
-    target = target or CFG.panel_uri(CFG.default_panel.address)
-    ftag = _gen("")
-    cid = _gen("opt-")
-
-    def _msg(branch, seq, auth=None):
-        m = (f"OPTIONS {target} SIP/2.0\r\n"
-             f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
-             f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
-             f"Max-Forwards: 70\r\n"
-             f"To: <{target}>\r\n"
-             f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
-             f"Call-ID: {cid}\r\n"
-             f"CSeq: {seq} OPTIONS\r\n"
-             f"User-Agent: {CFG.user_agent}\r\n"
-             f"Accept: application/sdp\r\n")
-        if auth:
-            m += f"Proxy-Authorization: {auth}\r\n"
-        return m + "Content-Length: 0\r\n\r\n"
-
-    branch = _gen()
-    seq = _next_cseq()
-    key = _open_transaction(branch, seq, "OPTIONS", cid)
-    await send(_msg(branch, seq))
-    for raw in await _wait_final(key, cid, seq, "OPTIONS"):
-        msg = parse_message(raw)
-        if msg.code and msg.code < 200:
-            continue
-        if msg.code in (401, 407):
-            ch = msg.headers.get("proxy-authenticate", "") or msg.headers.get("www-authenticate", "")
-            if not ch:
-                return False, f"Empty authentication challenge ({msg.code})"
-            auth = _make_auth("OPTIONS", target, ch)
-            branch2 = _gen()
-            seq2 = _next_cseq()
-            key2 = _open_transaction(branch2, seq2, "OPTIONS", cid)
-            await send(_msg(branch2, seq2, auth=auth))
-            for raw2 in await _wait_final(key2, cid, seq2, "OPTIONS"):
-                msg2 = parse_message(raw2)
-                if msg2.code and 200 <= msg2.code < 300:
-                    return True, f"OK: {msg2.code}"
-                return False, f"Rejected with {msg2.code}"
-            return False, "Timed out"
-        if msg.code and 200 <= msg.code < 300:
-            return True, f"OK: {msg.code}"
-        if msg.code and msg.code >= 300:
-            return False, f"Rejected with {msg.code}"
-    return False, "Timed out"
-
-
-async def do_connect_profiles():
-    """Register push profile on Vimar cloud. Uses Digest auth (not Basic)."""
-    username = f"{CFG.sip_user}@{CFG.sip_domain}"
-    body = [{"sipid": CFG.sip_user, "domain": CFG.sip_domain, "pntok": CFG.push_token}]
-    if not CFG.push_token:
-        return False, "No FCM token"
-
-    import requests as req_lib
-    loop = asyncio.get_event_loop()
-    base_url = f"https://{CFG.route}/eipvdesUtils"
-
-    def _call(endpoint):
-        return req_lib.post(
-            f"{base_url}/{endpoint}",
-            json=body,
-            auth=req_lib.auth.HTTPDigestAuth(username, CFG.push_token),
-            headers={"Accept": "application/json"}, timeout=15)
-
-    try:
-        resp = await loop.run_in_executor(None, _call, "connectProfiles")
-        _LOGGER.info("connectProfiles: %d", resp.status_code)
-        if resp.status_code == 200:
-            return True, "Profile connected"
-        if resp.status_code == 403:
-            await loop.run_in_executor(None, _call, "disconnectProfiles")
-            resp3 = await loop.run_in_executor(None, _call, "connectProfiles")
-            _LOGGER.info("connectProfiles retry: %d", resp3.status_code)
-            if resp3.status_code == 200:
-                return True, "Profile connected"
-            return False, f"connectProfiles: {resp3.status_code}"
-        return False, f"connectProfiles: {resp.status_code}"
-    except Exception as e:
-        _LOGGER.error("connectProfiles error: %s", e)
-        return False, str(e)
-
-
 # ─── Incoming SIP ───────────────────────────────────────────────────
 
 pending_incoming = {
@@ -1059,7 +1010,7 @@ async def do_answer_incoming():
         remote = parse_sdp(p["body"])
         call_state["remote_sdp"] = remote
         _LOGGER.debug("Answer SDP: audio=%s video=%s", remote.get('audio'), remote.get('video'))
-        await media.setup_media(remote, _local_crypto_key, _local_video_crypto_key)
+        await media.setup_media(remote)
 
     pending_incoming["active"] = False
     await broadcast("call_started", "Call established")
@@ -1149,39 +1100,57 @@ async def handle_incoming_cancel(raw):
 
 
 async def request_processor():
+    """Dispatch inbound SIP requests forever.
+
+    Every iteration is isolated. MESSAGE and INFO are answered inline,
+    and `send` raises when the writer is closing — a panel reboot in the
+    instant an INFO is being answered used to take this loop down for
+    good, leaving the supervisor happily reconnected and the doorbell
+    silently dead until Home Assistant restarted.
+    """
     while True:
-        raw = await incoming_requests.get()
-        msg = parse_message(raw)
-        method = msg.method
-        if method == "INVITE":
-            asyncio.create_task(handle_incoming_invite(raw))
-        elif method == "CANCEL":
-            asyncio.create_task(handle_incoming_cancel(raw))
-        elif method == "BYE":
-            asyncio.create_task(handle_incoming_bye(raw))
-        elif method == "OPTIONS":
-            asyncio.create_task(handle_incoming_options(raw))
-        elif method == "MESSAGE":
-            _LOGGER.debug("SIP MESSAGE: %s", msg.body[:200])
-            await broadcast("message", msg.body[:200])
-            from_hdr = msg.headers.get("from", "")
-            to_hdr = msg.headers.get("to", "")
-            msg_cid = msg.headers.get("call-id", "")
-            msg_cseq = msg.headers.get("cseq", "1 MESSAGE")
-            await send(
-                f"SIP/2.0 200 OK\r\n"
-                f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
-                f"Call-ID: {msg_cid}\r\nCSeq: {msg_cseq}\r\n"
-                f"Content-Length: 0\r\n\r\n")
-        elif method == "INFO":
-            from_hdr = msg.headers.get("from", "")
-            to_hdr = msg.headers.get("to", "")
-            info_cid = msg.headers.get("call-id", "")
-            info_cseq = msg.headers.get("cseq", "1 INFO")
-            await send(
-                f"SIP/2.0 200 OK\r\n"
-                f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
-                f"Call-ID: {info_cid}\r\nCSeq: {info_cseq}\r\n"
-                f"Content-Length: 0\r\n\r\n")
-        elif method != "ACK":
-            _LOGGER.debug("Unhandled SIP request: %s", method)
+        try:
+            await _process_one_request()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one bad request must not end the loop
+            _LOGGER.exception("Failed to process an incoming SIP request")
+
+
+async def _process_one_request():
+    """Handle exactly one inbound SIP request."""
+    raw = await incoming_requests.get()
+    msg = parse_message(raw)
+    method = msg.method
+    if method == "INVITE":
+        asyncio.create_task(handle_incoming_invite(raw))
+    elif method == "CANCEL":
+        asyncio.create_task(handle_incoming_cancel(raw))
+    elif method == "BYE":
+        asyncio.create_task(handle_incoming_bye(raw))
+    elif method == "OPTIONS":
+        asyncio.create_task(handle_incoming_options(raw))
+    elif method == "MESSAGE":
+        _LOGGER.debug("SIP MESSAGE: %s", msg.body[:200])
+        await broadcast("message", msg.body[:200])
+        from_hdr = msg.headers.get("from", "")
+        to_hdr = msg.headers.get("to", "")
+        msg_cid = msg.headers.get("call-id", "")
+        msg_cseq = msg.headers.get("cseq", "1 MESSAGE")
+        await send(
+            f"SIP/2.0 200 OK\r\n"
+            f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+            f"Call-ID: {msg_cid}\r\nCSeq: {msg_cseq}\r\n"
+            f"Content-Length: 0\r\n\r\n")
+    elif method == "INFO":
+        from_hdr = msg.headers.get("from", "")
+        to_hdr = msg.headers.get("to", "")
+        info_cid = msg.headers.get("call-id", "")
+        info_cseq = msg.headers.get("cseq", "1 INFO")
+        await send(
+            f"SIP/2.0 200 OK\r\n"
+            f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+            f"Call-ID: {info_cid}\r\nCSeq: {info_cseq}\r\n"
+            f"Content-Length: 0\r\n\r\n")
+    elif method != "ACK":
+        _LOGGER.debug("Unhandled SIP request: %s", method)
