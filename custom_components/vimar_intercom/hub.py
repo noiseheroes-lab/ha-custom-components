@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from . import sip_client as sip
 from . import media_handler as media
-from .const import REGISTRATION_DOWN_GRACE
+from .const import DOOR_COMMAND_CURRENT, EVENT_RING, REGISTRATION_DOWN_GRACE
 from .runtime import RuntimeConfig
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,11 +35,26 @@ class VimarIntercomHub:
         self._auto_call_target: str | None = None
         self._raise_issue: Callable | None = None
         self._clear_issue: Callable | None = None
+        self._hass = None
+        self._entry_id = ""
 
     @property
     def config(self) -> RuntimeConfig:
         """Runtime configuration for this hub."""
         return self._cfg
+
+    def set_hass(self, hass, entry_id: str) -> None:
+        """Give the hub the bus it fires ring events on."""
+        self._hass = hass
+        self._entry_id = entry_id
+
+    def _panel_for(self, caller_uri: str) -> tuple[str, str]:
+        """Map an incoming caller URI to a configured panel."""
+        address = caller_uri.split("@")[0].removeprefix("sip:")
+        for panel in self._cfg.panels:
+            if panel.address == address:
+                return panel.address, panel.name
+        return address, address or "unknown"
 
     @property
     def registered(self) -> bool:
@@ -281,34 +296,49 @@ class VimarIntercomHub:
     async def async_door(
         self, target: str | None = None, command: str | None = None
     ) -> tuple[bool, str]:
-        """Open a door by sending a SIP MESSAGE to the entrance panel.
+        """Open a door, the way the Vimar app itself does.
 
-        The panel forwards the command to its own relay, so no active
-        call is required.
+        Three cases:
+
+        - An explicit target: OPEN_CURRENT to that panel, for plants with
+          more than one entrance.
+        - During a call: OPEN_CURRENT to the door relay group, which opens
+          the relay of whichever panel is calling.
+        - Otherwise: the configured door command, OPEN_2F by default, to
+          the door relay group — the main entrance.
+
+        The relay group comes from the QR, so the common case needs no
+        configuration.
         """
-        address = target or self._cfg.default_panel.address
-        uri = self._cfg.panel_uri(address)
-        body = command or self._cfg.door_command
+        if target:
+            uri = self._cfg.panel_uri(target)
+            body = command or DOOR_COMMAND_CURRENT
+        elif sip.in_call:
+            uri = self._cfg.door_uri
+            body = command or DOOR_COMMAND_CURRENT
+        else:
+            uri = self._cfg.door_uri
+            body = command or self._cfg.door_command
 
-        _LOGGER.debug("Door command to %s (registered=%s)", address, sip.registered)
+        _LOGGER.debug("Door command %s to %s (registered=%s)", body, uri, sip.registered)
 
         ok, msg = await sip.do_system_message(
             uri, body, extra_headers={"Panda": "command"})
         if ok:
-            _LOGGER.info("Door %s opened", address)
+            _LOGGER.info("Door %s opened", uri)
             return True, msg
 
         _LOGGER.warning("Door command to %s failed (%s); re-registering and retrying",
-                        address, msg)
+                        uri, msg)
         try:
             if not await sip.do_register():
                 return False, "Re-registration failed"
             ok, msg = await sip.do_system_message(
                 uri, body, extra_headers={"Panda": "command"})
             if ok:
-                _LOGGER.info("Door %s opened on retry", address)
+                _LOGGER.info("Door %s opened on retry", uri)
             else:
-                _LOGGER.error("Door %s failed on retry: %s", address, msg)
+                _LOGGER.error("Door %s failed on retry: %s", uri, msg)
             return ok, msg
         except Exception as err:  # noqa: BLE001 - surfaced to the caller
             _LOGGER.error("Door retry error: %s", err)
@@ -352,8 +382,18 @@ class VimarIntercomHub:
                 asyncio.create_task(sip.do_decline_incoming())
                 return
 
+            address, name = self._panel_for(
+                sip.pending_incoming.get("caller_uri", ""))
+
+            if self._hass is not None:
+                self._hass.bus.async_fire(EVENT_RING, {
+                    "panel": address,
+                    "panel_name": name,
+                    "entry_id": self._entry_id,
+                })
+
             for cb in self._ring_callbacks:
                 try:
-                    cb()
+                    cb(address)
                 except Exception:
                     _LOGGER.exception("Ring callback error")

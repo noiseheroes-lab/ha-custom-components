@@ -99,6 +99,11 @@ class RuntimeConfig:
         return f"sip:{address}@{self.sip_domain}"
 
     @property
+    def door_uri(self) -> str:
+        """The door relay group, taken from the QR's GID field."""
+        return f"sip:{self.group_id}@{self.sip_domain}"
+
+    @property
     def account_uri(self) -> str:
         """SIP URI of this Home Assistant account."""
         return f"sip:{self.sip_user}@{self.sip_domain}"

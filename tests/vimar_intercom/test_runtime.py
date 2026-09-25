@@ -1,5 +1,6 @@
 """Tests for RuntimeConfig derivation."""
 
+import dataclasses
 import hashlib
 
 import pytest
@@ -72,6 +73,21 @@ def test_panel_uri_uses_the_sip_domain():
     cfg = runtime.build_runtime_config(runtime.entry_data_from_qr(QR_FIELDS), {})
     assert cfg.panel_uri("55001") == (
         "sip:55001@abcdef123456.FFFFFFFFFF.ipvdes.vimar.cloud")
+
+
+def test_door_uri_uses_the_group_id_from_the_qr():
+    cfg = runtime.build_runtime_config(runtime.entry_data_from_qr(QR_FIELDS), {})
+    assert cfg.door_uri == "sip:21@abcdef123456.FFFFFFFFFF.ipvdes.vimar.cloud"
+
+
+def test_door_uri_with_an_empty_group_id_has_no_user_part():
+    # build_runtime_config never produces an empty group_id (it falls back
+    # to DEFAULT_GROUP_ID), so this only happens if a RuntimeConfig is
+    # built directly with group_id="". door_uri does no defensive
+    # handling of its own; it renders whatever group_id holds.
+    cfg = runtime.build_runtime_config(runtime.entry_data_from_qr(QR_FIELDS), {})
+    cfg = dataclasses.replace(cfg, group_id="")
+    assert cfg.door_uri == "sip:@abcdef123456.FFFFFFFFFF.ipvdes.vimar.cloud"
 
 
 def test_default_panels_is_a_single_entry():

@@ -38,6 +38,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         partial(ir.async_delete_issue, hass, DOMAIN, ISSUE_REGISTRATION_DOWN),
     )
 
+    hub.set_hass(hass, entry.entry_id)
     await hub.async_start()
     hass.http.register_view(VimarAVStreamView(hub))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

@@ -21,30 +21,32 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Create the door lock.
+
+    One entity, addressing the relay group from the QR. That is the door
+    a Vimar system has by default, and it works without the user
+    configuring anything. Plants with a second entrance reach it through
+    the per-panel door buttons.
+    """
     hub = hass.data[DOMAIN][entry.entry_id]["hub"]
-    async_add_entities([
-        VimarIntercomLock(hub, entry.entry_id, key="lock", name="Street Gate", door_target="55001", door_command="OPEN_2F"),
-        VimarIntercomLock(hub, entry.entry_id, key="lock_2", name="Building Door", door_target="55002", door_command="OPEN_2F"),
-    ])
+    async_add_entities([VimarIntercomLock(hub, entry.entry_id)])
 
 
 class VimarIntercomLock(LockEntity):
-    """Door lock — unlock sends SIP MESSAGE to open the intercom relay.
+    """A door release, modelled as a lock.
 
-    In HomeKit this maps to a DoorLock accessory. The physical lock
-    auto-relocks after a few seconds, so we transition back to locked
-    after 5 seconds.
+    Unlocking sends the SIP door command to the panel, which pulses its
+    relay. The physical release re-locks itself after a few seconds, so
+    the entity returns to locked after the same delay.
     """
 
-    _attr_has_entity_name = False
+    _attr_has_entity_name = True
+    _attr_translation_key = "door"
     _attr_icon = "mdi:door-closed-lock"
 
-    def __init__(self, hub, entry_id: str, *, key: str, name: str, door_target: str | None, door_command: str = "OPEN_2F") -> None:
+    def __init__(self, hub, entry_id: str) -> None:
         self._hub = hub
-        self._door_target = door_target
-        self._door_command = door_command
-        self._attr_name = name
-        self._attr_unique_id = f"{entry_id}_{key}"
+        self._attr_unique_id = f"{entry_id}_lock"
         self._is_locked = True
         self._relock_task: asyncio.Task | None = None
         self._attr_device_info = DeviceInfo(
@@ -69,7 +71,7 @@ class VimarIntercomLock(LockEntity):
 
     async def async_unlock(self, **kwargs) -> None:
         """Open the door via SIP MESSAGE."""
-        ok, msg = await self._hub.async_door(target=self._door_target, command=self._door_command)
+        ok, msg = await self._hub.async_door()
         if ok:
             self._is_locked = False
             self.async_write_ha_state()

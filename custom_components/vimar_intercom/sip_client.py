@@ -1042,12 +1042,12 @@ async def handle_incoming_invite(raw):
         f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>\r\n"
         f"Content-Length: 0\r\n\r\n")
 
-    await broadcast("ring", f"Chiamata da: {caller_uri}")
+    await broadcast("ring", f"Incoming call from {caller_uri}")
 
 
 async def do_answer_incoming():
     if not pending_incoming["active"]:
-        return False, "Nessuna chiamata in arrivo"
+        return False, "No incoming call"
 
     p = pending_incoming
     sdp = build_sdp()
@@ -1076,7 +1076,7 @@ async def do_answer_incoming():
     await broadcast("call_started", "Chiamata attiva!")
     # Request keyframe for video
     await send_keyframe_request()
-    return True, "Risposto!"
+    return True, "Answered"
 
 
 async def do_decline_incoming():

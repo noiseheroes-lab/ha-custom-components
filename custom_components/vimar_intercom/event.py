@@ -24,15 +24,26 @@ async def async_setup_entry(
     async_add_entities([VimarDoorbellEvent(hub, entry.entry_id)])
 
 
-class VimarDoorbellEvent(EventEntity):
-    """Doorbell ring event — fires when an incoming SIP INVITE is received.
+def _device_info(entry_id: str) -> DeviceInfo:
+    """Device entry shared by every Vimar Intercom entity."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry_id)},
+        name="Vimar Intercom",
+        manufacturer=MANUFACTURER,
+        model=MODEL,
+    )
 
-    In HomeKit this maps to a Doorbell accessory, enabling push
-    notifications with video snapshot on Apple devices.
+
+class VimarDoorbellEvent(EventEntity):
+    """Fires when an entrance panel calls this Home Assistant.
+
+    The same ring is also published on the event bus as
+    `vimar_intercom_ring`, which is the supported integration point for
+    notifications and companion apps.
     """
 
-    _attr_has_entity_name = False
-    _attr_name = "Doorbell"
+    _attr_has_entity_name = True
+    _attr_translation_key = "doorbell"
     _attr_icon = "mdi:bell-ring"
     _attr_device_class = EventDeviceClass.DOORBELL
     _attr_event_types = ["ring"]
@@ -40,12 +51,7 @@ class VimarDoorbellEvent(EventEntity):
     def __init__(self, hub, entry_id: str) -> None:
         self._hub = hub
         self._attr_unique_id = f"{entry_id}_doorbell"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
-            name="Vimar Intercom",
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-        )
+        self._attr_device_info = _device_info(entry_id)
 
     async def async_added_to_hass(self) -> None:
         """Register ring callback when entity is added."""
@@ -56,8 +62,8 @@ class VimarDoorbellEvent(EventEntity):
         self._hub.unregister_ring_callback(self._handle_ring)
 
     @callback
-    def _handle_ring(self) -> None:
-        """Handle incoming SIP INVITE (doorbell ring)."""
-        self._trigger_event("ring")
+    def _handle_ring(self, panel: str) -> None:
+        """Record the ring, tagged with the panel that called."""
+        self._trigger_event("ring", {"panel": panel})
         self.async_write_ha_state()
-        _LOGGER.info("Doorbell ring detected")
+        _LOGGER.info("Doorbell ring from panel %s", panel)
