@@ -72,8 +72,8 @@ def sip_stub(monkeypatch):
         calls.append("answer")
         return True, "Answered"
 
-    async def _do_decline():
-        calls.append("decline")
+    async def _do_decline(busy=False):
+        calls.append("decline:486" if busy else "decline:603")
 
     async def _do_hangup():
         calls.append("hangup")
@@ -157,7 +157,7 @@ def test_a_real_ring_survives_a_stream_that_timed_out(sip_stub):
 
     run(scenario())
 
-    assert "decline" not in sip_stub
+    assert not any(c.startswith("decline") for c in sip_stub)
     assert hass.bus.events == [
         ("vimar_intercom_ring",
          {"panel": "55001", "panel_name": "Front Door",
@@ -303,19 +303,197 @@ def test_the_door_asks_for_a_reconnect_instead_of_re_registering(
     assert "reconnect" in msg.lower()
 
 
-def test_the_door_retries_once_while_still_registered(sip_stub, monkeypatch):
-    attempts = []
+def _record_door(monkeypatch, results=None):
+    """Record the exact (uri, body) of every door command sent.
 
-    async def _flaky(uri, body, extra_headers=None):
-        attempts.append(uri)
-        return len(attempts) > 1, "OK" if len(attempts) > 1 else "Timed out"
+    The old door tests captured the URI and then asserted only how many
+    attempts there were, or stubbed `do_system_message` away entirely.
+    Either way the three branches of `async_door` could be swapped for
+    each other and the suite stayed green — for the one function in this
+    integration that opens a door.
+    """
+    attempts: list[tuple[str, str]] = []
+    outcomes = list(results or [(True, "OK (200)")])
 
-    monkeypatch.setattr(sip, "do_system_message", _flaky)
+    async def _send(uri, body, extra_headers=None):
+        attempts.append((uri, body))
+        return outcomes.pop(0) if outcomes else (True, "OK (200)")
+
+    monkeypatch.setattr(sip, "do_system_message", _send)
+    return attempts
+
+
+DOOR_GROUP_URI = "sip:21@example.invalid"
+
+
+def test_the_door_of_an_explicit_panel_gets_open_current(
+        sip_stub, monkeypatch):
+    """The per-panel button, for a plant with more than one entrance."""
+    attempts = _record_door(monkeypatch)
+
+    ok, _ = run(_hub().async_door(target="55002"))
+
+    assert ok is True
+    assert attempts == [("sip:55002@example.invalid", "OPEN_CURRENT")]
+
+
+def test_the_door_during_a_call_gets_open_current_on_the_relay_group(
+        sip_stub, monkeypatch):
+    """OPEN_CURRENT opens the relay of whichever panel is calling."""
+    attempts = _record_door(monkeypatch)
+    monkeypatch.setattr(sip, "in_call", True)
 
     ok, _ = run(_hub().async_door())
+
     assert ok is True
-    assert len(attempts) == 2
+    assert attempts == [(DOOR_GROUP_URI, "OPEN_CURRENT")]
+
+
+def test_the_door_outside_a_call_gets_the_configured_command(
+        sip_stub, monkeypatch):
+    """No call, no target: the main entrance, with the configured command."""
+    attempts = _record_door(monkeypatch)
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(QR_FIELDS),
+        {"panels": "55001:Front Door", "door_command": "OPEN_1F"})
+
+    ok, _ = run(hub.VimarIntercomHub(cfg).async_door())
+
+    assert ok is True
+    assert attempts == [(DOOR_GROUP_URI, "OPEN_1F")]
+
+
+def test_the_door_retries_once_on_an_explicit_rejection(
+        sip_stub, monkeypatch):
+    """A response that says the command was refused is safe to resend."""
+    attempts = _record_door(
+        monkeypatch, [(False, "Rejected with 500"), (True, "OK (200)")])
+
+    ok, _ = run(_hub().async_door())
+
+    assert ok is True
+    assert attempts == [(DOOR_GROUP_URI, "OPEN_2F"),
+                        (DOOR_GROUP_URI, "OPEN_2F")]
     assert "register" not in sip_stub
+
+
+def test_a_door_command_that_got_no_reply_is_never_resent(
+        sip_stub, monkeypatch):
+    """A MESSAGE whose 200 OK was lost looks exactly like one that never
+    arrived. Resending it pulses the relay a second time: the door
+    opens, closes and opens again, the second time unattended."""
+    attempts = _record_door(monkeypatch, [(False, sip.NO_RESPONSE)])
+
+    ok, msg = run(_hub().async_door())
+
+    assert ok is False
+    assert len(attempts) == 1
+    assert "may have opened" in msg
+
+
+def test_the_retry_re_resolves_the_target_when_the_call_ended(
+        sip_stub, monkeypatch):
+    """The first attempt can take 30 s, and the call may not survive it.
+
+    Choosing the branch once and reusing it sent OPEN_CURRENT to the
+    relay group with no current call at all.
+    """
+    attempts: list[tuple[str, str]] = []
+    outcomes = [(False, "Rejected with 500"), (True, "OK (200)")]
+
+    async def _send(uri, body, extra_headers=None):
+        attempts.append((uri, body))
+        # The call ends while the first attempt is in flight.
+        sip.in_call = False
+        return outcomes.pop(0)
+
+    monkeypatch.setattr(sip, "do_system_message", _send)
+    monkeypatch.setattr(sip, "in_call", True)
+
+    ok, _ = run(_hub().async_door())
+
+    assert ok is True
+    assert attempts == [(DOOR_GROUP_URI, "OPEN_CURRENT"),
+                        (DOOR_GROUP_URI, "OPEN_2F")]
+
+
+# ─── a real ring during a call is declined, but still announced ──────
+
+def test_a_real_ring_during_a_call_still_fires_the_event(sip_stub, monkeypatch):
+    """One call at a time is real; a silent visitor is not acceptable.
+
+    `vimar_intercom_ring` is the only signal a notification bridge has,
+    so a visitor arriving during a call — or during the up-to-45 s
+    window where `calling` is set — used to be completely invisible.
+    """
+    h = _hub()
+    hass = FakeHass()
+    h.set_hass(hass, "entry123")
+    monkeypatch.setattr(sip, "in_call", True)
+    # The call up is one we answered, not one we placed.
+    sip.pending_incoming.update(
+        active=True, caller_uri="sip:55002@example.invalid")
+
+    run(h._handle_broadcast("ring", "Incoming call"))
+
+    # Declined, because there is only one line — but with 486 Busy Here,
+    # which leaves the rest of the plant ringing.
+    assert sip_stub == ["decline:486"]
+    assert hass.bus.events == [
+        ("vimar_intercom_ring",
+         {"panel": "55002", "panel_name": "Garage",
+          "entry_id": "entry123"}),
+    ]
+
+
+def test_the_ring_callbacks_also_run_for_a_ring_during_a_call(
+        sip_stub, monkeypatch):
+    h = _hub()
+    seen: list[str] = []
+    h.register_ring_callback(seen.append)
+    monkeypatch.setattr(sip, "in_call", True)
+    sip.pending_incoming.update(
+        active=True, caller_uri="sip:55001@example.invalid")
+
+    run(h._handle_broadcast("ring", "Incoming call"))
+
+    assert seen == ["55001"]
+
+
+def test_the_pbx_echoing_our_own_call_fires_nothing(sip_stub, monkeypatch):
+    """After we INVITE a panel the PBX INVITEs us back. Not a doorbell."""
+    h = _hub()
+    hass = FakeHass()
+    h.set_hass(hass, "entry123")
+    h._auto_called = True
+    h._auto_call_target = "55002"
+    monkeypatch.setattr(sip, "calling", True)
+    sip.pending_incoming.update(
+        active=True, caller_uri="sip:55002@example.invalid")
+
+    run(h._handle_broadcast("ring", "Incoming call"))
+
+    # Silent, and declined with 603: we already have that call.
+    assert sip_stub == ["decline:603"]
+    assert hass.bus.events == []
+
+
+def test_the_echo_of_a_call_placed_with_no_explicit_target_is_silent(
+        sip_stub, monkeypatch):
+    """`do_call()` records the default panel in `call_state` only."""
+    h = _hub()
+    hass = FakeHass()
+    h.set_hass(hass, "entry123")
+    h._auto_called = True
+    monkeypatch.setattr(sip, "calling", True)
+    sip.call_state["original_target"] = "sip:55001@example.invalid"
+    sip.pending_incoming.update(
+        active=True, caller_uri="sip:55001@example.invalid")
+
+    run(h._handle_broadcast("ring", "Incoming call"))
+
+    assert sip_stub == ["decline:603"]
+    assert hass.bus.events == []
 
 
 # ─── teardown ────────────────────────────────────────────────────────

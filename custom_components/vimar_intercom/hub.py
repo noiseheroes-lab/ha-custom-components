@@ -63,6 +63,36 @@ class VimarIntercomHub:
                 return panel.address, panel.name
         return address, address or "unknown"
 
+    @staticmethod
+    def _extension_of(uri: str) -> str:
+        """The SIP extension in a URI, ignoring scheme, domain and port."""
+        return uri.split("@")[0].removeprefix("sip:").strip()
+
+    def _is_echo_of_our_call(self, caller_uri: str) -> bool:
+        """True when this INVITE is the PBX calling us back for our call.
+
+        After this client places a call the PBX INVITEs it back, and that
+        arrives looking exactly like a doorbell press. The one thing that
+        separates them is who is calling: the echo comes from the panel
+        we dialled, which `_auto_call_target` (an extension) and
+        `call_state["original_target"]` (a URI) both record. Anything
+        else ringing while a call is up is a real visitor.
+
+        A call this hub answered rather than placed has neither recorded,
+        so nothing is treated as its echo — which is right: we never sent
+        an INVITE for the PBX to reflect.
+        """
+        caller = self._extension_of(caller_uri)
+        if not caller:
+            return False
+        ours = {
+            self._extension_of(uri)
+            for uri in (self._auto_call_target,
+                        sip.call_state.get("original_target"))
+            if uri
+        }
+        return caller in ours
+
     @property
     def registered(self) -> bool:
         return sip.is_registered()
@@ -148,29 +178,43 @@ class VimarIntercomHub:
         self._auto_call_target = None
 
     async def stream_opened(self, target: str | None = None):
+        """Count a viewer, and place the call it needs.
+
+        The count is incremented first and given back on any failure. It
+        has to go up before the `_auto_called` guard below, and the whole
+        of the rest of this may raise — a cancellation, or `_track`
+        failing — so without the rollback the hub would keep counting a
+        viewer that never arrived, and never hang up the call it placed
+        for it. The caller must not call `stream_closed` for a
+        `stream_opened` that raised.
+        """
         self._stream_viewers += 1
-        _LOGGER.debug("Stream opened (%d viewers)", self._stream_viewers)
+        try:
+            _LOGGER.debug("Stream opened (%d viewers)", self._stream_viewers)
 
-        if self._hangup_task:
-            self._hangup_task.cancel()
-            self._hangup_task = None
+            if self._hangup_task:
+                self._hangup_task.cancel()
+                self._hangup_task = None
 
-        # `_auto_called` is part of the guard, not just a record: it is
-        # set synchronously here, before any await, so a second viewer
-        # arriving before the first auto-call task has even run sees a
-        # call is already being placed. Without it both viewers call
-        # `do_call`, the loser gets "Already in a call" and clears the
-        # flag mid-call, and the echo INVITE becomes a phantom ring.
-        if sip.in_call or sip.calling or self._auto_called:
-            return
+            # `_auto_called` is part of the guard, not just a record: it is
+            # set synchronously here, before any await, so a second viewer
+            # arriving before the first auto-call task has even run sees a
+            # call is already being placed. Without it both viewers call
+            # `do_call`, the loser gets "Already in a call" and clears the
+            # flag mid-call, and the echo INVITE becomes a phantom ring.
+            if sip.in_call or sip.calling or self._auto_called:
+                return
 
-        if not sip.is_registered():
-            return
+            if not sip.is_registered():
+                return
 
-        self._auto_called = True
-        self._auto_call_target = target
-        # Fire in the background — don't block the HTTP response.
-        self._track(self._do_auto_call(target))
+            self._auto_called = True
+            self._auto_call_target = target
+            # Fire in the background — don't block the HTTP response.
+            self._track(self._do_auto_call(target))
+        except BaseException:
+            self._stream_viewers = max(0, self._stream_viewers - 1)
+            raise
 
     async def _do_auto_call(self, target: str | None):
         """Answer or place the call a newly opened stream needs.
@@ -415,10 +459,10 @@ class VimarIntercomHub:
         self._cancel_call_timeout()
         await sip.do_hangup()
 
-    async def async_door(
-        self, target: str | None = None, command: str | None = None
-    ) -> tuple[bool, str]:
-        """Open a door, the way the Vimar app itself does.
+    def _door_target(
+        self, target: str | None, command: str | None
+    ) -> tuple[str, str]:
+        """Resolve the door command to one (URI, body) pair, right now.
 
         Three cases:
 
@@ -431,17 +475,27 @@ class VimarIntercomHub:
 
         The relay group comes from the QR, so the common case needs no
         configuration.
+
+        This is deliberately a single cheap snapshot with no await in it.
+        Choosing the branch and then awaiting a challenge/response round
+        trip of up to 30 s before the next send used to mean the call
+        could end in between — `OPEN_CURRENT` then went to the relay
+        group with no current call — or start, sending the configured
+        command to the main entrance while the user was talking to a side
+        gate. Each attempt now takes its own snapshot immediately before
+        it sends.
         """
         if target:
-            uri = self._cfg.panel_uri(target)
-            body = command or DOOR_COMMAND_CURRENT
-        elif sip.in_call:
-            uri = self._cfg.door_uri
-            body = command or DOOR_COMMAND_CURRENT
-        else:
-            uri = self._cfg.door_uri
-            body = command or self._cfg.door_command
+            return self._cfg.panel_uri(target), command or DOOR_COMMAND_CURRENT
+        if sip.in_call:
+            return self._cfg.door_uri, command or DOOR_COMMAND_CURRENT
+        return self._cfg.door_uri, command or self._cfg.door_command
 
+    async def async_door(
+        self, target: str | None = None, command: str | None = None
+    ) -> tuple[bool, str]:
+        """Open a door. See `_door_target` for which one, and with what."""
+        uri, body = self._door_target(target, command)
         _LOGGER.debug("Door command %s to %s (registered=%s)", body, uri, sip.is_registered())
 
         ok, msg = await sip.do_system_message(
@@ -461,8 +515,23 @@ class VimarIntercomHub:
             return False, ("Not connected to the intercom. A reconnect has "
                            "been requested; try again in a few seconds.")
 
+        if msg == sip.NO_RESPONSE:
+            # Nothing came back, which does not mean nothing happened.
+            # A MESSAGE that reached the panel and whose 200 OK was lost
+            # looks exactly like one that never arrived, and resending it
+            # pulses the relay a second time: the door opens, closes and
+            # opens again, with the second opening unattended. Only an
+            # explicit failure response says the command was not carried
+            # out, so only that is retried.
+            _LOGGER.warning(
+                "Door command to %s got no response; not retrying, because "
+                "the panel may have opened the door already", uri)
+            return False, ("No reply from the intercom. The door may have "
+                           "opened anyway; check before trying again.")
+
         _LOGGER.warning("Door command to %s failed (%s); retrying once", uri, msg)
         try:
+            uri, body = self._door_target(target, command)
             ok, msg = await sip.do_system_message(
                 uri, body, extra_headers={"Panda": "command"})
             if ok:
@@ -490,18 +559,36 @@ class VimarIntercomHub:
             self._clear_auto_call()
 
         if msg_type == "ring":
+            caller_uri = sip.pending_incoming.get("caller_uri", "")
+            busy = self._auto_called or sip.in_call or sip.calling
+
             # When we placed the call ourselves the panel INVITEs us back.
-            # That is the PBX echoing our own call, not a doorbell press.
-            if self._auto_called or sip.in_call or sip.calling:
+            # That is the PBX echoing our own call, not a doorbell press,
+            # and it must stay completely silent.
+            if busy and self._is_echo_of_our_call(caller_uri):
                 _LOGGER.debug(
-                    "Suppressing ring: call initiated locally "
-                    "(auto_called=%s, in_call=%s, calling=%s)",
+                    "Suppressing ring: the PBX is echoing the call this hub "
+                    "placed (auto_called=%s, in_call=%s, calling=%s)",
                     self._auto_called, sip.in_call, sip.calling)
                 self._track(sip.do_decline_incoming())
                 return
 
-            address, name = self._panel_for(
-                sip.pending_incoming.get("caller_uri", ""))
+            if busy:
+                # A real visitor, while a call is already up or being set
+                # up. One call at a time is a genuine constraint of this
+                # design, so the INVITE is still declined — with 486 Busy
+                # Here rather than 603, which would also stop the indoor
+                # unit ringing. But the doorbell did ring, and
+                # `vimar_intercom_ring` is the only signal a notification
+                # bridge has: firing nothing made every visitor arriving
+                # during a call, or during the up-to-45 s setup window,
+                # completely invisible.
+                _LOGGER.info(
+                    "Declining a doorbell press that arrived during a call; "
+                    "the ring event still fires")
+                self._track(sip.do_decline_incoming(busy=True))
+
+            address, name = self._panel_for(caller_uri)
 
             if self._hass is not None:
                 self._hass.bus.async_fire(EVENT_RING, {
