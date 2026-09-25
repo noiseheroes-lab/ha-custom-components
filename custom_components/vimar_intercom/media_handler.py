@@ -154,6 +154,18 @@ NAL_TYPE_IDR = 5
 NAL_TYPE_SPS = 7
 NAL_TYPE_PPS = 8
 
+# Per-consumer backlog cap, in bytes, for a consumer whose write stalls
+# transiently (e.g. ffmpeg under CPU contention on the reference fanless
+# two-core 7 W box, or a hiccup on its own output). On the reference
+# hardware the kernel pipe buffer is only tens of KB, so a hiccup lasting
+# a fraction of a second is enough to fill it and turn a write into
+# BlockingIOError; without a backlog the consumer would be dropped for
+# the rest of the call over a stall it would otherwise have recovered
+# from in milliseconds. Assuming a doorbell-camera-class H.264 stream at
+# roughly 1 Mbps at the high end (~128 KB/s), 256 KB buys about 2 seconds
+# of catch-up before giving up and dropping the consumer for good.
+MAX_CONSUMER_BACKLOG_BYTES = 256 * 1024
+
 
 class VideoStreamRegistry:
     """Fan H.264 NAL units out to consumers, replaying parameter sets.
@@ -175,6 +187,9 @@ class VideoStreamRegistry:
         self._pps: bytes | None = None
         self._pending_idr: bytes | None = None
         self._started = False
+        # consumer -> bytes still owed to it after a BlockingIOError.
+        # Capped at MAX_CONSUMER_BACKLOG_BYTES; see that constant.
+        self._backlog: dict = {}
 
     @property
     def parameter_sets(self) -> tuple[bytes, bytes] | None:
@@ -195,10 +210,12 @@ class VideoStreamRegistry:
         """Stop sending to a consumer."""
         if consumer in self._consumers:
             self._consumers.remove(consumer)
+        self._backlog.pop(consumer, None)
 
     def reset(self) -> None:
         """Forget consumers and cached state, e.g. when a call ends."""
         self._consumers.clear()
+        self._backlog.clear()
         self._sps = None
         self._pps = None
         self._pending_idr = None
@@ -260,20 +277,52 @@ class VideoStreamRegistry:
             self._send_one(consumer, nal)
 
     def _send_one(self, consumer, nal: bytes) -> None:
-        """Send to one consumer; drop it if the sink has gone away."""
+        """Send one NAL (as Annex-B) to a consumer, honoring its backlog.
+
+        A consumer with backlogged bytes never gets new data ahead of
+        them — the pending bytes and the new NAL are written as one
+        chunk, in that order, so a slow consumer's stream is never
+        reordered. `BlockingIOError` means the write is only transient
+        (a non-blocking pipe that could not accept everything right
+        now): whatever did not go out is kept, up to
+        `MAX_CONSUMER_BACKLOG_BYTES`, and retried on the next call. Any
+        other exception means the sink is genuinely gone and is dropped
+        immediately.
+        """
+        data = ANNEX_B_START + nal
+        backlog = self._backlog.get(consumer)
+        pending = backlog + data if backlog else data
         try:
-            consumer(ANNEX_B_START + nal)
+            consumer(pending)
+        except BlockingIOError as exc:
+            # A well-behaved consumer sets `characters_written` to report
+            # a partial write (as `_make_ffmpeg_consumer` does); one that
+            # doesn't is assumed to have written nothing, so the whole
+            # chunk is kept and retried.
+            written = getattr(exc, "characters_written", None) or 0
+            remainder = pending[written:]
+            if len(remainder) > MAX_CONSUMER_BACKLOG_BYTES:
+                self._drop_consumer(consumer, "its output could not keep up with the stream")
+            else:
+                self._backlog[consumer] = remainder
         except Exception:  # noqa: BLE001 - a dead sink must not stop the rest
-            _LOGGER.debug("Dropping a video consumer that stopped accepting data")
-            self.remove_consumer(consumer)
+            self._drop_consumer(consumer, "it stopped accepting data")
+        else:
+            self._backlog.pop(consumer, None)
+
+    def _drop_consumer(self, consumer, reason: str) -> None:
+        """Remove a consumer for good and say why, once, not per NAL."""
+        self.remove_consumer(consumer)
+        _LOGGER.warning("Dropping a video consumer: %s", reason)
 
 
 video_registry = VideoStreamRegistry()
 
 
 class RTPVideoProtocol(asyncio.DatagramProtocol):
-    """Video SRTP: decrypt → depacketize RTP H.264 → send NALs via WebSocket.
-    No ffmpeg — direct pipeline like the official Vimar app."""
+    """Video SRTP: decrypt → depacketize RTP H.264 → hand complete NAL
+    units to the video registry, which fans them out to consumers. The
+    one consumer wired up today is the ffmpeg AV pipeline (its stdin)."""
 
     REORDER_BUF_SIZE = 5  # Hold up to 5 packets for reordering (~30ms at 15fps)
 
@@ -293,7 +342,6 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         self._srtp_fail = 0
         self._srtp_ok = 0
         self._nal_count = 0
-        self._nal_types = {}  # type -> count
 
     def connection_made(self, transport):
         self.transport = transport
@@ -321,9 +369,9 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         if self.pkt_count == 1:
             _LOGGER.debug("First video RTP from %s (%dB)", addr, len(rtp))
         if self.pkt_count <= 3 or self.pkt_count % 200 == 0:
-            _LOGGER.debug("Video pkt #%d: %dB, srtp_ok=%d fail=%d nals=%d types=%s",
+            _LOGGER.debug("Video pkt #%d: %dB, srtp_ok=%d fail=%d nals=%d",
                          self.pkt_count, len(rtp), self._srtp_ok, self._srtp_fail,
-                         self._nal_count, self._nal_types)
+                         self._nal_count)
 
         # Parse RTP header
         cc = rtp[0] & 0x0F
@@ -525,7 +573,6 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         video_proto._srtp_fail = 0
         video_proto._srtp_ok = 0
         video_proto._nal_count = 0
-        video_proto._nal_types = {}
         if remote_video_key:
             video_proto.srtp_rx = SRTPContext(remote_video_key)
             _LOGGER.debug("SRTP Video RX — direct H.264 depacketization (no ffmpeg)")
@@ -652,12 +699,29 @@ async def start_av_ffmpeg():
 
 
 def _make_ffmpeg_consumer(proc):
-    """Return a consumer that writes Annex-B NALs into ffmpeg's stdin."""
+    """Return a consumer that writes Annex-B NALs into ffmpeg's stdin.
+
+    Writes go straight to the pipe's file descriptor with `os.write`
+    rather than through the buffered file object's `.write()`, which
+    would silently re-buffer a short write inside Python's io stack and
+    hide exactly how much got through — the registry's backlog needs
+    that exact count to avoid duplicating or dropping bytes. ffmpeg's
+    stdin is put in non-blocking mode in `start_av_ffmpeg`, so a stall
+    surfaces here as `BlockingIOError` (full pipe, nothing written) or
+    as a short write (some bytes accepted, the rest reported back to
+    the registry via `.characters_written`).
+    """
     def _write(data: bytes) -> None:
         if proc.poll() is not None or proc.stdin is None:
             raise BrokenPipeError("ffmpeg has exited")
-        proc.stdin.write(data)
-        proc.stdin.flush()
+        try:
+            written = os.write(proc.stdin.fileno(), data)
+        except BlockingIOError:
+            written = 0
+        if written < len(data):
+            err = BlockingIOError()
+            err.characters_written = written
+            raise err
     return _write
 
 

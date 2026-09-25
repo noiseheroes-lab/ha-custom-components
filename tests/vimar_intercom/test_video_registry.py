@@ -2,6 +2,7 @@
 
 from custom_components.vimar_intercom.media_handler import (
     ANNEX_B_START,
+    MAX_CONSUMER_BACKLOG_BYTES,
     VideoStreamRegistry,
 )
 
@@ -145,6 +146,15 @@ def test_reset_clears_the_cache_and_the_consumers():
     registry.push_nal(SLICE)
     assert received == []
 
+    # A slice alone proves nothing about consumer clearing on its own --
+    # _started is also cleared by reset() and the slice-drop path checks
+    # that independently. Push a full, valid SPS/PPS/IDR sequence too: if
+    # reset() had not removed the consumer, this would reach it.
+    registry.push_nal(SPS)
+    registry.push_nal(PPS)
+    registry.push_nal(IDR)
+    assert received == []
+
 
 def test_parameter_sets_property_reports_the_cached_pair():
     registry = VideoStreamRegistry()
@@ -161,3 +171,79 @@ def test_empty_nals_are_ignored():
     registry.add_consumer(sink)
     registry.push_nal(b"")
     assert received == []
+
+
+def test_a_transiently_blocking_consumer_gets_everything_once_it_recovers():
+    """A consumer that raises BlockingIOError must not be dropped, and
+    must receive every backlogged byte, in order, once it recovers."""
+    registry = VideoStreamRegistry()
+    received = bytearray()
+    blocking = {"on": True}
+
+    def flaky(data: bytes) -> None:
+        if blocking["on"]:
+            err = BlockingIOError()
+            err.characters_written = 0
+            raise err
+        received.extend(data)
+
+    registry.add_consumer(flaky)
+    registry.push_nal(IDR)   # held: no parameter sets cached yet
+    registry.push_nal(SPS)   # still held: PPS missing
+    registry.push_nal(PPS)   # flushes SPS, PPS, IDR -- all get backlogged
+    assert bytes(received) == b""
+
+    blocking["on"] = False
+    registry.push_nal(SLICE)  # drains the backlog, then the new slice
+    assert bytes(received) == b"".join(annex_b(SPS, PPS, IDR, SLICE))
+
+
+def test_a_consumer_that_never_accepts_is_dropped_once_the_cap_is_exceeded():
+    """A consumer stuck in BlockingIOError forever is kept only while its
+    backlog fits the cap; a chunk that blows through it drops the
+    consumer for good."""
+    registry = VideoStreamRegistry()
+    calls = []
+
+    def refuses(data: bytes) -> None:
+        calls.append(len(data))
+        err = BlockingIOError()
+        err.characters_written = 0
+        raise err
+
+    registry.add_consumer(refuses)
+    registry.push_nal(SPS)
+    registry.push_nal(PPS)
+    registry.push_nal(IDR)  # started; backlog still tiny, well under cap
+
+    oversized_slice = SLICE[:1] + bytes(MAX_CONSUMER_BACKLOG_BYTES)
+    registry.push_nal(oversized_slice)  # blows straight through the cap
+    calls_after_drop = len(calls)
+
+    registry.push_nal(SLICE)  # a dropped consumer must not be called again
+    assert len(calls) == calls_after_drop
+
+
+def test_a_partial_write_is_completed_on_the_next_push():
+    """write() accepting some bytes and not the rest must not corrupt or
+    lose data -- the remainder is retried, in order, on the next push."""
+    registry = VideoStreamRegistry()
+    received = bytearray()
+    first_call_done = {"yes": False}
+
+    def half_writer(data: bytes) -> None:
+        if not first_call_done["yes"]:
+            first_call_done["yes"] = True
+            n = 2
+            received.extend(data[:n])
+            err = BlockingIOError()
+            err.characters_written = n
+            raise err
+        received.extend(data)
+
+    registry.add_consumer(half_writer)
+    registry.push_nal(SPS)
+    registry.push_nal(PPS)
+    registry.push_nal(IDR)
+
+    assert bytes(received) == b"".join(annex_b(SPS, PPS, IDR))

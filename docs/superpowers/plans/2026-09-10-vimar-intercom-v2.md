@@ -3700,6 +3700,15 @@ def test_reset_clears_the_cache_and_the_consumers():
     registry.push_nal(SLICE)
     assert received == []
 
+    # A slice alone proves nothing about consumer clearing on its own --
+    # _started is also cleared by reset() and the slice-drop path checks
+    # that independently. Push a full, valid SPS/PPS/IDR sequence too: if
+    # reset() had not removed the consumer, this would reach it.
+    registry.push_nal(SPS)
+    registry.push_nal(PPS)
+    registry.push_nal(IDR)
+    assert received == []
+
 
 def test_parameter_sets_property_reports_the_cached_pair():
     registry = VideoStreamRegistry()
