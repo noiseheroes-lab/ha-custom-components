@@ -1,9 +1,8 @@
-"""Vimar Intercom — Media: RTP transport, STUN, G.711 codec, video capture, audio."""
+"""Vimar Intercom — Media: RTP/SRTP transport, STUN, H.264 depacketisation, AV pipeline."""
 
 import asyncio
 import logging
 import os
-import random
 import socket
 import struct
 import subprocess
@@ -39,53 +38,29 @@ async def broadcast(msg_type, msg):
         await _broadcast(msg_type, msg)
 
 
-# ─── G.711 μ-law codec ──────────────────────────────────────────────
-
-def _build_ulaw_decode_table():
-    table = []
-    for byte_val in range(256):
-        b = ~byte_val & 0xFF
-        sign = b & 0x80
-        exponent = (b >> 4) & 0x07
-        mantissa = b & 0x0F
-        sample = ((mantissa << 3) + 0x84) << exponent
-        sample -= 0x84
-        table.append(-sample if sign else sample)
-    return table
-
-_ULAW_DECODE = _build_ulaw_decode_table()
-
-
-def ulaw_decode(data: bytes) -> bytes:
-    """μ-law bytes → 16-bit signed LE PCM."""
-    pcm = bytearray(len(data) * 2)
-    for i, b in enumerate(data):
-        struct.pack_into('<h', pcm, i * 2, _ULAW_DECODE[b])
-    return bytes(pcm)
-
-
 # ─── RTP Protocols ──────────────────────────────────────────────────
 
 class RTPAudioProtocol(asyncio.DatagramProtocol):
-    """Audio SRTP: receive SRTP PCMU → decrypt → decode → buffer. Send as SRTP.
-    Also forwards decrypted RTP to a secondary port for AV ffmpeg."""
+    """Audio SRTP: decrypt, then forward the plain RTP to the AV ffmpeg port.
+
+    Nothing on the receive path logs. `datagram_received` runs 50 times a
+    second for the whole of a call, and a log statement there — at any
+    level — is what produced the million-line log this rewrite was
+    promised to fix. Everything worth knowing is counted here and
+    reported once per call by `stop_media`.
+    """
 
     def __init__(self):
         self.transport = None
         self.remote_addr = None
-        self.audio_buffer = asyncio.Queue(maxsize=200)
-        self.rtp_seq = random.randint(0, 65535)
-        self.rtp_ts = random.randint(0, 2**32 - 1)
-        self.rtp_ssrc = random.randint(0, 2**32 - 1)
         self.pkt_count = 0
+        self.srtp_fail = 0
         self.srtp_rx: SRTPContext | None = None
-        self.srtp_tx: SRTPContext | None = None
-        # Forward raw RTP to AV ffmpeg
+        # Forward decrypted RTP to the local port ffmpeg reads audio from.
         self.ffmpeg_av_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def connection_made(self, transport):
         self.transport = transport
-        _LOGGER.debug("RTP Audio ready on :%d", CFG.rtp_audio_port)
 
     def datagram_received(self, data, addr):
         if len(data) < 4:
@@ -99,8 +74,7 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         if self.srtp_rx:
             rtp = self.srtp_rx.unprotect(data)
             if rtp is None:
-                if self.pkt_count == 0:
-                    _LOGGER.warning("SRTP audio auth failed from %s (%dB)", addr, len(data))
+                self.srtp_fail += 1
                 return
         else:
             rtp = data
@@ -113,38 +87,24 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
             return
         # Forward decrypted RTP to AV ffmpeg port
         self.ffmpeg_av_sock.sendto(rtp, ('127.0.0.1', CFG.av_audio_port))
-        payload = rtp[hlen:]
         self.pkt_count += 1
-        if self.pkt_count == 1:
-            _LOGGER.debug("First SRTP audio from %s (%dB)", addr, len(payload))
-        pcm = ulaw_decode(payload)
-        try:
-            self.audio_buffer.put_nowait(pcm)
-        except asyncio.QueueFull:
-            try:
-                self.audio_buffer.get_nowait()
-                self.audio_buffer.put_nowait(pcm)
-            except Exception:
-                pass
 
-    def send_rtp(self, ulaw_payload: bytes):
-        if not self.transport or not self.remote_addr:
-            return
-        self.rtp_seq = (self.rtp_seq + 1) & 0xFFFF
-        self.rtp_ts = (self.rtp_ts + len(ulaw_payload)) & 0xFFFFFFFF
-        header = struct.pack('!BBHII',
-            0x80, 0, self.rtp_seq, self.rtp_ts, self.rtp_ssrc)
-        rtp = header + ulaw_payload
-        if self.srtp_tx:
-            rtp = self.srtp_tx.protect(rtp)
-        self.transport.sendto(rtp, self.remote_addr)
+    def stats(self) -> str:
+        """One-line summary of what this protocol saw during the call."""
+        return f"audio pkts={self.pkt_count} srtp_fail={self.srtp_fail}"
+
+    def close(self) -> None:
+        """Release the forwarding socket."""
+        try:
+            self.ffmpeg_av_sock.close()
+        except OSError:
+            pass
 
     def send_stun(self):
         if not self.transport or not self.remote_addr:
             return
         stun = struct.pack('!HHI', 0x0001, 0, 0x2112A442) + os.urandom(12)
         self.transport.sendto(stun, self.remote_addr)
-        _LOGGER.debug("STUN Audio → %s", self.remote_addr)
 
 
 ANNEX_B_START = b"\x00\x00\x00\x01"
@@ -187,6 +147,7 @@ class VideoStreamRegistry:
         self._pps: bytes | None = None
         self._pending_idr: bytes | None = None
         self._started = False
+        self._last_keyframe: bytes | None = None
         # consumer -> bytes still owed to it after a BlockingIOError.
         # Capped at MAX_CONSUMER_BACKLOG_BYTES; see that constant.
         self._backlog: dict = {}
@@ -197,6 +158,17 @@ class VideoStreamRegistry:
         if self._sps is None or self._pps is None:
             return None
         return self._sps, self._pps
+
+    @property
+    def last_keyframe(self) -> bytes | None:
+        """The most recent decodable keyframe, as an Annex-B byte string.
+
+        SPS, PPS and the IDR they describe, concatenated — everything a
+        decoder needs to produce one picture and nothing else. The
+        camera entity turns this into a still, which is why a snapshot
+        never has to open a stream or place a call of its own.
+        """
+        return self._last_keyframe
 
     def add_consumer(self, consumer) -> None:
         """Register a consumer and prime it with the parameter sets."""
@@ -220,6 +192,7 @@ class VideoStreamRegistry:
         self._pps = None
         self._pending_idr = None
         self._started = False
+        self._last_keyframe = None
 
     def push_nal(self, nal: bytes) -> None:
         """Feed one complete NAL unit into the stream."""
@@ -242,6 +215,7 @@ class VideoStreamRegistry:
             if self.parameter_sets is None:
                 self._pending_idr = nal
                 return
+            self._cache_keyframe(nal)
             self._broadcast_parameter_sets()
             self._started = True
             self._broadcast(nal)
@@ -258,10 +232,19 @@ class VideoStreamRegistry:
         if self.parameter_sets is None:
             return
         if self._pending_idr is not None:
+            self._cache_keyframe(self._pending_idr)
             self._broadcast_parameter_sets()
             self._started = True
             self._broadcast(self._pending_idr)
             self._pending_idr = None
+
+    def _cache_keyframe(self, idr: bytes) -> None:
+        """Keep the parameter sets and this IDR as a self-contained still."""
+        pair = self.parameter_sets
+        if pair is None:
+            return
+        self._last_keyframe = b"".join(
+            ANNEX_B_START + nal for nal in (*pair, idr))
 
     def _broadcast_parameter_sets(self) -> None:
         """Send the cached SPS and PPS to every consumer."""
@@ -322,7 +305,14 @@ video_registry = VideoStreamRegistry()
 class RTPVideoProtocol(asyncio.DatagramProtocol):
     """Video SRTP: decrypt → depacketize RTP H.264 → hand complete NAL
     units to the video registry, which fans them out to consumers. The
-    one consumer wired up today is the ffmpeg AV pipeline (its stdin)."""
+    one consumer wired up today is the ffmpeg AV pipeline (its stdin).
+
+    Like `RTPAudioProtocol`, nothing on the receive path logs: it runs
+    around a hundred times a second, and a single lost packet mid
+    keyframe would otherwise emit one line per remaining fragment. The
+    events that used to be logged individually are counted here and
+    summarised once per call by `stop_media`.
+    """
 
     REORDER_BUF_SIZE = 5  # Hold up to 5 packets for reordering (~30ms at 15fps)
 
@@ -338,14 +328,20 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         # RTP reorder buffer — fixes out-of-order UDP packets
         self._reorder_buf = {}  # seq -> payload
         self._next_seq = None   # next expected sequence number
-        # Diagnostics
+        self.reset_counters()
+
+    def reset_counters(self) -> None:
+        """Zero the per-call diagnostic counters."""
         self._srtp_fail = 0
         self._srtp_ok = 0
         self._nal_count = 0
+        self._fua_restarts = 0   # a new FU-A start while one was in flight
+        self._fua_orphans = 0    # a continuation whose start packet was lost
+        self._fua_discards = 0   # a NAL thrown away over too large a gap
+        self._fua_gaps = 0       # a small gap ridden out
 
     def connection_made(self, transport):
         self.transport = transport
-        _LOGGER.debug("RTP Video ready on :%d", CFG.rtp_video_port)
 
     def datagram_received(self, data, addr):
         if len(data) < 4:
@@ -358,20 +354,12 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
             rtp = self.srtp_rx.unprotect(data)
             if rtp is None:
                 self._srtp_fail += 1
-                if self._srtp_fail <= 5 or self._srtp_fail % 100 == 0:
-                    _LOGGER.warning("SRTP video auth FAIL #%d (pkt %dB)", self._srtp_fail, len(data))
                 return
             self._srtp_ok += 1
         else:
             rtp = data
 
         self.pkt_count += 1
-        if self.pkt_count == 1:
-            _LOGGER.debug("First video RTP from %s (%dB)", addr, len(rtp))
-        if self.pkt_count <= 3 or self.pkt_count % 200 == 0:
-            _LOGGER.debug("Video pkt #%d: %dB, srtp_ok=%d fail=%d nals=%d",
-                         self.pkt_count, len(rtp), self._srtp_ok, self._srtp_fail,
-                         self._nal_count)
 
         # Parse RTP header
         cc = rtp[0] & 0x0F
@@ -448,19 +436,14 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                 # Reconstruct NAL header: F|NRI from original + type from FU
                 nal_header = (payload[0] & 0xE0) | nal_unit_type
                 if self._fua_started:
-                    _LOGGER.debug("FU-A new start while prev incomplete (type=%d buf=%d)",
-                                  nal_unit_type, len(self._fua_buf))
+                    self._fua_restarts += 1
                 self._fua_buf = bytearray([nal_header])
                 self._fua_buf.extend(fragment)
                 self._fua_started = True
                 self._fua_expected_seq = (seq + 1) & 0xFFFF
-                if nal_unit_type in (5, 7, 8):
-                    _LOGGER.debug("FU-A START seq=%d nalType=%d fragSize=%d",
-                                 seq, nal_unit_type, len(fragment))
             elif not self._fua_started:
                 # FU-A continuation without start — dropped start packet
-                _LOGGER.warning("FU-A middle/end without start: seq=%d nalType=%d end=%s",
-                                seq, nal_unit_type, end)
+                self._fua_orphans += 1
                 return
             else:
                 # Check sequence continuity — tolerate small gaps (1-3 missing pkts)
@@ -468,24 +451,17 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
                     gap = (seq - self._fua_expected_seq) & 0xFFFF
                     if gap > 5:
                         # Too many missing packets — discard entire NAL
-                        _LOGGER.warning("FU-A seq gap: expected %d got %d (gap=%d), discarding",
-                                        self._fua_expected_seq, seq, gap)
+                        self._fua_discards += 1
                         self._fua_buf = bytearray()
                         self._fua_started = False
                         self._fua_expected_seq = None
                         return
-                    else:
-                        # Small gap — keep going, the NAL might still decode
-                        _LOGGER.debug("FU-A seq gap: expected %d got %d (gap=%d), continuing",
-                                      self._fua_expected_seq, seq, gap)
+                    # Small gap — keep going, the NAL might still decode
+                    self._fua_gaps += 1
                 self._fua_buf.extend(fragment)
                 self._fua_expected_seq = (seq + 1) & 0xFFFF
 
             if end and self._fua_started:
-                completed_type = self._fua_buf[0] & 0x1F if self._fua_buf else 0
-                if completed_type in (5, 7, 8):
-                    _LOGGER.debug("FU-A END seq=%d nalType=%d totalSize=%d",
-                                 seq, completed_type, len(self._fua_buf))
                 self._emit_nal(bytes(self._fua_buf))
                 self._fua_buf = bytearray()
                 self._fua_started = False
@@ -498,12 +474,20 @@ class RTPVideoProtocol(asyncio.DatagramProtocol):
         self._nal_count += 1
         video_registry.push_nal(nal_data)
 
+    def stats(self) -> str:
+        """One-line summary of what this protocol saw during the call."""
+        return (f"video pkts={self.pkt_count} srtp_ok={self._srtp_ok} "
+                f"srtp_fail={self._srtp_fail} nals={self._nal_count} "
+                f"fua_restarts={self._fua_restarts} "
+                f"fua_orphans={self._fua_orphans} "
+                f"fua_discards={self._fua_discards} "
+                f"fua_gaps={self._fua_gaps}")
+
     def send_stun(self):
         if not self.transport or not self.remote_addr:
             return
         stun = struct.pack('!HHI', 0x0001, 0, 0x2112A442) + os.urandom(12)
         self.transport.sendto(stun, self.remote_addr)
-        _LOGGER.debug("STUN Video → %s", self.remote_addr)
 
 
 # ─── State ──────────────────────────────────────────────────────────
@@ -514,31 +498,63 @@ av_ffmpeg_proc = None
 _stun_task = None
 _av_sdp_path: str | None = None
 _av_consumer = None
+# One asyncio.Queue per attached AV viewer. The pipeline is started when
+# the list goes from empty to non-empty and stopped when it empties
+# again, so a second dashboard joins the running pipeline instead of
+# killing the first viewer's ffmpeg out from under it.
+_av_subscribers: list[asyncio.Queue] = []
+_av_reader_task: asyncio.Task | None = None
 
 
 # ─── Transport setup ────────────────────────────────────────────────
 
+def _bind_udp(port: int) -> socket.socket:
+    """Bind one UDP socket, closing it again if the bind fails."""
+    # SO_REUSEADDR avoids "Address in use" on a Home Assistant reload.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('0.0.0.0', port))
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
 async def setup_transports():
+    """Bind the RTP sockets, leaving nothing open if any step fails."""
     global audio_proto, video_proto
     loop = asyncio.get_event_loop()
 
-    # Use SO_REUSEADDR to avoid "Address in use" on HA restart/reload
-    audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    audio_sock.bind(('0.0.0.0', CFG.rtp_audio_port))
+    audio_sock = _bind_udp(CFG.rtp_audio_port)
+    try:
+        video_sock = _bind_udp(CFG.rtp_video_port)
+    except OSError:
+        # The audio socket is already bound at this point; a raise here
+        # used to leak it, and one leaked socket per failed setup keeps
+        # its port busy and makes every later attempt fail too.
+        audio_sock.close()
+        raise
 
-    video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    video_sock.bind(('0.0.0.0', CFG.rtp_video_port))
+    try:
+        _, audio_proto = await loop.create_datagram_endpoint(
+            RTPAudioProtocol, sock=audio_sock)
+    except OSError:
+        audio_sock.close()
+        video_sock.close()
+        raise
 
-    _, audio_proto = await loop.create_datagram_endpoint(
-        RTPAudioProtocol, sock=audio_sock)
-    _, video_proto = await loop.create_datagram_endpoint(
-        RTPVideoProtocol, sock=video_sock)
+    try:
+        _, video_proto = await loop.create_datagram_endpoint(
+            RTPVideoProtocol, sock=video_sock)
+    except OSError:
+        video_sock.close()
+        close_transports()
+        raise
 
 
-async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=None):
-    """Start media after SIP call established. Called by sip.py."""
+async def setup_media(remote_sdp):
+    """Start media after SIP call established. Called by sip_client."""
     global _stun_task
     audio = remote_sdp.get("audio", {})
     video = remote_sdp.get("video", {})
@@ -551,12 +567,9 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         aip = audio.get("ip", remote_ip)
         audio_proto.remote_addr = (aip, audio["port"])
         audio_proto.pkt_count = 0
+        audio_proto.srtp_fail = 0
         if remote_audio_key:
             audio_proto.srtp_rx = SRTPContext(remote_audio_key)
-            _LOGGER.debug("SRTP Audio RX context created")
-        if local_crypto_key:
-            audio_proto.srtp_tx = SRTPContext(local_crypto_key)
-            _LOGGER.debug("SRTP Audio TX context created")
         audio_proto.send_stun()
         await broadcast("log", f"Audio SRTP → {aip}:{audio['port']}")
 
@@ -570,12 +583,9 @@ async def setup_media(remote_sdp, local_crypto_key=None, local_video_crypto_key=
         video_proto._fua_expected_seq = None
         video_proto._reorder_buf = {}
         video_proto._next_seq = None
-        video_proto._srtp_fail = 0
-        video_proto._srtp_ok = 0
-        video_proto._nal_count = 0
+        video_proto.reset_counters()
         if remote_video_key:
             video_proto.srtp_rx = SRTPContext(remote_video_key)
-            _LOGGER.debug("SRTP Video RX context created")
         video_proto.send_stun()
         await broadcast("log", f"Video SRTP → {vip}:{video['port']}")
 
@@ -590,16 +600,20 @@ async def stop_media():
     if _stun_task:
         _stun_task.cancel()
         _stun_task = None
+
+    # The one and only place the media layer reports what it saw: one
+    # DEBUG line for a whole call, instead of a line per packet.
+    if audio_proto or video_proto:
+        _LOGGER.debug(
+            "Call media summary: %s | %s",
+            audio_proto.stats() if audio_proto else "audio absent",
+            video_proto.stats() if video_proto else "video absent")
+
     if audio_proto:
         audio_proto.remote_addr = None
         audio_proto.pkt_count = 0
+        audio_proto.srtp_fail = 0
         audio_proto.srtp_rx = None
-        audio_proto.srtp_tx = None
-        while not audio_proto.audio_buffer.empty():
-            try:
-                audio_proto.audio_buffer.get_nowait()
-            except Exception:
-                break
     if video_proto:
         video_proto.remote_addr = None
         video_proto.pkt_count = 0
@@ -607,6 +621,7 @@ async def stop_media():
         video_proto._fua_buf = bytearray()
         video_proto._fua_started = False
         video_proto._fua_expected_seq = None
+        video_proto.reset_counters()
     await stop_av_ffmpeg()
     video_registry.reset()
 
@@ -614,11 +629,16 @@ async def stop_media():
 def close_transports():
     """Close UDP transports — called on integration unload."""
     global audio_proto, video_proto
-    if audio_proto and audio_proto.transport:
-        audio_proto.transport.close()
+    if audio_proto:
+        if audio_proto.transport:
+            audio_proto.transport.close()
+        # The forwarding socket is not owned by the transport, so
+        # closing the transport alone leaked one UDP socket per reload.
+        audio_proto.close()
         audio_proto = None
-    if video_proto and video_proto.transport:
-        video_proto.transport.close()
+    if video_proto:
+        if video_proto.transport:
+            video_proto.transport.close()
         video_proto = None
 
 
@@ -636,7 +656,16 @@ async def _stun_keepalive():
         pass
 
 
-# ─── AV stream (H264 video + PCMU audio → MPEG-TS for HomeKit) ────
+# ─── AV stream (H.264 video + PCMU audio → MPEG-TS) ─────────────────
+
+# Read size for ffmpeg's MPEG-TS output: 4 KB is ~21 transport packets,
+# small enough to keep latency low and large enough to keep the executor
+# round-trips down.
+AV_CHUNK_BYTES = 4096
+# Per-viewer buffering before the slowest viewer starts losing chunks.
+# 256 * 4 KB is 1 MB, roughly eight seconds of a 1 Mbps stream.
+AV_QUEUE_CHUNKS = 256
+
 
 def _create_av_sdp() -> str:
     """Write the SDP that describes the audio RTP stream for ffmpeg."""
@@ -653,9 +682,14 @@ def _create_av_sdp() -> str:
 
 
 async def start_av_ffmpeg():
-    """Start ffmpeg muxing H.264 from stdin and audio RTP into MPEG-TS."""
-    global av_ffmpeg_proc, _av_consumer
-    await stop_av_ffmpeg()
+    """Start ffmpeg muxing H.264 from stdin and audio RTP into MPEG-TS.
+
+    Idempotent: a pipeline that is already running is left alone, which
+    is what makes `av_subscribe` safe to call for a second viewer.
+    """
+    global av_ffmpeg_proc, _av_consumer, _av_reader_task
+    if av_ffmpeg_proc is not None and av_ffmpeg_proc.poll() is None:
+        return
 
     sdp_path = _create_av_sdp()
     cmd = [
@@ -690,9 +724,119 @@ async def start_av_ffmpeg():
     os.set_blocking(av_ffmpeg_proc.stdin.fileno(), False)
 
     asyncio.create_task(_read_av_ffmpeg_stderr())
+    _av_reader_task = asyncio.create_task(_read_av_ffmpeg_stdout())
     _av_consumer = _make_ffmpeg_consumer(av_ffmpeg_proc)
     video_registry.add_consumer(_av_consumer)
     _LOGGER.info("AV pipeline started")
+
+
+async def av_subscribe() -> asyncio.Queue | None:
+    """Attach a viewer to the AV pipeline, starting it if needed.
+
+    Returns the queue the viewer should read MPEG-TS chunks from, or
+    None when ffmpeg could not be started. A `None` item on the queue
+    means the pipeline has ended and the viewer should stop.
+    """
+    if av_ffmpeg_proc is None or av_ffmpeg_proc.poll() is not None:
+        await start_av_ffmpeg()
+        if av_ffmpeg_proc is None:
+            return None
+    queue: asyncio.Queue = asyncio.Queue(maxsize=AV_QUEUE_CHUNKS)
+    _av_subscribers.append(queue)
+    return queue
+
+
+async def av_unsubscribe(queue: asyncio.Queue) -> None:
+    """Detach a viewer, stopping the pipeline once the last one leaves."""
+    if queue in _av_subscribers:
+        _av_subscribers.remove(queue)
+    if not _av_subscribers:
+        await stop_av_ffmpeg()
+
+
+async def _read_av_ffmpeg_stdout() -> None:
+    """Fan ffmpeg's MPEG-TS output out to every attached viewer.
+
+    One reader for the process, not one per viewer: two viewers reading
+    the same pipe from separate executor threads would each get half of
+    the transport stream and neither would decode.
+    """
+    loop = asyncio.get_running_loop()
+    proc = av_ffmpeg_proc
+    try:
+        while proc and proc.poll() is None:
+            chunk = await loop.run_in_executor(
+                None, proc.stdout.read, AV_CHUNK_BYTES)
+            if not chunk:
+                break
+            for queue in list(_av_subscribers):
+                try:
+                    queue.put_nowait(chunk)
+                except asyncio.QueueFull:
+                    # This viewer's HTTP connection cannot keep up.
+                    # Drop its oldest chunk rather than stall the
+                    # others; MPEG-TS resynchronises on its own.
+                    try:
+                        queue.get_nowait()
+                        queue.put_nowait(chunk)
+                    except (asyncio.QueueEmpty, asyncio.QueueFull):
+                        pass
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a dead pipe must not kill the loop
+        _LOGGER.debug("AV output reader stopped early", exc_info=True)
+    finally:
+        _signal_av_end()
+
+
+def _signal_av_end() -> None:
+    """Tell every attached viewer the pipeline has finished."""
+    for queue in list(_av_subscribers):
+        try:
+            queue.put_nowait(None)
+        except asyncio.QueueFull:
+            # The sentinel matters more than the last chunk of video.
+            try:
+                queue.get_nowait()
+                queue.put_nowait(None)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
+
+async def snapshot_jpeg(timeout: float = 5.0) -> bytes | None:
+    """Decode the most recent keyframe to a JPEG, or None if there is none.
+
+    Deliberately independent of the streaming pipeline: a still must
+    never start a call, so this reads the keyframe the registry already
+    cached from a call that is running and decodes that one picture.
+    """
+    keyframe = video_registry.last_keyframe
+    if not keyframe:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-loglevel", "error",
+            "-f", "h264", "-i", "pipe:0",
+            "-frames:v", "1", "-f", "mjpeg", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as err:
+        _LOGGER.error("Could not start ffmpeg for a snapshot: %s", err)
+        return None
+    try:
+        async with asyncio.timeout(timeout):
+            out, _ = await proc.communicate(keyframe)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        _LOGGER.debug("Snapshot decode timed out")
+        return None
+    except OSError as err:
+        _LOGGER.debug("Snapshot decode failed: %s", err)
+        return None
+    return out or None
 
 
 def _make_ffmpeg_consumer(proc):
@@ -723,8 +867,8 @@ def _make_ffmpeg_consumer(proc):
 
 
 async def stop_av_ffmpeg():
-    """Stop the AV pipeline and detach it from the video registry."""
-    global av_ffmpeg_proc, _av_consumer, _av_sdp_path
+    """Stop the AV pipeline, detach it, and release every viewer."""
+    global av_ffmpeg_proc, _av_consumer, _av_sdp_path, _av_reader_task
 
     if _av_consumer is not None:
         video_registry.remove_consumer(_av_consumer)
@@ -745,6 +889,13 @@ async def stop_av_ffmpeg():
         av_ffmpeg_proc = None
         _LOGGER.info("AV pipeline stopped")
 
+    # Cancel the reader only after the process is gone, so its blocking
+    # read in the executor has already returned.
+    if _av_reader_task is not None:
+        _av_reader_task.cancel()
+        _av_reader_task = None
+
+    _signal_av_end()
     _cleanup_av_sdp()
 
 
