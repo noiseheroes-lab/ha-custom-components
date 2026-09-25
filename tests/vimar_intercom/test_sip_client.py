@@ -274,3 +274,145 @@ def test_the_supervisor_ends_the_call_when_the_connection_drops(
     assert sip.in_call is False
     assert sip.call_state["call_id"] is None
     assert "call_ended" in live_call
+
+
+# ─── a hang-up must not strip a dialog that is still being set up ────
+
+async def _no_wait(*_args, **_kwargs):
+    """Stand in for `_wait_final`: the far end answers at once."""
+    return []
+
+
+def test_hanging_up_while_the_invite_is_in_flight_keeps_the_call_id(
+        live_call, monkeypatch):
+    """`do_call` owns `call_state` until its INVITE transaction is over.
+
+    The camera opens the stream, the auto-call sends an INVITE, and the
+    2xx can take up to 45 s. A hang-up inside that window used to run
+    the local teardown, wiping the Call-ID the arriving 2xx completes
+    the dialog around — `do_call` sets the To-tag and the remote
+    Contact but never re-sets the Call-ID.
+    """
+    sent: list[str] = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(sip, "send", _send)
+
+    sip.in_call = False
+    sip.calling = True
+    sip.call_state.update(call_id="call-abc", from_tag="ftag",
+                          to_tag=None, remote_contact=None)
+
+    run(sip.do_hangup())
+
+    assert sip.calling is False
+    assert sip.call_state["call_id"] == "call-abc"
+    assert sip.call_state["from_tag"] == "ftag"
+    # Nothing was torn down, and no BYE can be sent for a dialog that
+    # has not reached its 2xx yet.
+    assert sent == []
+    assert live_call == []
+
+
+def test_a_hang_up_during_setup_leaves_a_call_a_later_bye_can_end(
+        live_call, monkeypatch):
+    """The cost of the stranded dialog: the panel's single registration.
+
+    Losing the Call-ID took the BYE with it — every later hang-up, the
+    button, the five-minute limit and the unload alike, found no
+    `call_id` and took the early-return branch.
+    """
+    sent: list[str] = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(sip, "send", _send)
+    monkeypatch.setattr(sip, "_wait_final", _no_wait)
+
+    sip.in_call = False
+    sip.calling = True
+    sip.call_state.update(call_id="call-abc", from_tag="ftag",
+                          to_tag=None, remote_contact=None)
+
+    run(sip.do_hangup())
+
+    # The 2xx arrives: `do_call` fills in the far end and marks it up.
+    sip.call_state.update(to_tag="ttag",
+                          remote_contact="sip:panel@example.invalid")
+    sip.in_call = True
+
+    run(sip.do_hangup())
+
+    assert [msg.split(" ", 1)[0] for msg in sent] == ["BYE"]
+    assert "Call-ID: call-abc\r\n" in sent[0]
+    assert ";tag=ttag" in sent[0]
+    assert sip.in_call is False
+    assert sip.call_state["call_id"] is None
+    assert live_call == ["stop_media", "call_ended"]
+
+
+# ─── an incoming BYE ends the dialog it names, and only that one ─────
+
+def _raw_bye(call_id: str) -> str:
+    """One well-formed BYE from the panel for `call_id`."""
+    return (
+        "BYE sip:60901@example.invalid SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bK-panel\r\n"
+        "From: <sip:panel@example.invalid>;tag=ptag\r\n"
+        "To: <sip:60901@example.invalid>;tag=ftag\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 2 BYE\r\n"
+        "Content-Length: 0\r\n\r\n")
+
+
+def test_a_bye_we_cannot_acknowledge_still_ends_the_call(
+        live_call, monkeypatch):
+    """The other half of "a call always ends locally".
+
+    The panel hangs up as the cloud connection goes, so the 200 OK
+    raises on a dead writer. The clear-up used to sit after that send:
+    `in_call` stayed True with no dialog behind it, sticking the in-call
+    sensor on, stopping the camera placing a call and turning every
+    later doorbell press into a 603.
+    """
+    async def _raises(_msg):
+        raise ConnectionResetError("the SIP socket has gone")
+
+    monkeypatch.setattr(sip, "send", _raises)
+
+    with pytest.raises(ConnectionResetError):
+        run(sip.handle_incoming_bye(_raw_bye("call-abc")))
+
+    assert sip.in_call is False
+    assert sip.call_state["call_id"] is None
+    assert live_call == ["stop_media", "call_ended"]
+
+
+def test_a_bye_for_another_dialog_leaves_the_live_call_alone(
+        live_call, monkeypatch):
+    """A late or duplicate BYE used to tear down whatever was up.
+
+    The handler never looked at the Call-ID, so a BYE belonging to the
+    previous call ended the current one — and, when that current one was
+    still being set up, left it with no identity at all.
+    """
+    sent: list[str] = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(sip, "send", _send)
+
+    run(sip.handle_incoming_bye(_raw_bye("call-that-already-ended")))
+
+    # The panel still gets its answer.
+    assert len(sent) == 1
+    assert sent[0].startswith("SIP/2.0 200 OK")
+    assert "Call-ID: call-that-already-ended\r\n" in sent[0]
+    # But the call that is actually up is untouched.
+    assert sip.in_call is True
+    assert sip.call_state["call_id"] == "call-abc"
+    assert live_call == []

@@ -953,9 +953,34 @@ async def _abandon_call() -> None:
 
 async def do_hangup():
     """End the current call: send a BYE if the socket still allows it,
-    and clear the call locally whether or not it went out."""
+    and clear the call locally whether or not it went out.
+
+    `call_state` belongs to whoever is driving the dialog. While
+    `do_call` is inside its INVITE transaction it is the owner, and this
+    function only clears `calling` — see the guard below.
+    """
+    # Read before `_set_calling(False)` hides it: a call still being set
+    # up is `calling` True, `in_call` False, with its Call-ID already in
+    # `call_state`.
+    in_setup = calling and not in_call and bool(call_state["call_id"])
     _set_calling(False)
     if not in_call or not call_state["call_id"]:
+        if in_setup:
+            # `do_call` is waiting on a 2xx that can take up to 45 s, and
+            # it completes the dialog out of `call_state` — it sets the
+            # To-tag and the remote Contact, and never re-sets the
+            # Call-ID. Tearing down here would hand it a live call with
+            # no identity: `send_keyframe_request` would early-return so
+            # video could never recover, and every later hang-up — the
+            # button, the five-minute limit, the unload — would take
+            # this same branch and send no BYE, leaving the panel holding
+            # the dialog and the account's single SIP registration
+            # occupied. Clearing `calling` is the whole of what this
+            # branch may safely do; the hang-up lands on the call once it
+            # is up.
+            return
+        # No dialog is being set up, so whatever is left in `call_state`
+        # is stale and the local teardown is what clears it.
         await _end_call_locally()
         return
 
@@ -1091,6 +1116,13 @@ async def handle_incoming_bye(raw):
     to_hdr = msg.headers.get("to", "")
     cseq = msg.headers.get("cseq", "1 BYE")
 
+    # Only the dialog this BYE names ends. A late or duplicate BYE for a
+    # call that is already over used to tear down whatever `call_state`
+    # held at the time — including a call still being set up, which then
+    # established with no Call-ID and could never be ended with a BYE.
+    # The 200 OK is unconditional: the panel gets its answer either way.
+    ours = bool(cid) and cid == call_state["call_id"]
+
     try:
         await send(
             f"SIP/2.0 200 OK\r\n"
@@ -1100,7 +1132,8 @@ async def handle_incoming_bye(raw):
     finally:
         # The panel has hung up. Whether our 200 OK reached it or the
         # socket died under us, the call is over on this side.
-        await _end_call_locally()
+        if ours:
+            await _end_call_locally()
 
 
 async def handle_incoming_options(raw):
