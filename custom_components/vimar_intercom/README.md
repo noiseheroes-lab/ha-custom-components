@@ -1,10 +1,10 @@
 # Vimar Intercom — Home Assistant Integration
 
-> **Status: in active development.** This is the v2 rewrite and it is not
-> released yet. The 1.x release users are running lives on `origin/main`;
-> this work lives on the `v2` branch until it has been verified on real
-> hardware. Do not point HACS at a branch carrying v2. This notice is
-> removed when v2.0.0 ships.
+> **Status: version 2.0.0, in active development.** `main` carries the v2
+> rewrite, so that is what HACS installs from the default branch. It has
+> not been verified against a live panel — the camera in particular has
+> never been run against one. Upgrading from 1.x is a remove-and-re-add,
+> not an in-place update.
 
 Integrate a **Vimar Elvox** video door entry system into Home Assistant:
 doorbell events, live video (with audio from the panel), door release and
