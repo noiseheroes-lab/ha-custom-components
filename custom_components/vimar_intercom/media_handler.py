@@ -622,8 +622,16 @@ async def stop_media():
         video_proto._fua_started = False
         video_proto._fua_expected_seq = None
         video_proto.reset_counters()
-    await stop_av_ffmpeg()
+    # Before the await, for the same reason `stop_av_ffmpeg` detaches
+    # what it owns before its own: reaping ffmpeg takes up to three
+    # seconds, and a viewer arriving in that window starts a replacement
+    # pipeline and registers its consumer. Resetting afterwards cleared
+    # that consumer too, and the new ffmpeg then sat on `pipe:0`
+    # receiving no NALs — it emitted nothing, the reader produced no
+    # sentinel, and the viewer held a response body that never arrived
+    # and never ended.
     video_registry.reset()
+    await stop_av_ffmpeg()
 
 
 def close_transports():

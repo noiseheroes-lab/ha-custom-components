@@ -395,3 +395,55 @@ def test_a_viewer_arriving_during_teardown_starts_a_fresh_pipeline(
     assert _drain(leaving) == [None]
     assert media._av_subscribers == [newcomer]
     assert media.av_ffmpeg_proc is not None
+
+
+def test_a_pipeline_started_during_teardown_keeps_its_consumer(monkeypatch):
+    """The call-ended teardown must not strip the pipeline after it.
+
+    `stop_media` awaits `stop_av_ffmpeg` — up to three seconds reaping
+    ffmpeg — and then reset the registry. A viewer arriving in that
+    window starts a replacement pipeline and registers its consumer, and
+    the reset cleared that one too: the new ffmpeg sat on `pipe:0`
+    receiving no NALs, emitted nothing, so its reader never produced the
+    end-of-stream sentinel and the viewer held a response body that
+    never arrived and never ended.
+    """
+    gate = threading.Event()
+    registry = media.VideoStreamRegistry()
+    monkeypatch.setattr(media, "video_registry", registry)
+    monkeypatch.setattr(media, "_av_subscribers", [])
+    monkeypatch.setattr(media, "_av_reader_task", None)
+    monkeypatch.setattr(media, "_av_sdp_path", None)
+    monkeypatch.setattr(media, "_stun_task", None)
+    monkeypatch.setattr(media, "audio_proto", None)
+    monkeypatch.setattr(media, "video_proto", None)
+    monkeypatch.setattr(media, "av_ffmpeg_proc", _ReapedProc(gate))
+
+    leaving: list[bytes] = []
+    arriving: list[bytes] = []
+    monkeypatch.setattr(media, "_av_consumer", leaving.append)
+    registry.add_consumer(leaving.append)
+
+    async def _start():
+        media.av_ffmpeg_proc = _FakeProc()
+        media._av_consumer = arriving.append
+        media.video_registry.add_consumer(media._av_consumer)
+
+    monkeypatch.setattr(media, "start_av_ffmpeg", _start)
+
+    async def scenario():
+        stopping = asyncio.create_task(media.stop_media())
+        await asyncio.sleep(0.05)  # let it reach the executor wait
+        newcomer = await media.av_subscribe()
+        gate.set()
+        await stopping
+        return newcomer
+
+    newcomer = run(scenario())
+    assert newcomer is not None
+
+    for nal in (SPS, PPS, IDR):
+        media.video_registry.push_nal(nal)
+
+    assert arriving == [media.ANNEX_B_START + nal for nal in (SPS, PPS, IDR)]
+    assert leaving == []
