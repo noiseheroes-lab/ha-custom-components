@@ -7,6 +7,7 @@ import logging
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -69,10 +70,15 @@ class VimarCallButton(VimarButtonBase):
         self._attr_name = f"Call {panel.name}"
 
     async def async_press(self) -> None:
-        """Place the call."""
+        """Place the call.
+
+        Raising is what puts the reason in front of the user: a button
+        press that only logs looks identical to one that worked.
+        """
         ok, msg = await self._hub.async_call(target=self._panel.address)
         if not ok:
             _LOGGER.error("Call to %s failed: %s", self._panel.address, msg)
+            raise HomeAssistantError(msg)
 
 
 class VimarDoorButton(VimarButtonBase):
@@ -92,6 +98,7 @@ class VimarDoorButton(VimarButtonBase):
         ok, msg = await self._hub.async_door(target=self._panel.address)
         if not ok:
             _LOGGER.error("Opening %s failed: %s", self._panel.address, msg)
+            raise HomeAssistantError(msg)
 
 
 class VimarAnswerButton(VimarButtonBase):
@@ -109,6 +116,7 @@ class VimarAnswerButton(VimarButtonBase):
         ok, msg = await self._hub.async_answer()
         if not ok:
             _LOGGER.error("Answer failed: %s", msg)
+            raise HomeAssistantError(msg)
 
 
 class VimarHangupButton(VimarButtonBase):

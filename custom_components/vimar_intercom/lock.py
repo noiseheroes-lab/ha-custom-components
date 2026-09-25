@@ -8,6 +8,7 @@ import logging
 from homeassistant.components.lock import LockEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -75,18 +76,37 @@ class VimarIntercomLock(LockEntity):
         self.async_write_ha_state()
 
     async def async_unlock(self, **kwargs) -> None:
-        """Open the door via SIP MESSAGE."""
+        """Open the door via SIP MESSAGE.
+
+        A failure is raised, not just logged. The hub has already
+        produced the sentence the user needs — why it failed and what to
+        do — and swallowing it left them pressing Open door, seeing
+        nothing happen, and having no way to tell a slow door from a
+        dead connection. Raising also lets an automation catch it.
+        """
         ok, msg = await self._hub.async_door()
-        if ok:
-            self._is_locked = False
-            self.async_write_ha_state()
-            if self._relock_task:
-                self._relock_task.cancel()
-            self._relock_task = asyncio.create_task(self._auto_relock())
-        else:
+        if not ok:
             _LOGGER.error("Door open failed: %s", msg)
+            raise HomeAssistantError(msg)
+
+        self._is_locked = False
+        self.async_write_ha_state()
+        if self._relock_task:
+            self._relock_task.cancel()
+        self._relock_task = asyncio.create_task(self._auto_relock())
 
     async def _auto_relock(self):
         await asyncio.sleep(5)
         self._is_locked = True
         self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop the re-lock timer before the entity goes.
+
+        An entry reload within the five seconds after the door opened
+        otherwise wakes this task on a removed entity, and
+        `async_write_ha_state` on one of those raises.
+        """
+        if self._relock_task:
+            self._relock_task.cancel()
+            self._relock_task = None

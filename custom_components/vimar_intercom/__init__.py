@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from functools import partial
 
 from aiohttp import web
@@ -15,7 +16,12 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import issue_registry as ir
 
 from . import media_handler as media
-from .const import DOMAIN, ISSUE_MIGRATION_REQUIRED, ISSUE_REGISTRATION_DOWN
+from .const import (
+    CA_PATH,
+    DOMAIN,
+    ISSUE_MIGRATION_REQUIRED,
+    ISSUE_REGISTRATION_DOWN,
+)
 from .hub import VimarIntercomHub
 from .runtime import RuntimeConfig, build_runtime_config
 
@@ -34,6 +40,17 @@ CALL_SETUP_TIMEOUT = 15.0
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Vimar Intercom from a config entry."""
+    if not await hass.async_add_executor_job(os.path.exists, CA_PATH):
+        # The SIP connection carries the door command and the digest
+        # response. Without this file its certificate cannot be verified,
+        # and the integration used to carry on unverified rather than
+        # say so. Refusing is the honest answer, and ConfigEntryNotReady
+        # retries on its own once the file is back.
+        raise ConfigEntryNotReady(
+            f"The Vimar CA certificate is missing from {CA_PATH}. "
+            "Reinstall the integration through HACS: the connection to "
+            "the intercom cannot be verified without it.")
+
     cfg = build_runtime_config(entry.data, entry.options)
     hub = VimarIntercomHub(cfg)
 
@@ -96,6 +113,16 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             severity=ir.IssueSeverity.ERROR,
             translation_key=ISSUE_MIGRATION_REQUIRED,
         )
+    else:
+        # An entry from a newer version of the integration than the one
+        # installed: the user has downgraded, and this code cannot know
+        # what that entry contains. Refusing is right, but saying so is
+        # the difference between a readable cause and a bare failure.
+        _LOGGER.error(
+            "Config entry version %s was written by a newer version of "
+            "Vimar Intercom than the one installed, which cannot read it. "
+            "Upgrade the integration again, or delete the entry and set "
+            "it up from the QR code.", entry.version)
     return False
 
 
@@ -160,9 +187,15 @@ class VimarAVStreamView(HomeAssistantView):
         if hub is None:
             return web.Response(status=503, text="Intercom not loaded")
 
-        await hub.stream_opened()
         queue: asyncio.Queue | None = None
+        # Inside the try, so a cancellation between opening the stream
+        # and reaching the body cannot leave the hub counting a viewer
+        # that has gone. `stream_opened` gives the count back itself if
+        # it raises, so `opened` only becomes True once it is owed.
+        opened = False
         try:
+            await hub.stream_opened()
+            opened = True
             waited = 0.0
             while not hub.in_call and waited < CALL_SETUP_TIMEOUT:
                 await asyncio.sleep(0.5)
@@ -181,7 +214,7 @@ class VimarAVStreamView(HomeAssistantView):
             # has to balance the stream_opened above, or the hub keeps
             # counting a viewer that has gone and never clears the
             # auto-call it placed for it.
-            if queue is None:
+            if queue is None and opened:
                 await hub.stream_closed()
 
         response = web.StreamResponse()
