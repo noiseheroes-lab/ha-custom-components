@@ -8,6 +8,7 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, MANUFACTURER, MODEL
@@ -20,128 +21,122 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Set up one call and one door button per configured panel."""
     hub = hass.data[DOMAIN][entry.entry_id]["hub"]
-    async_add_entities([
-        VimarCallButton(hub, entry.entry_id),
-        VimarCallTargetButton(hub, entry.entry_id, "55001", "Chiama Targa Esterna", "call_ext"),
-        VimarCallTargetButton(hub, entry.entry_id, "60001", "Chiama Targa Interna", "call_int"),
+    entities: list[ButtonEntity] = [
         VimarAnswerButton(hub, entry.entry_id),
         VimarHangupButton(hub, entry.entry_id),
-        VimarDoorButton(hub, entry.entry_id, "55001", "Apri Cancello", "door_street", "mdi:gate"),
-        VimarDoorButton(hub, entry.entry_id, "55002", "Apri Portone", "door_building", "mdi:door"),
-    ])
+        VimarReconnectButton(hub, entry.entry_id),
+    ]
+    for panel in hub.config.panels:
+        entities.append(VimarCallButton(hub, entry.entry_id, panel))
+        entities.append(VimarDoorButton(hub, entry.entry_id, panel))
+    async_add_entities(entities)
 
 
-class VimarCallButton(ButtonEntity):
-    """Button to call the intercom (initiate SIP INVITE)."""
+def _device_info(entry_id: str) -> DeviceInfo:
+    """Device entry shared by every Vimar Intercom entity."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry_id)},
+        name="Vimar Intercom",
+        manufacturer=MANUFACTURER,
+        model=MODEL,
+    )
 
-    _attr_has_entity_name = False
-    _attr_name = "Chiama"
+
+class VimarButtonBase(ButtonEntity):
+    """Common wiring for the intercom buttons."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, hub, entry_id: str, unique_suffix: str) -> None:
+        """Attach the button to the intercom device."""
+        self._hub = hub
+        self._attr_unique_id = f"{entry_id}_{unique_suffix}"
+        self._attr_device_info = _device_info(entry_id)
+
+
+class VimarCallButton(VimarButtonBase):
+    """Call one entrance panel."""
+
+    _attr_translation_key = "call"
     _attr_icon = "mdi:phone-outgoing"
 
-    def __init__(self, hub, entry_id: str) -> None:
-        self._hub = hub
-        self._attr_unique_id = f"{entry_id}_call"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
-            name="Vimar Intercom",
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-        )
+    def __init__(self, hub, entry_id: str, panel) -> None:
+        """Remember which panel this button calls."""
+        super().__init__(hub, entry_id, f"call_{panel.address}")
+        self._panel = panel
+        self._attr_name = f"Call {panel.name}"
 
     async def async_press(self) -> None:
-        ok, msg = await self._hub.async_call()
+        """Place the call."""
+        ok, msg = await self._hub.async_call(target=self._panel.address)
         if not ok:
-            _LOGGER.error("Call failed: %s", msg)
+            _LOGGER.error("Call to %s failed: %s", self._panel.address, msg)
 
 
-class VimarCallTargetButton(ButtonEntity):
-    """Button to call a specific SIP target (targa interna/esterna)."""
+class VimarDoorButton(VimarButtonBase):
+    """Open the door of one entrance panel."""
 
-    _attr_has_entity_name = False
-    _attr_icon = "mdi:phone-outgoing"
+    _attr_translation_key = "open_door"
+    _attr_icon = "mdi:door-open"
 
-    def __init__(self, hub, entry_id: str, target: str, name: str, key: str) -> None:
-        self._hub = hub
-        self._target = target
-        self._attr_name = name
-        self._attr_unique_id = f"{entry_id}_{key}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
-            name="Vimar Intercom",
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-        )
+    def __init__(self, hub, entry_id: str, panel) -> None:
+        """Remember which panel this button opens."""
+        super().__init__(hub, entry_id, f"door_{panel.address}")
+        self._panel = panel
+        self._attr_name = f"Open {panel.name}"
 
     async def async_press(self) -> None:
-        ok, msg = await self._hub.async_call(target=self._target)
+        """Send the door command."""
+        ok, msg = await self._hub.async_door(target=self._panel.address)
         if not ok:
-            _LOGGER.error("Call to %s failed: %s", self._target, msg)
+            _LOGGER.error("Opening %s failed: %s", self._panel.address, msg)
 
 
-class VimarAnswerButton(ButtonEntity):
-    """Button to answer an incoming intercom call."""
+class VimarAnswerButton(VimarButtonBase):
+    """Answer an incoming intercom call."""
 
-    _attr_has_entity_name = False
-    _attr_name = "Rispondi"
+    _attr_translation_key = "answer"
     _attr_icon = "mdi:phone-incoming"
 
     def __init__(self, hub, entry_id: str) -> None:
-        self._hub = hub
-        self._attr_unique_id = f"{entry_id}_answer"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
-            name="Vimar Intercom",
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-        )
+        """Create the answer button."""
+        super().__init__(hub, entry_id, "answer")
 
     async def async_press(self) -> None:
+        """Answer the pending call."""
         ok, msg = await self._hub.async_answer()
         if not ok:
             _LOGGER.error("Answer failed: %s", msg)
 
 
-class VimarHangupButton(ButtonEntity):
-    """Button to hang up the current call (SIP BYE)."""
+class VimarHangupButton(VimarButtonBase):
+    """End the current call."""
 
-    _attr_has_entity_name = False
-    _attr_name = "Riaggancia"
+    _attr_translation_key = "hang_up"
     _attr_icon = "mdi:phone-hangup"
 
     def __init__(self, hub, entry_id: str) -> None:
-        self._hub = hub
-        self._attr_unique_id = f"{entry_id}_hangup"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
-            name="Vimar Intercom",
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-        )
+        """Create the hang-up button."""
+        super().__init__(hub, entry_id, "hangup")
 
     async def async_press(self) -> None:
+        """Send BYE."""
         await self._hub.async_hangup()
 
 
-class VimarDoorButton(ButtonEntity):
-    """Button to open a door (SIP MESSAGE)."""
+class VimarReconnectButton(VimarButtonBase):
+    """Rebuild the SIP connection without restarting Home Assistant."""
 
-    _attr_has_entity_name = False
+    _attr_translation_key = "reconnect"
+    _attr_icon = "mdi:restart"
+    _attr_entity_category = EntityCategory.CONFIG
 
-    def __init__(self, hub, entry_id: str, target: str | None, name: str, key: str, icon: str) -> None:
-        self._hub = hub
-        self._target = target
-        self._attr_name = name
-        self._attr_icon = icon
-        self._attr_unique_id = f"{entry_id}_{key}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
-            name="Vimar Intercom",
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-        )
+    def __init__(self, hub, entry_id: str) -> None:
+        """Create the reconnect button."""
+        super().__init__(hub, entry_id, "reconnect")
 
     async def async_press(self) -> None:
-        ok, msg = await self._hub.async_door(target=self._target)
-        if not ok:
-            _LOGGER.error("Door %s open failed: %s", self._target or "default", msg)
+        """Drop the connection so the supervisor rebuilds it."""
+        await self._hub.async_reconnect()

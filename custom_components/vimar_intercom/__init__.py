@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 
 from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 
 from . import media_handler as media
-from .const import DOMAIN
+from .const import DOMAIN, ISSUE_REGISTRATION_DOWN
 from .hub import VimarIntercomHub
-from .runtime import build_runtime_config
+from .runtime import RuntimeConfig, build_runtime_config
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,10 +33,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
+    hub.set_issue_callbacks(
+        partial(_raise_registration_issue, hass, cfg),
+        partial(ir.async_delete_issue, hass, DOMAIN, ISSUE_REGISTRATION_DOWN),
+    )
+
     await hub.async_start()
     hass.http.register_view(VimarAVStreamView(hub))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
+
+def _raise_registration_issue(hass: HomeAssistant, cfg: RuntimeConfig) -> None:
+    """Tell the user the intercom has been unregistered for too long."""
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        ISSUE_REGISTRATION_DOWN,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=ISSUE_REGISTRATION_DOWN,
+        translation_placeholders={
+            "proxy_host": cfg.proxy_host,
+            "proxy_port": str(cfg.proxy_port),
+        },
+    )
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -48,6 +71,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if ok:
         data = hass.data[DOMAIN].pop(entry.entry_id)
         await data["hub"].async_stop()
+        ir.async_delete_issue(hass, DOMAIN, ISSUE_REGISTRATION_DOWN)
     return ok
 
 

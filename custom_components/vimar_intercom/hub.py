@@ -2,16 +2,19 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 
 from . import sip_client as sip
 from . import media_handler as media
+from .const import REGISTRATION_DOWN_GRACE
 from .runtime import RuntimeConfig
 
 _LOGGER = logging.getLogger(__name__)
 
 STREAM_HANGUP_DELAY = 30
 MAX_CALL_DURATION = 300  # 5 minutes — auto-hangup safety net
+REGISTRATION_WATCHDOG_INTERVAL = 30
 
 
 class VimarIntercomHub:
@@ -30,6 +33,8 @@ class VimarIntercomHub:
         self._keyframe_task: asyncio.Task | None = None
         self._auto_called = False
         self._auto_call_target: str | None = None
+        self._raise_issue: Callable | None = None
+        self._clear_issue: Callable | None = None
 
     @property
     def config(self) -> RuntimeConfig:
@@ -74,6 +79,34 @@ class VimarIntercomHub:
                 cb()
             except Exception:
                 _LOGGER.exception("State callback error")
+
+    def set_issue_callbacks(self, raise_issue: Callable, clear_issue: Callable) -> None:
+        """Install the callbacks used to raise and clear the repair issue."""
+        self._raise_issue = raise_issue
+        self._clear_issue = clear_issue
+
+    async def _registration_watchdog(self) -> None:
+        """Raise a repair issue when registration stays down too long."""
+        down_since: float | None = None
+        raised = False
+        try:
+            while self._running:
+                await asyncio.sleep(REGISTRATION_WATCHDOG_INTERVAL)
+                if sip.is_registered():
+                    if raised and self._clear_issue:
+                        self._clear_issue()
+                        raised = False
+                    down_since = None
+                    continue
+                if down_since is None:
+                    down_since = time.monotonic()
+                elif (not raised
+                      and time.monotonic() - down_since >= REGISTRATION_DOWN_GRACE
+                      and self._raise_issue):
+                    self._raise_issue()
+                    raised = True
+        except asyncio.CancelledError:
+            pass
 
     async def stream_opened(self, target: str | None = None):
         self._stream_viewers += 1
@@ -196,12 +229,18 @@ class VimarIntercomHub:
         # opens its own.
         self._tasks.append(asyncio.create_task(sip.connection_supervisor()))
         self._tasks.append(asyncio.create_task(sip.request_processor()))
+        self._tasks.append(asyncio.create_task(self._registration_watchdog()))
         self._running = True
 
     async def async_stop(self):
         self._running = False
         for t in self._tasks:
             t.cancel()
+        if self._tasks:
+            # Await teardown so no task (notably the registration watchdog,
+            # which would otherwise sleep up to REGISTRATION_WATCHDOG_INTERVAL
+            # seconds after self._running flips) outlives an entry reload.
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         if self._hangup_task:
             self._hangup_task.cancel()
