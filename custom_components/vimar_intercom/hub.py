@@ -14,6 +14,9 @@ _LOGGER = logging.getLogger(__name__)
 
 STREAM_HANGUP_DELAY = 30
 MAX_CALL_DURATION = 300  # 5 minutes — auto-hangup safety net
+# How long an unload waits for the BYE before giving up on it. A reload
+# must not be able to block on a socket the peer has stopped answering.
+HANGUP_ON_UNLOAD_TIMEOUT = 5
 REGISTRATION_WATCHDOG_INTERVAL = 30
 
 
@@ -346,9 +349,19 @@ class VimarIntercomHub:
         # is gone and no BYE can be sent, leaving the panel holding a
         # call it thinks is live and the account's single registration
         # occupied.
+        #
+        # Bounded, because nothing inside the hang-up is. `sip.send`
+        # takes the connection lock and then awaits `writer.drain()`,
+        # and on a half-open TCP connection — the socket is not closed,
+        # the peer simply stops acknowledging — the reader loop's CRLF
+        # keepalive is already blocked in its own drain while holding
+        # that lock. The reader task is still alive, since this runs
+        # before the cancel loop below, so the wait would never end and
+        # the entry would sit in "unloading" forever: an option change
+        # mid-call never reloads, and a Home Assistant restart hangs.
         if sip.in_call:
             try:
-                await sip.do_hangup()
+                await asyncio.wait_for(sip.do_hangup(), HANGUP_ON_UNLOAD_TIMEOUT)
             except Exception:  # noqa: BLE001 - shutdown must not fail here
                 _LOGGER.debug("Hang-up on unload failed", exc_info=True)
 

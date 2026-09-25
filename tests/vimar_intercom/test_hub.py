@@ -179,20 +179,28 @@ def test_a_second_viewer_does_not_place_a_second_call(sip_stub):
     assert h._stream_viewers == 2
 
 
-def test_an_established_call_is_hung_up_when_nobody_waited(sip_stub):
-    """The view waits 15 s; do_call may take 45. Nobody is left to watch."""
+def test_an_established_call_is_hung_up_when_nobody_waited(
+        sip_stub, monkeypatch):
+    """The view waits 15 s; do_call may take 45. Nobody is left to watch.
+
+    The grace timer has to run to an actual BYE: a call that established
+    with nobody watching otherwise holds the account's single
+    registration until the five-minute duration limit expires.
+    """
     h = _hub()
+    monkeypatch.setattr(hub, "STREAM_HANGUP_DELAY", 0)
+    h._auto_called = True
+    h._stream_viewers = 0
 
     async def scenario():
-        await h.stream_opened()
-        h._stream_viewers = 0
         await h._do_auto_call(None)
-        task = h._hangup_task
-        if task is not None:
-            task.cancel()
-        return task
+        assert h._hangup_task is not None
+        sip.in_call = True
+        await h._hangup_task
 
-    assert run(scenario()) is not None
+    run(scenario())
+    assert sip_stub == ["call:None", "hangup"]
+    assert h._auto_called is False
 
 
 def test_a_bye_that_cannot_be_sent_still_clears_the_auto_call(
@@ -327,4 +335,35 @@ def test_stopping_hangs_up_a_live_call(sip_stub, monkeypatch):
     run(h.async_stop())
     assert "hangup" in sip_stub
     assert h._auto_called is False
+    assert h._stream_viewers == 0
+
+
+def test_a_hang_up_that_never_returns_cannot_block_the_unload(
+        sip_stub, monkeypatch):
+    """A half-open socket used to leave the entry stuck in "unloading".
+
+    `sip.send` waits on the connection lock and then on `writer.drain()`,
+    neither of them bounded, and the reader loop's keepalive holds that
+    lock while blocked in a drain of its own. The reader is still alive,
+    because this hang-up deliberately runs before the cancel loop.
+    """
+    h = _hub()
+    monkeypatch.setattr(sip, "in_call", True)
+    monkeypatch.setattr(sip, "writer", None)
+    monkeypatch.setattr(hub, "HANGUP_ON_UNLOAD_TIMEOUT", 0.01)
+
+    async def _never_returns():
+        sip_stub.append("hangup")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sip, "do_hangup", _never_returns)
+
+    async def _noop():
+        pass
+
+    monkeypatch.setattr(media_handler, "stop_media", _noop)
+    monkeypatch.setattr(media_handler, "close_transports", lambda: None)
+
+    run(asyncio.wait_for(h.async_stop(), 5))
+    assert "hangup" in sip_stub
     assert h._stream_viewers == 0
