@@ -30,7 +30,9 @@ can break the day Vimar changes something on their end.
 | `discovery.py` | The indoor unit's mDNS announcement (`_eipvdes._tcp`, TXT `mac`/`proxy`/`domain`): parsing, MAC normalisation, matching it to an existing entry and to the QR read afterwards — no Home Assistant |
 | `entity_plan.py` | Which plant-dependent entities exist and under which unique IDs, and which registry entries are stale — no Home Assistant |
 | `srtp.py` | SRTP (RFC 3711) encrypt/decrypt for the audio and video RTP streams |
-| `media_handler.py` | RTP/SRTP transport for audio and video, H.264 depacketisation, the video registry, the AV ffmpeg process |
+| `media_handler.py` | RTP/SRTP transport for audio and video, H.264 depacketisation, the video registry, the AV ffmpeg process, the 20 ms audio sender towards the panel |
+| `talkback.py` | Talk-back: G.711 µ-law encoding, the jitter buffer the 20 ms sender pulls from (voice, else silence), the one-talker rule, and the `vimar_intercom/talk` request against a duck-typed websocket connection — no Home Assistant |
+| `talk_api.py` | Registers the `vimar_intercom/talk` websocket command; the Home Assistant glue for `talkback.py` |
 | `config_flow.py` | Config (manual or from zeroconf discovery), reconfigure and options flows — QR image upload or paste in, panel list and door command out |
 | `camera.py` | Camera entity — the live stream and the keyframe-derived still |
 | `event.py` | Doorbell event entity, also the source of the `vimar_intercom_ring` bus event |
@@ -153,8 +155,9 @@ on separate ports (`RTPAudioProtocol`, `RTPVideoProtocol` in
 - **Audio** is decrypted and the plain RTP forwarded to a local UDP port,
   where ffmpeg picks it up and remuxes it into the MPEG-TS served by the
   `/api/vimar_intercom/av` HTTP view. Nothing else consumes it: there is
-  no decode to PCM and no buffer, because Home Assistant has no
-  talk-back path and nothing ever read one. ffmpeg runs with `-c copy` —
+  no decode to PCM and no buffer, because nothing would read one; the
+  talk-back path (below) goes the other way and never touches the
+  panel's audio. ffmpeg runs with `-c copy` —
   never `-c:v libx264` or any other transcode — because the reference
   deployment is a fanless two-core machine that a live re-encode would
   saturate.
@@ -198,6 +201,78 @@ artifacts, is behavioural and needs a live Vimar panel — see the
 README's note on why that validation is a scheduled session, not
 something to try casually.
 
+## Audio towards the panel, and talk-back
+
+For the whole of a call the media layer sends the panel one PCMU packet
+every 20 ms, SRTP-encrypted under the audio key this side offered: a
+call that carries nothing from this side is ended by the panel after
+about ten seconds. The sender owns the clock and the RTP sequence and
+timestamp; what goes in each packet is decided by `talkback.py`'s
+`TalkbackSource`, pulled once per tick — a queued talk-back frame if
+there is one, silence otherwise. So the packet rate never depends on a
+browser, and a talker who stops, stalls or disconnects leaves the call
+exactly as it was without talk-back.
+
+The browser side is the dashboard card's Talk button. It captures the
+microphone with echo cancellation, noise suppression and gain control,
+resamples it in an AudioWorklet (a ScriptProcessor where there is none)
+to 16-bit little-endian mono PCM at 8 kHz — a low-pass at 3.2 kHz
+first, so nothing folds back into the speech band — and sends 20 ms
+frames (320 bytes) over the frontend's existing websocket:
+
+1. The card subscribes with `{"type": "vimar_intercom/talk"}`. The
+   command refuses with `no_call` when the hub is not in a call and
+   `no_audio` when the 20 ms sender is not running.
+2. Otherwise it registers a websocket binary handler
+   (`ActiveConnection.async_register_binary_handler`, what Assist's
+   audio pipeline uses), sends the result, then an event
+   `{"type": "start", "handler_id": N, ...}`: the frontend's
+   `subscribeMessage` hands events to the caller but not the result's
+   payload.
+3. Each frame is one binary websocket message, `N` as its first byte.
+   Home Assistant routes it to the handler, which encodes µ-law and
+   queues it.
+4. The browser unsubscribing, or the websocket closing, runs the
+   subscription's cleanup: the session ends and the handler is
+   unregistered. The call ending, or another talker taking over, ends
+   the session from this side with an event `{"type": "end", "reason":
+   "call_ended" | "replaced"}`; the handler stays registered as a
+   no-op until the browser unsubscribes, so frames still in flight do
+   not make Home Assistant log an error each.
+
+A websocket binary handler rather than an HTTP upload, because it is
+authenticated before any command runs, closes with the page, needs no
+token in the card, and is the mechanism Home Assistant itself uses for
+microphone audio. The request carries no fields, so the command has no
+schema beyond its type.
+
+The buffer holds at most 200 ms and drops the oldest frame beyond
+that, so a burst or clock drift cannot build up a lasting delay.
+Playout starts once 60 ms are queued, and again after running dry, so
+network jitter does not turn into one-frame-on, one-frame-off chopping.
+One talker at a time, the newest winning: two voices mixed through one
+small speaker are noise, and a tab left talking in another room must
+not lock everyone else out. A talker who lets go keeps the last word
+(the queue plays out); a replaced talker, or the end of the call,
+drops it. µ-law is encoded in pure Python through a 16 K-entry table,
+matching `audioop.lin2ulaw` for every 16-bit sample: `audioop` is gone
+from Python 3.13.
+
+The card mutes the stream's own audio while Talk is on (ducking) and
+restores it after. The panel's microphone hears its own speaker, and
+the stream arrives seconds late, so without it you hear your own voice
+come back after a delay — an echo the browser's echo canceller cannot
+remove, because that audio never went through the call it processes.
+The mute reaches the `<video>`/`<audio>` elements inside
+`ha-camera-stream` through their open shadow roots; if the frontend
+ever changes that structure, ducking silently stops and nothing else
+breaks.
+
+**Built and unit tested, and the card exercised in a browser with a
+generated tone standing in for the microphone and a stand-in for the
+websocket, but not tried against a live panel, a real Home Assistant
+or a real microphone.**
+
 ## Dashboard card
 
 `async_setup` registers `frontend/vimar-intercom-card.js` as a static
@@ -218,7 +293,11 @@ key) and tells them apart by the `intercom_role` attribute every
 entity carries, and the `panel` attribute of the call and open buttons;
 the camera's `default_panel` says which panel watching calls on its
 own. It calls nothing but the entities' services (`button.press`,
-`lock.unlock`), so it can do nothing an automation could not.
+`lock.unlock`), so it can do nothing an automation could not — with
+one exception, the Talk button, which uses the `vimar_intercom/talk`
+websocket command (see "Audio towards the panel, and talk-back"). Its
+code is one block of the file (`VimarTalkBack` and what it needs),
+touched by the card in four places.
 
 Two choices follow from the hub rather than from taste. A ring does
 not start the video: opening the stream while a panel rings answers it
@@ -289,6 +368,18 @@ after 30 seconds, or as soon as `in_call` turns on.
   is how Home Assistant works rather than something introduced here, but
   fetching the view places a call to the entrance panel, so it is worth
   knowing about.
+- The `vimar_intercom/talk` websocket command lets any authenticated
+  Home Assistant user, admin or not, put their voice on the entrance
+  panel's speaker during a call — the same reach the answer and hang-up
+  buttons give them, and nothing outside a call: it is refused unless
+  the hub is in a call and the audio sender is running. A websocket
+  has no unauthenticated state in which a command could arrive. The
+  audio reaches nothing but the µ-law encoder and the buffer, bounded
+  at 200 ms however much a client sends; one binary message is
+  converted up to that bound and no further. A second client takes
+  over from the first rather than being refused, which is the intended
+  behaviour for a household and also means one user can cut another
+  off.
 - The phonebook download is authenticated with a token the indoor unit
   hands out in its status reply. It is kept in memory only, never
   persisted and never logged; a Basic challenge is refused rather than

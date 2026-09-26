@@ -190,6 +190,53 @@ also carry `panel` and `panel_name`, and the camera `default_panel` and
 `default_panel_name`. The card relies on them, and so can your own
 cards and templates.
 
+## Talk-back
+
+While you watch a call in the dashboard card, a **Hold to talk**
+button appears under the call. Your browser's microphone is played out
+of the entrance panel's speaker.
+
+- **Press and hold** while you speak, and let go to stop — like a
+  walkie-talkie.
+- **Tap** to keep talking without holding; tap again to stop.
+- On a keyboard, Enter or Space toggles it.
+
+While you talk, the stream's own sound is muted and comes back when
+you stop. The panel's microphone hears its own speaker, and the stream
+reaches your browser a few seconds late, so without this you would hear
+your own voice come back after a delay — an echo the browser cannot
+remove, because it never played that sound through a call. It is the
+way an intercom behaves anyway: while you speak, you do not hear the
+door. Echo cancellation, noise suppression and automatic gain are
+requested from the browser.
+
+It needs two things:
+
+- **Home Assistant opened over HTTPS** (or on `localhost`). Browsers
+  only give a page the microphone in a secure context. Over plain
+  `http://` the button is replaced by a short note saying so. Home
+  Assistant Cloud, a reverse proxy with a certificate, or the Let's
+  Encrypt / DuckDNS add-ons all provide it. The Home Assistant
+  companion apps count as whatever address they are connected to.
+- **Permission to use the microphone.** The browser asks the first time
+  you press the button. If you refused, allow it again from the
+  browser's site settings (in the companion app, from the phone's
+  settings for the app).
+
+Only one person talks at a time: if someone presses Talk on another
+screen, they take over and the first card says so. Talking stops when
+the call ends, when you leave the dashboard, or when the connection to
+Home Assistant drops. Nothing is recorded or stored; the audio is
+passed straight through to the panel.
+
+How it travels: the card resamples the microphone to 8 kHz, 16-bit
+mono, and sends it in 20 ms frames over the websocket connection the
+dashboard already has open (the same mechanism Assist uses for voice).
+The integration encodes it to G.711 µ-law and sends it to the panel in
+the call's encrypted audio stream, where silence went before. The
+panel keeps receiving a packet every 20 ms whether or not anyone is
+talking, as it needs to keep the call open.
+
 ## The `vimar_intercom_ring` event
 
 Every time a panel calls in, the integration fires `vimar_intercom_ring`
@@ -282,10 +329,17 @@ phonebook door inherits the original door lock.
 
 ## Limitations
 
-- **You can see and hear the door; you cannot speak back.** Audio from
-  the panel is carried in the camera stream. Home Assistant does not send
-  audio to the panel, and has no two-way voice interface for cameras.
-  Call and Answer control the call — they do not open a conversation.
+- **You can speak back only from the dashboard card.** Audio from the
+  panel is carried in the camera stream; talk-back is the card's Talk
+  button (see "Talk-back" above), which needs HTTPS. Home Assistant has
+  no two-way voice interface for cameras, so the camera entity itself,
+  and other cards showing it, stay listen-only. Call and Answer control
+  the call — they do not open a conversation.
+- **Talk-back has not been tried against a live panel or a real
+  microphone.** The encoding, the buffering and the card's audio path
+  are unit tested, and the card was exercised in a browser with a
+  generated tone, but whether the panel plays the audio at a good
+  level has not been heard yet.
 - **One Vimar system per Home Assistant installation.** The integration
   declares `single_config_entry`.
 - **The camera is implemented but not verified end to end against a live
@@ -361,6 +415,16 @@ look like bugs:
 - **A snapshot saves nothing** — there is no image outside a call.
   Answer or place a call first; see the "Doorbell snapshot" automation
   above.
+- **No Talk button** — it only appears while a call is being watched in
+  the card, and only where the browser can use a microphone. Over plain
+  `http://` the card shows a note instead: open Home Assistant over
+  HTTPS. "Microphone access was denied" means the browser, or the phone
+  for the companion app, refused it; allow it in the site or app
+  settings.
+- **The visitor cannot hear you** — the panel's own speaker volume
+  applies. "This call carries no audio from Home Assistant" means the
+  call was set up without an audio stream towards the panel, so there
+  is nothing to put a voice in; hang up and call again.
 - **The video cut out after five minutes** — that is the maximum call
   duration, not a fault. Open the stream again.
 - **Door does not open** — the lock addresses the relay group from your

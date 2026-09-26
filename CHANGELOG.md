@@ -43,6 +43,19 @@ by hand any more.
   does not start the video on its own, because opening the stream while
   a panel rings answers the call. The integration now declares
   `frontend` as a dependency.
+- **Talk-back from the dashboard card.** While a call is being watched
+  in the card, **Hold to talk** plays the browser's microphone out of
+  the entrance panel: hold while speaking, or tap to keep talking and
+  tap again to stop. The audio travels over the frontend's existing
+  websocket through a binary handler (`vimar_intercom/talk`, the
+  mechanism Assist uses), as 8 kHz 16-bit PCM the card resamples to,
+  and is encoded to G.711 µ-law in pure Python and sent in the call's
+  SRTP audio stream in place of the silence, with a 200 ms jitter
+  buffer. One person talks at a time, the newest taking over. The
+  stream's sound is muted while talking, so your own voice does not
+  come back from the panel seconds later. Needs HTTPS and microphone
+  permission; over plain HTTP the card says so. Not yet tried against
+  a live panel.
 - Every entity carries an `intercom_role` attribute, the call and open
   buttons `panel` and `panel_name`, and the camera `default_panel` and
   `default_panel_name`, so a card can tell them apart without guessing
@@ -163,7 +176,9 @@ by hand any more.
   would deregister the production panel, so real-hardware validation is
   a scheduled session, not something to try casually.
 - There is no still image outside a call.
-- Audio flows from the panel only. There is no talk-back.
+- Talk-back works from the dashboard card only (the camera entity has
+  no two-way audio in Home Assistant), needs HTTPS, and has not been
+  tried against a live panel.
 - One Vimar system per Home Assistant installation.
 - The AV stream view is reachable by any authenticated Home Assistant
   user; entity permissions do not apply to an HTTP view.

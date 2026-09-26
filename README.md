@@ -49,7 +49,7 @@ Developed against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due Fili P
 - **The camera has never been verified against a live panel.** It is built and unit tested; nothing more than that is claimed. The Vimar cloud accepts one SIP registration per account, so a second instance deregisters the first and takes down a real house's intercom, which is why end-to-end validation is a scheduled session rather than something done casually.
 - **Snapshots only work during a call.** Outside a call the panel sends no video, so the camera has no image to give and returns none. A still request never places a call of its own.
 - **A call is cut after five minutes**, as a safety net against a call left open forever.
-- **Audio flows from the panel only.** There is no talk-back.
+- **Talk-back is in the dashboard card only, and needs HTTPS.** The browser's microphone can be played out of the panel from the card's Talk button; like the camera, it has not been tried against a live panel yet.
 - **Upgrading from 1.x is a reinstall, not a migration.** Remove the old entry and add the integration again; most entity IDs change.
 
 **Entities:** camera, doorbell event, lock, call and door buttons, SIP registration sensor
