@@ -4,16 +4,24 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 
+from . import call_log as cl
 from . import sip_client as sip
 from . import media_handler as media
 from . import system_messages as sm
+from . import voicemail as vm
 from .const import (
+    APT_PARAMS_TIMEOUT,
+    CAMERA_SWITCH_ADDRESS,
     DOOR_COMMAND_CURRENT,
+    EVENT_MISSED_CALL,
     EVENT_RING,
+    EVENT_VIDEO_MESSAGE,
     PICG_ADDRESS,
     PLANT_STATUS_TIMEOUT,
     REGISTRATION_DOWN_GRACE,
+    RING_TIMEOUT,
 )
 from .phonebook import PhonebookError
 from .plant_config import PlantConfig
@@ -35,6 +43,32 @@ PlantFetcher = Callable[[sm.InitStatus, str], Awaitable[PlantConfig]]
 # Told about every newly downloaded plant configuration, with the one
 # it replaces, so it can be persisted. Returns nothing.
 PlantListener = Callable[[PlantConfig | None, PlantConfig], Awaitable[None]]
+
+
+@dataclass
+class ApartmentState:
+    """The apartment's settings as the indoor unit last reported them.
+
+    Everything is None until the unit has said: the entities built on
+    these are unavailable rather than showing a guess.
+    """
+
+    dnd: bool | None = None
+    voicemail: bool | None = None
+    vm_timeout: int | None = None
+    vm_timeout_values: tuple[int, ...] = ()
+    # (messages stored, capacity) from the status reply's vm_level.
+    vm_level: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class Ring:
+    """The INVITE ringing Home Assistant right now."""
+
+    panel: str
+    panel_name: str
+    call_ids: tuple[str, ...]
+    entry_id: int
 
 
 class VimarIntercomHub:
@@ -72,6 +106,21 @@ class VimarIntercomHub:
         self._sync_task: asyncio.Task | None = None
         self._sync_again = False
         self._was_registered = False
+        # The native-app features. See the "Apartment settings", "Rings
+        # and the call log" and "Video messages" sections below.
+        self._update_callbacks: list[Callable[[], None]] = []
+        self._apt = ApartmentState()
+        self._apt_waiters: dict[str, asyncio.Future] = {}
+        self._call_log = cl.CallLog()
+        self._save_call_log: Callable[[], None] | None = None
+        self._ring: Ring | None = None
+        self._ring_timeout: asyncio.TimerHandle | None = None
+        self._grace_timers: dict[int, asyncio.TimerHandle] = {}
+        self._switch_available = False
+        self._video_messages: tuple[vm.VideoMessage, ...] | None = None
+        self._mailbox_task: asyncio.Task | None = None
+        self._mailbox_again = False
+        self._new_message_pending = False
 
     @property
     def config(self) -> RuntimeConfig:
@@ -143,6 +192,29 @@ class VimarIntercomHub:
     def unregister_state_callback(self, callback: Callable) -> None:
         if callback in self._state_callbacks:
             self._state_callbacks.remove(callback)
+
+    def register_update_callback(self, callback: Callable[[], None]) -> None:
+        """Be told when a native-app feature's state changes.
+
+        Do-not-disturb, the answering machine, the ring, the call log,
+        the mailbox and the camera switch all change on messages from
+        the indoor unit rather than on the SIP state, so their entities
+        listen here. One signal for all of them: each entity re-reads
+        what it shows, and Home Assistant drops a write that changes
+        nothing.
+        """
+        self._update_callbacks.append(callback)
+
+    def unregister_update_callback(self, callback: Callable[[], None]) -> None:
+        if callback in self._update_callbacks:
+            self._update_callbacks.remove(callback)
+
+    def _notify_update(self) -> None:
+        for cb in list(self._update_callbacks):
+            try:
+                cb()
+            except Exception:
+                _LOGGER.exception("Update callback error")
 
     def _on_sip_state_change(self):
         """Called by sip_client when registered/in_call changes."""
@@ -263,7 +335,7 @@ class VimarIntercomHub:
         """
         try:
             if sip.pending_incoming["active"]:
-                ok, msg = await sip.do_answer_incoming()
+                ok, msg = await self._answer_pending()
             elif target:
                 ok, msg = await sip.do_call(target=self._cfg.panel_uri(target))
             else:
@@ -449,6 +521,17 @@ class VimarIntercomHub:
             t.cancel()
         self._background.clear()
         self._sync_task = None
+        self._mailbox_task = None
+        for waiter in self._apt_waiters.values():
+            if not waiter.done():
+                waiter.cancel()
+        self._apt_waiters.clear()
+        for timer in self._grace_timers.values():
+            timer.cancel()
+        self._grace_timers.clear()
+        self._cancel_ring_timeout()
+        self._ring = None
+        self._switch_available = False
         if self._status_waiter and not self._status_waiter.done():
             self._status_waiter.cancel()
         self._status_waiter = None
@@ -490,10 +573,54 @@ class VimarIntercomHub:
         return await sip.do_call()
 
     async def async_answer(self) -> tuple[bool, str]:
-        return await sip.do_answer_incoming()
+        return await self._answer_pending()
+
+    async def _answer_pending(self) -> tuple[bool, str]:
+        """Answer the ringing INVITE, and tell the other devices.
+
+        The official app sends `C;<call id>;ANSWERED` to the apartment's
+        intercom address when an incoming call connects, which is how
+        the other phones of the house learn the visitor was taken. The
+        call IDs are read before answering: answering clears them.
+        """
+        call_ids = tuple(sip.pending_incoming.get("call_ids") or ())
+        ok, msg = await sip.do_answer_incoming()
+        if ok:
+            self._ring_over(self._call_log.answered_here())
+            if call_ids:
+                self._track(self._notify_answered(call_ids[0]))
+        return ok, msg
+
+    async def _notify_answered(self, call_id: str) -> None:
+        sga = self.apartment_intercom
+        if sga is None:
+            _LOGGER.debug("No apartment intercom address in the phonebook; "
+                          "not telling the other devices this call was answered")
+            return
+        try:
+            body = sm.call_answered_command(call_id)
+        except ValueError:
+            _LOGGER.debug("The ring's call ID cannot be sent back; not "
+                          "telling the other devices it was answered")
+            return
+        ok, msg = await sip.do_system_message(
+            self._cfg.panel_uri(sga), body,
+            extra_headers={sm.PANDA_HEADER: sm.PANDA_BLUE})
+        if not ok:
+            _LOGGER.debug("The answered notice was not accepted (%s)", msg)
 
     async def async_decline(self):
+        """Refuse the ringing INVITE with 603 Decline.
+
+        603 is a global refusal: the proxy stops the other devices of
+        the house ringing too. That is what a Decline button is for; a
+        visitor this client merely cannot take (a call already up) gets
+        486 from the ring handler instead.
+        """
+        was_ringing = sip.pending_incoming["active"]
         await sip.do_decline_incoming()
+        if was_ringing:
+            self._ring_over(self._call_log.declined())
 
     async def async_hangup(self):
         self._clear_auto_call()
@@ -597,6 +724,487 @@ class VimarIntercomHub:
             _LOGGER.error("Door retry error: %s", err)
             return False, str(err)
 
+    # ─── Apartment settings ──────────────────────────────────────────
+    #
+    # Do-not-disturb and the answering machine are switched with a
+    # `blue` MESSAGE to the apartment's intercom address (the SDK's
+    # "SGA", the phonebook's MAGIC_APT_INTERCOM); the voicemail timeout
+    # with a `set` SET_APT_PARAMS to the indoor unit, which confirms it.
+    # Their state comes from the status reply and from the unit's own
+    # notifications when any device changes them.
+
+    @property
+    def apartment(self) -> ApartmentState:
+        """The apartment's settings as last reported."""
+        return self._apt
+
+    @property
+    def apartment_intercom(self) -> str | None:
+        """The apartment's intercom address, if the phonebook names one."""
+        sga = self._plant.apartment_intercom if self._plant is not None else None
+        return sga if sga and valid_sip_token(sga) else None
+
+    def _apply_status(self, status: sm.InitStatus) -> None:
+        self._apt.dnd = status.dnd
+        self._apt.voicemail = status.voicemail
+        self._apt.vm_timeout = status.vm_timeout
+        self._apt.vm_timeout_values = status.vm_timeout_values or ()
+        self._apt.vm_level = sm.parse_vm_level(status.vm_level)
+        self._notify_update()
+
+    async def async_set_dnd(self, on: bool) -> tuple[bool, str]:
+        """Turn do-not-disturb on or off for the whole apartment."""
+        return await self._set_apartment_switch(sm.dnd_command(on), "dnd", on)
+
+    async def async_set_voicemail(self, on: bool) -> tuple[bool, str]:
+        """Turn the answering machine on or off."""
+        return await self._set_apartment_switch(
+            sm.voicemail_command(on), "voicemail", on)
+
+    async def _set_apartment_switch(
+        self, body: str, attr: str, on: bool
+    ) -> tuple[bool, str]:
+        """Send a switch to the SGA; adopt the new state on its 200 OK.
+
+        Optimistic on the 200, as the official app is: the unit sends
+        no reply to these, only the notification other devices get, and
+        whether it echoes that back to the sender is not known.
+        """
+        sga = self.apartment_intercom
+        if sga is None:
+            return False, ("The plant's phonebook names no apartment intercom "
+                           "address, so this setting cannot be changed from "
+                           "here.")
+        ok, msg = await sip.do_system_message(
+            self._cfg.panel_uri(sga), body,
+            extra_headers={sm.PANDA_HEADER: sm.PANDA_BLUE})
+        if ok:
+            setattr(self._apt, attr, on)
+            self._notify_update()
+        return ok, msg
+
+    async def async_set_vm_timeout(self, seconds: int) -> tuple[bool, str]:
+        """Change how long the unit rings before the answering machine.
+
+        Unlike the switches this one is confirmed: the unit answers
+        SET_APT_PARAMS_REPLY with the request's MSGID and an error code,
+        and only ERR_NONE is a success.
+        """
+        values = self._apt.vm_timeout_values
+        if values and seconds not in values:
+            return False, f"The indoor unit does not offer a {seconds} s timeout."
+        msg_id = sm.new_message_id()
+        try:
+            body = sm.set_vm_timeout_command(msg_id, seconds)
+        except ValueError as err:
+            return False, str(err)
+        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._apt_waiters[msg_id] = waiter
+        try:
+            ok, msg = await sip.do_system_message(
+                self._cfg.panel_uri(PICG_ADDRESS), body,
+                extra_headers={sm.PANDA_HEADER: sm.PANDA_SET})
+            if not ok:
+                return False, msg
+            reply: sm.AptParamsReply = await asyncio.wait_for(
+                waiter, APT_PARAMS_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False, "The indoor unit did not confirm the change."
+        finally:
+            self._apt_waiters.pop(msg_id, None)
+        if not reply.ok:
+            return False, ("The indoor unit refused the change "
+                           f"({reply.error_code or 'no error code'}).")
+        self._apt.vm_timeout = seconds
+        self._notify_update()
+        return True, "OK"
+
+    def _on_dnd_line(self, line: str) -> None:
+        self._apt.dnd = sm.parse_switch(line, sm.DND_PREFIX)
+        self._notify_update()
+
+    def _on_voicemail_line(self, line: str) -> None:
+        self._apt.voicemail = sm.parse_switch(line, sm.VOICEMAIL_PREFIX)
+        self._notify_update()
+
+    def _on_apt_params_reply_line(self, line: str) -> None:
+        reply = sm.parse_apt_params_reply(line)
+        waiter = self._apt_waiters.get(reply.msg_id) if reply.msg_id else None
+        if waiter is not None and not waiter.done():
+            waiter.set_result(reply)
+
+    def _on_apt_params_changed_line(self, line: str) -> None:
+        change = sm.parse_apt_params_changed(line)
+        if change.vm_timeout is not None:
+            self._apt.vm_timeout = change.vm_timeout
+            self._notify_update()
+
+    # ─── Rings and the call log ──────────────────────────────────────
+    #
+    # A ring is on from the INVITE until Home Assistant answers or
+    # declines it, the panel cancels it, or another device answers it.
+    # Every ring goes into the call log (`call_log.py`), which also
+    # takes the unit's MISSED_CALL reports.
+
+    @property
+    def ringing(self) -> Ring | None:
+        """The ring in progress, or None."""
+        return self._ring
+
+    @property
+    def call_log(self) -> cl.CallLog:
+        """The local call log."""
+        return self._call_log
+
+    def set_call_log(self, log: cl.CallLog, save: Callable[[], None]) -> None:
+        """Adopt the restored call log, and the way to persist it.
+
+        `save` is Home Assistant's business (a delayed Store write), so
+        it is handed in and the hub stays testable without it.
+        """
+        self._call_log = log
+        self._save_call_log = save
+
+    def _call_log_changed(self) -> None:
+        if self._save_call_log is not None:
+            try:
+                self._save_call_log()
+            except Exception:  # noqa: BLE001 - a failed save loses history only
+                _LOGGER.exception("Could not save the call log")
+        self._notify_update()
+
+    def _panel_name(self, address: str) -> str:
+        return self._panel_for(address)[1]
+
+    @property
+    def panel_names(self) -> dict[str, str]:
+        """Extension to name, for every panel this installation knows."""
+        return {panel.address: panel.name for panel in self._cfg.panels}
+
+    def _start_ring(self, panel: str, name: str) -> None:
+        call_ids = tuple(sip.pending_incoming.get("call_ids") or ())
+        entry = self._call_log.ring(panel, name, call_ids, time.time())
+        self._ring = Ring(panel, name, call_ids, entry.id)
+        self._cancel_ring_timeout()
+        self._ring_timeout = asyncio.get_running_loop().call_later(
+            RING_TIMEOUT, self._on_ring_timeout)
+        self._call_log_changed()
+
+    def _cancel_ring_timeout(self) -> None:
+        if self._ring_timeout is not None:
+            self._ring_timeout.cancel()
+            self._ring_timeout = None
+
+    def _on_ring_timeout(self) -> None:
+        self._ring_timeout = None
+        if self._ring is None:
+            return
+        _LOGGER.debug("A ring nothing ended ran out after %ss", RING_TIMEOUT)
+        self._ring_over(self._call_log.ring_ended(), grace=True)
+
+    def _ring_over(self, entry: cl.CallEntry | None, grace: bool = False) -> None:
+        """The ring ended. `entry` is its log entry, as the log returned it.
+
+        With `grace`, the entry was left unanswered and is called missed
+        after `call_log.UNANSWERED_GRACE` unless something says it was
+        answered in the meantime.
+        """
+        self._ring = None
+        self._cancel_ring_timeout()
+        if not sip.in_call:
+            # A CALL_INFO that came with an unanswered ring.
+            self._switch_available = False
+        if grace and entry is not None:
+            self._grace_timers[entry.id] = asyncio.get_running_loop().call_later(
+                cl.UNANSWERED_GRACE, self._finalize_ring, entry.id)
+        self._call_log_changed()
+
+    def _finalize_ring(self, entry_id: int) -> None:
+        self._grace_timers.pop(entry_id, None)
+        entry = self._call_log.finalize(entry_id)
+        if entry is not None:
+            self._fire_missed(entry)
+            self._call_log_changed()
+
+    def _sync_ring_with_log(self) -> None:
+        """Drop the ring when the log says it is no longer ringing."""
+        if self._ring is not None and self._call_log.ringing is None:
+            self._ring = None
+            self._cancel_ring_timeout()
+
+    def _on_ring_ended(self, ended) -> None:
+        if not getattr(ended, "ours", False) or self._ring is None:
+            return
+        if getattr(ended, "answered_elsewhere", False):
+            self._ring_over(self._call_log.answered_elsewhere(None))
+        else:
+            self._ring_over(self._call_log.ring_ended(), grace=True)
+
+    def _fire_missed(self, entry: cl.CallEntry) -> None:
+        if self._hass is None:
+            return
+        self._hass.bus.async_fire(EVENT_MISSED_CALL, {
+            "panel": entry.panel,
+            "panel_name": entry.name,
+            "time": cl.iso_time(entry.time),
+            "entry_id": self._entry_id,
+        })
+
+    def _on_missed_call_line(self, line: str) -> None:
+        missed = sm.parse_missed_call(line)
+        panel = (missed.sip_id if missed.sip_id and valid_sip_token(missed.sip_id)
+                 else "unknown")
+        when = cl.epoch_seconds(missed.timestamp) or time.time()
+        entry, new = self._call_log.missed_call(
+            panel, self._panel_name(panel), when)
+        self._sync_ring_with_log()
+        if new:
+            self._fire_missed(entry)
+        self._call_log_changed()
+
+    def _on_call_answered_line(self, line: str) -> None:
+        call_id = sm.parse_call_answered(line)
+        if call_id is None:
+            return
+        was_ringing = self._ring is not None
+        entry = self._call_log.answered_elsewhere(call_id)
+        if entry is None:
+            return
+        if was_ringing and self._call_log.ringing is None:
+            self._ring_over(entry)
+        else:
+            self._call_log_changed()
+
+    async def async_clear_missed_calls(self) -> None:
+        """Reset the missed-call count."""
+        self._call_log.clear_missed()
+        self._call_log_changed()
+
+    # ─── Camera switch ───────────────────────────────────────────────
+
+    @property
+    def camera_switch_available(self) -> bool:
+        """True during a call whose panel said it has other cameras."""
+        return self._switch_available and sip.in_call
+
+    def _on_call_info_line(self, line: str) -> None:
+        available = sm.parse_call_info(line).switch_available
+        if available != self._switch_available:
+            self._switch_available = available
+            self._notify_update()
+
+    async def async_switch_camera(self, forward: bool) -> tuple[bool, str]:
+        """Show the calling panel's next (or previous) camera."""
+        if not self.camera_switch_available:
+            return False, "The calling panel has no other camera to switch to."
+        return await sip.do_system_message(
+            self._cfg.panel_uri(CAMERA_SWITCH_ADDRESS),
+            sm.switch_source_command(forward),
+            extra_headers={sm.PANDA_HEADER: sm.PANDA_BLUE})
+
+    # ─── Video messages ──────────────────────────────────────────────
+
+    @property
+    def video_messages(self) -> tuple[vm.VideoMessage, ...] | None:
+        """The mailbox, newest first, or None until it has been read."""
+        return self._video_messages
+
+    @property
+    def mailbox_usage(self) -> tuple[int, int] | None:
+        """(messages stored, capacity), or None when the unit never said.
+
+        The capacity only comes with the status reply; the count is the
+        mailbox's own once it has been read, since the unit sends no new
+        vm_level when a message arrives or is deleted.
+        """
+        level = self._apt.vm_level
+        if level is None:
+            return None
+        used = (len(self._video_messages) if self._video_messages is not None
+                else level[0])
+        return used, level[1]
+
+    def request_video_messages(self) -> None:
+        """Ask the indoor unit for its mailbox; the reply comes as a MESSAGE.
+
+        One request at a time; one asked for while another is being
+        sent is sent once more after it.
+        """
+        if self._mailbox_task is not None and not self._mailbox_task.done():
+            self._mailbox_again = True
+            return
+        self._mailbox_task = self._track(self._request_mailbox_loop())
+
+    async def _request_mailbox_loop(self) -> None:
+        while True:
+            self._mailbox_again = False
+            try:
+                ok, msg = await self._send_to_indoor_unit(sm.VM_GET_DB)
+                if not ok:
+                    _LOGGER.debug("VM;GET_DB was not accepted (%s)", msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the next notification retries
+                _LOGGER.debug("Asking for the mailbox failed", exc_info=True)
+            if not self._mailbox_again:
+                return
+
+    async def _send_to_indoor_unit(self, body: str) -> tuple[bool, str]:
+        return await sip.do_system_message(
+            self._cfg.panel_uri(PICG_ADDRESS), body,
+            extra_headers={sm.PANDA_HEADER: sm.PANDA_BLUE})
+
+    def _on_mailbox_changed_line(self, line: str) -> None:
+        if sm.classify_line(line) == sm.KIND_NEW_VOICEMAIL:
+            self._new_message_pending = True
+        self.request_video_messages()
+
+    async def _on_mailbox(self, body: str) -> None:
+        """Adopt a mailbox the unit sent, and announce what is new in it.
+
+        A message is new when the previous mailbox did not have it. The
+        first mailbox after a start has nothing to compare with, so only
+        a mailbox that answers a NEW notification announces its newest
+        unread message then.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            messages = await loop.run_in_executor(None, _read_mailbox, body)
+        except ValueError as err:
+            _LOGGER.warning("Could not read the video-message mailbox (%s)", err)
+            return
+        previous = self._video_messages
+        self._video_messages = messages
+        if previous is not None:
+            known = {(m.id, m.orig_time) for m in previous}
+            fresh = [m for m in messages
+                     if (m.id, m.orig_time) not in known and not m.read]
+        elif self._new_message_pending:
+            fresh = [m for m in messages if not m.read][:1]
+        else:
+            fresh = []
+        self._new_message_pending = False
+        for message in fresh:
+            self._fire_video_message(message)
+        self._notify_update()
+
+    def _fire_video_message(self, message: vm.VideoMessage) -> None:
+        if self._hass is None:
+            return
+        self._hass.bus.async_fire(EVENT_VIDEO_MESSAGE, {
+            **message.as_attribute(self.panel_names),
+            "entry_id": self._entry_id,
+        })
+
+    def _find_message(self, message_id: str) -> vm.VideoMessage | None:
+        for message in self._video_messages or ():
+            if message.id == str(message_id).strip():
+                return message
+        return None
+
+    def _unknown_message(self, message_id: str) -> tuple[bool, str]:
+        if self._video_messages is None:
+            return False, "The video messages have not been read from the indoor unit yet."
+        return False, f"There is no video message with ID {message_id}."
+
+    async def async_mark_video_message_read(self, message_id: str) -> tuple[bool, str]:
+        """Mark one message read, on the unit and here."""
+        message = self._find_message(message_id)
+        if message is None:
+            return self._unknown_message(message_id)
+        ok, msg = await self._send_to_indoor_unit(vm.read_command(message))
+        if ok:
+            self._video_messages = tuple(
+                replace(m, read=True) if m == message else m
+                for m in self._video_messages or ())
+            self._notify_update()
+            self.request_video_messages()
+        return ok, msg
+
+    async def async_delete_video_message(self, message_id: str) -> tuple[bool, str]:
+        """Delete one message, on the unit and here."""
+        message = self._find_message(message_id)
+        if message is None:
+            return self._unknown_message(message_id)
+        ok, msg = await self._send_to_indoor_unit(vm.delete_command(message))
+        if ok:
+            self._video_messages = tuple(
+                m for m in self._video_messages or () if m != message)
+            self._notify_update()
+            self.request_video_messages()
+        return ok, msg
+
+    async def async_delete_all_video_messages(self) -> tuple[bool, str]:
+        """Empty the mailbox."""
+        ok, msg = await self._send_to_indoor_unit(vm.DELETE_ALL)
+        if ok:
+            self._video_messages = ()
+            self._notify_update()
+            self.request_video_messages()
+        return ok, msg
+
+    async def async_play_video_message(self, message_id: str) -> tuple[bool, str]:
+        """Play a message: call the extension that plays it back.
+
+        The recording is the media of an ordinary call, so it shows on
+        the camera like any call does, and ends with the unit's BYE.
+        Playing an unread message marks it read, as opening it in the
+        app does.
+        """
+        message = self._find_message(message_id)
+        if message is None:
+            return self._unknown_message(message_id)
+        prefix = self._plant.vm_prefix if self._plant is not None else None
+        extension = vm.playback_extension(message, prefix)
+        if not valid_sip_token(extension):
+            return False, "That message has no extension it can be played from."
+        ok, msg = await self.async_call(target=extension)
+        if ok and not message.read:
+            self._track(self.async_mark_video_message_read(message.id))
+        return ok, msg
+
+    # ─── Diagnostics ─────────────────────────────────────────────────
+
+    def diagnostics(self) -> dict:
+        """What a bug report needs, without a secret or an identity.
+
+        No SIP identity, no address, no token, no call ID: counts,
+        flags and the settings the unit reported.
+        """
+        plant = self._plant
+        messages = self._video_messages
+        return {
+            "registered": self.registered,
+            "in_call": self.in_call,
+            "ringing": self._ring is not None,
+            "camera_switch_available": self.camera_switch_available,
+            "plant": None if plant is None else {
+                "panels": len(plant.panels),
+                "actuators": len(plant.actuators),
+                "has_group": plant.group is not None,
+                "has_apartment_intercom": self.apartment_intercom is not None,
+                "has_vm_prefix": plant.vm_prefix is not None,
+            },
+            "status_received": self._init_status is not None,
+            "apartment": {
+                "dnd": self._apt.dnd,
+                "voicemail": self._apt.voicemail,
+                "vm_timeout": self._apt.vm_timeout,
+                "vm_timeout_values": list(self._apt.vm_timeout_values),
+                "vm_level": (None if self._apt.vm_level is None
+                             else list(self._apt.vm_level)),
+            },
+            "video_messages": None if messages is None else {
+                "total": len(messages),
+                "unread": sum(1 for m in messages if not m.read),
+            },
+            "call_log": {
+                "entries": len(self._call_log.entries),
+                "missed_count": self._call_log.missed_count,
+                "outcomes": [e.outcome for e in self._call_log.entries],
+            },
+        }
+
     # ─── Plant configuration ─────────────────────────────────────────
 
     @property
@@ -699,6 +1307,9 @@ class VimarIntercomHub:
         status = await self._request_init_status()
         if status is None:
             return
+        # The unit answers, so it is there to ask for its mailbox too.
+        # The official app fetches it after the status as well.
+        self.request_video_messages()
         if not status.rubrica_ver or not status.token:
             _LOGGER.debug("The indoor unit announced no phonebook; keeping "
                           "the current panels")
@@ -757,27 +1368,43 @@ class VimarIntercomHub:
     def _handle_message(self, message: sip.InboundMessage) -> None:
         """Dispatch the lines of a MESSAGE from the indoor unit.
 
-        Only the families this integration acts on are handled: the
-        status reply this hub asked for, and the notification that the
-        phonebook changed. Every other line is classified and ignored,
-        which is where do-not-disturb and voicemail updates will plug in.
+        A `grey` MESSAGE with `Koala: mailbox.db` is the video-message
+        mailbox this hub asked for. Any other `Panda` family but `blue`
+        (text messages) is not read as a system notification, whatever
+        its text says. One with no header at all is accepted: whether
+        the indoor unit always sets it on its replies has not been
+        confirmed.
 
-        A MESSAGE with a `Panda` header other than `blue` belongs to
-        another family (text messages, the voicemail database) and is
-        not read as a system notification, whatever its text says. One
-        with no header at all is accepted: whether the indoor unit
-        always sets it on its replies has not been confirmed.
+        Every line of a notification is classified; the kinds this
+        integration acts on have a handler below, the rest (nicknames,
+        apartment names, text-message receipts) are ignored.
         """
-        if message.panda is not None and message.panda.lower() != sm.PANDA_BLUE:
+        panda = (message.panda or "").lower()
+        if panda == sm.PANDA_GREY and message.koala == sm.KOALA_MAILBOX:
+            self._track(self._on_mailbox(message.body))
+            return
+        if message.panda is not None and panda != sm.PANDA_BLUE:
             _LOGGER.debug("Ignoring a MESSAGE of family %s", message.panda)
             return
         _LOGGER.debug("System MESSAGE from %s (%s)", message.sender,
                       sm.summarize_body(message.body))
+        handlers = {
+            sm.KIND_INIT_STATUS_REPLY: self._on_init_status_line,
+            sm.KIND_NEW_PHONEBOOK: self._on_new_phonebook_line,
+            sm.KIND_DND_STATUS: self._on_dnd_line,
+            sm.KIND_VOICEMAIL_STATUS: self._on_voicemail_line,
+            sm.KIND_SET_APT_PARAMS_REPLY: self._on_apt_params_reply_line,
+            sm.KIND_APT_PARAMS_CHANGED: self._on_apt_params_changed_line,
+            sm.KIND_NEW_VOICEMAIL: self._on_mailbox_changed_line,
+            sm.KIND_VOICEMAIL_CHANGE: self._on_mailbox_changed_line,
+            sm.KIND_MISSED_CALL: self._on_missed_call_line,
+            sm.KIND_CALL_INFO: self._on_call_info_line,
+            sm.KIND_CALL_ANSWERED: self._on_call_answered_line,
+        }
         for kind, line in sm.classify_body(message.body):
-            if kind == sm.KIND_INIT_STATUS_REPLY:
-                self._on_init_status_line(line)
-            elif kind == sm.KIND_NEW_PHONEBOOK:
-                self._on_new_phonebook_line(line)
+            handler = handlers.get(kind)
+            if handler is not None:
+                handler(line)
 
     def _on_init_status_line(self, line: str) -> None:
         try:
@@ -786,6 +1413,7 @@ class VimarIntercomHub:
             _LOGGER.debug("Unreadable GET_INIT_STATUS_REPLY: %s", err)
             return
         self._init_status = status
+        self._apply_status(status)
         waiter = self._status_waiter
         if waiter is not None and not waiter.done():
             waiter.set_result(status)
@@ -815,9 +1443,18 @@ class VimarIntercomHub:
         if msg_type == "call_started":
             self._start_call_timeout()
             self._start_keyframe_loop()
+        elif msg_type == "ring_ended":
+            self._on_ring_ended(msg)
         elif msg_type == "call_ended":
             self._cancel_call_timeout()
             self._cancel_keyframe_loop()
+            if self._switch_available:
+                self._switch_available = False
+                self._notify_update()
+            if self._ring is not None and not sip.pending_incoming["active"]:
+                # The connection went while it rang (`_abandon_call`):
+                # nothing will ever CANCEL that INVITE now.
+                self._ring_over(self._call_log.ring_ended(), grace=True)
             # The panel, the cloud or our own BYE ended the call. This is
             # the one place every ending converges, so it is where the
             # auto-call record is torn down.
@@ -857,9 +1494,19 @@ class VimarIntercomHub:
                 _LOGGER.info(
                     "Declining a doorbell press that arrived during a call; "
                     "the ring event still fires")
+                call_ids = tuple(sip.pending_incoming.get("call_ids") or ())
                 self._track(sip.do_decline_incoming(busy=True))
 
             address, name = self._panel_for(caller_uri)
+            if busy:
+                # Logged, but not ringing here: 486 left the rest of the
+                # house ringing, and only the unit's MISSED_CALL or
+                # another device's C;<id>;ANSWERED can say how it ended.
+                self._call_log.ring(address, name, call_ids, time.time())
+                self._call_log.ring_ended()
+                self._call_log_changed()
+            else:
+                self._start_ring(address, name)
 
             if self._hass is not None:
                 self._hass.bus.async_fire(EVENT_RING, {
@@ -873,3 +1520,8 @@ class VimarIntercomHub:
                     cb(address)
                 except Exception:
                     _LOGGER.exception("Ring callback error")
+
+
+def _read_mailbox(body: str) -> tuple[vm.VideoMessage, ...]:
+    """Decode and parse a mailbox body; blocking, run in the executor."""
+    return vm.parse_mailbox(vm.decode_mailbox(body))

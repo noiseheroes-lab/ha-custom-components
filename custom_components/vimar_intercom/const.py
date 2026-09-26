@@ -46,6 +46,11 @@ CA_PATH = os.path.join(SCRIPT_DIR, "vimar_rootca.pem")
 
 # ─── Events ──────────────────────────────────────────────────────
 EVENT_RING = "vimar_intercom_ring"
+# A panel rang and nobody answered — reported by the indoor unit, or
+# concluded from a ring the panel gave up on. Fired once per visitor.
+EVENT_MISSED_CALL = "vimar_intercom_missed_call"
+# A new video message is in the indoor unit's mailbox.
+EVENT_VIDEO_MESSAGE = "vimar_intercom_video_message"
 
 # ─── Dashboard card contract ─────────────────────────────────────
 # State attributes the bundled dashboard card reads to tell the
@@ -70,6 +75,16 @@ ROLE_CALL = "call"
 ROLE_OPEN = "open"
 ROLE_DOOR = "door"
 ROLE_ACTUATOR = "actuator"
+ROLE_DECLINE = "decline"
+ROLE_RINGING = "ringing"
+ROLE_DND = "dnd"
+ROLE_VOICEMAIL = "voicemail"
+ROLE_VOICEMAIL_TIMEOUT = "voicemail_timeout"
+ROLE_MAILBOX_USAGE = "mailbox_usage"
+ROLE_VIDEO_MESSAGES = "video_messages"
+ROLE_MISSED_CALLS = "missed_calls"
+ROLE_CAMERA_NEXT = "camera_next"
+ROLE_CAMERA_PREVIOUS = "camera_previous"
 
 # ─── Repair issues ───────────────────────────────────────────────
 ISSUE_REGISTRATION_DOWN = "registration_down"
@@ -122,3 +137,31 @@ PLANT_STATUS_TIMEOUT = 15
 # holds the phonebook token.
 PLANT_STORAGE_VERSION = 1
 PLANT_STORAGE_KEY = "vimar_intercom.{entry_id}.plant"
+
+# ─── Native-app features ─────────────────────────────────────────
+# CALL_SWITCH_SOURCE goes to this address, whatever the plant: the SDK
+# hardcodes it (VMSIPImpl.switchVideoSource).
+CAMERA_SWITCH_ADDRESS = "60002"
+# Seconds to wait for SET_APT_PARAMS_REPLY before calling a change failed.
+APT_PARAMS_TIMEOUT = 10
+# A ring nothing has ended after this many seconds is over anyway: a
+# CANCEL can be lost with the connection, and the ringing sensor must not
+# stay on for good. Panels give up ringing well before this.
+RING_TIMEOUT = 120
+# How many video messages the sensor lists in its attributes. The state
+# attributes are written to the recorder on every change.
+MAX_LISTED_VIDEO_MESSAGES = 50
+# The local call log, per entry, in `.storage`.
+CALL_LOG_STORAGE_VERSION = 1
+CALL_LOG_STORAGE_KEY = "vimar_intercom.{entry_id}.call_log"
+# Seconds a call-log change waits before it is written, so a burst of
+# changes (a ring, its end, the unit's report) is one write.
+CALL_LOG_SAVE_DELAY = 10
+
+# ─── Services ────────────────────────────────────────────────────
+SERVICE_MARK_VIDEO_MESSAGE_READ = "mark_video_message_read"
+SERVICE_DELETE_VIDEO_MESSAGE = "delete_video_message"
+SERVICE_DELETE_ALL_VIDEO_MESSAGES = "delete_all_video_messages"
+SERVICE_PLAY_VIDEO_MESSAGE = "play_video_message"
+SERVICE_CLEAR_MISSED_CALLS = "clear_missed_calls"
+ATTR_MESSAGE_ID = "message_id"
