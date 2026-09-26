@@ -1,3 +1,7 @@
+> **Moved.** Vimar Intercom is now developed and released at
+> [noiseheroes-lab/ha-vimar-intercom](https://github.com/noiseheroes-lab/ha-vimar-intercom).
+> Install it from there; this copy is no longer maintained.
+
 # Vimar Intercom — Home Assistant Integration
 
 > **Status: version 2.0.0.** `main` carries the v2 rewrite, so that is
