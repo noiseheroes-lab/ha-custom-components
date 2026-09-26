@@ -294,12 +294,15 @@ def open_sqlite_bytes(data: bytes) -> sqlite3.Connection:
 
 def table_rows(con: sqlite3.Connection, table: str) -> list[dict[str, Any]] | None:
     """Every row of `table` as a dict, or None if the table is missing."""
+    # SQLite table names are case-insensitive, and the devices do not all
+    # spell them the way the app's queries do.
     exists = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name = ? COLLATE NOCASE",
         (table,)).fetchone()
     if not exists:
         return None
-    cursor = con.execute(f'SELECT * FROM "{table}"')  # noqa: S608 - fixed names
+    cursor = con.execute(f'SELECT * FROM "{exists[0]}"')  # noqa: S608 - a name read from the schema
     columns = [d[0].upper() for d in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 

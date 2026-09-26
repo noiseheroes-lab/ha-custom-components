@@ -158,12 +158,18 @@ def parse_mailbox(data: bytes) -> tuple[VideoMessage, ...]:
         raise ValueError("the mailbox database cannot be opened") from err
     try:
         rows = table_rows(con, "MAILBOX")
+        tables = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")]
     except sqlite3.Error as err:
         raise ValueError("the mailbox database is unreadable") from err
     finally:
         con.close()
     if rows is None:
-        raise ValueError("the database has no MAILBOX table")
+        # Table names are schema, never content, so they are safe to show
+        # and are what a report needs to support another firmware.
+        raise ValueError(
+            "the database has no MAILBOX table (tables: "
+            f"{', '.join(tables[:10]) or 'none'})")
     messages = [m for m in (_message(row) for row in rows) if m is not None]
     messages.sort(key=lambda m: m.orig_time, reverse=True)
     return tuple(messages)
