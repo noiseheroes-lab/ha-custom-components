@@ -249,7 +249,7 @@ class OctopusEnergyItalyAPI:
 
     def _do_auth(self, input_data: dict) -> None:
         data = self._gql_raw(_OBTAIN_TOKEN, {"input": input_data})
-        result = data.get("obtainKrakenToken", {})
+        result = data.get("obtainKrakenToken") or {}
         token = result.get("token")
         if not token:
             raise AuthError("No token in response")
@@ -495,12 +495,17 @@ class OctopusEnergyItalyAPI:
             if any(c in ("KT-CT-1124", "KT-CT-1111") for c in codes):
                 self._token = None  # force re-auth next call
                 raise AuthError("Token expired or unauthorized")
+            # Wrong email or password. Kraken answers with data present
+            # but `obtainKrakenToken: null`, which the partial-error path
+            # below would pass on as a result.
+            if "KT-CT-1138" in codes:
+                raise AuthError("Invalid email or password")
             messages = "; ".join(e.get("message", "unknown") for e in errors)
             if not payload.get("data"):
                 raise APIError(f"GraphQL errors: {messages}")
             _LOGGER.debug("GraphQL partial errors: %s", messages)
 
-        return payload.get("data", {})
+        return payload.get("data") or {}
 
 
 # ---------------------------------------------------------------------------
