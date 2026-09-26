@@ -269,8 +269,12 @@ def _icon_or_none(value: Any) -> str | None:
     return None if value is None else _clean_name(value, "")[:16] or None
 
 
-def _open(data: bytes) -> sqlite3.Connection:
-    """Open the downloaded bytes as a read-only in-memory database."""
+def open_sqlite_bytes(data: bytes) -> sqlite3.Connection:
+    """Open downloaded SQLite bytes as an in-memory database.
+
+    Shared with `voicemail.py`: the mailbox arrives the same way, as the
+    bytes of a whole database file.
+    """
     con = sqlite3.connect(":memory:")
     if hasattr(con, "deserialize"):
         con.deserialize(data)
@@ -288,7 +292,7 @@ def _open(data: bytes) -> sqlite3.Connection:
     return con
 
 
-def _rows(con: sqlite3.Connection, table: str) -> list[dict[str, Any]] | None:
+def table_rows(con: sqlite3.Connection, table: str) -> list[dict[str, Any]] | None:
     """Every row of `table` as a dict, or None if the table is missing."""
     exists = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -316,17 +320,17 @@ def parse_phonebook(data: bytes, *, group: str, version: str) -> PlantConfig:
         raise ValueError("the phonebook is not an SQLite database")
 
     try:
-        con = _open(data)
+        con = open_sqlite_bytes(data)
     except sqlite3.Error as err:
         raise ValueError("the phonebook database cannot be opened") from err
     try:
-        phonebook = _rows(con, "PHONEBOOK")
+        phonebook = table_rows(con, "PHONEBOOK")
         if phonebook is None:
             raise ValueError("the database has no PHONEBOOK table")
-        actuator_rows = _rows(con, "ACTUATOR_LIST") or []
-        rule_rows = _rows(con, "ACTUATOR_RULES")
-        icon_rows = _rows(con, "ICON_LIST") or []
-        system_rows = _rows(con, "SYSTEM") or []
+        actuator_rows = table_rows(con, "ACTUATOR_LIST") or []
+        rule_rows = table_rows(con, "ACTUATOR_RULES")
+        icon_rows = table_rows(con, "ICON_LIST") or []
+        system_rows = table_rows(con, "SYSTEM") or []
     except sqlite3.Error as err:
         raise ValueError("the phonebook database is unreadable") from err
     finally:
