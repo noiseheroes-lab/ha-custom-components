@@ -1180,3 +1180,55 @@ def test_no_offered_key_means_no_silence(cfg, monkeypatch):
         assert all(d[0] & 0xC0 != 0x80 for d, _ in transport.sent)
     finally:
         audio.close()
+
+
+def test_a_talker_is_heard_in_the_packets_and_the_call_end_stops_it(
+        cfg, monkeypatch):
+    """Talk-back rides the same 20 ms packets as the silence: voice when
+    the source has some, silence either side, and the end of the call
+    tells the talker and stops the sender.
+    """
+    import base64
+
+    from custom_components.vimar_intercom import talkback as tb
+    from custom_components.vimar_intercom.srtp import SRTPContext
+
+    key = base64.b64encode(os.urandom(30)).decode()
+    audio = media.RTPAudioProtocol()
+    transport = _RecordingTransport()
+    audio.transport = transport
+    source = tb.TalkbackSource()
+    monkeypatch.setattr(media, "talkback", source)
+    monkeypatch.setattr(media, "audio_proto", audio)
+    monkeypatch.setattr(media, "video_proto", None)
+    monkeypatch.setattr(media, "local_audio_key", key)
+    monkeypatch.setattr(media, "_stun_task", None)
+    monkeypatch.setattr(media, "_silence_task", None)
+    voice = struct.pack("<160h", *([3000] * 160))
+    ended = []
+
+    async def scenario():
+        assert not media.audio_sending()
+        await media.setup_media({"audio": {"port": 40000, "ip": "192.0.2.20"}})
+        assert media.audio_sending()
+        await asyncio.sleep(0.03)
+        session = source.open(ended.append)
+        for _ in range(4):
+            session.push(voice)
+        await asyncio.sleep(0.15)
+        await media.stop_media()
+        assert not media.audio_sending()
+
+    try:
+        run(scenario())
+        rx = SRTPContext(key)
+        payloads = [rx.unprotect(d)[12:] for d, _ in transport.sent
+                    if d[0] & 0xC0 == 0x80]
+        spoken = bytes([tb.linear_to_ulaw(3000)]) * 160
+        assert payloads[0] == media.SILENCE_PAYLOAD
+        assert payloads.count(spoken) == 4
+        assert payloads[-1] == media.SILENCE_PAYLOAD
+        assert ended == [tb.END_CALL_ENDED]
+        assert not source.talking
+    finally:
+        audio.close()

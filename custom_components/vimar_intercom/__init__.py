@@ -47,6 +47,7 @@ from .phonebook import download_phonebook, phonebook_url
 from .plant_config import PlantConfig, parse_phonebook
 from .runtime import RuntimeConfig, build_runtime_config
 from .system_messages import InitStatus
+from .talk_api import async_register_talk_api
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,14 +72,16 @@ _MESSAGE_SCHEMA = vol.Schema({vol.Required(ATTR_MESSAGE_ID): cv.string})
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Serve the dashboard card and register the services, once per run.
+    """Serve the dashboard card, its talk-back command and the services.
 
-    Here rather than in `async_setup_entry`, which runs again on every
-    reload; see `dashboard_card`. The services exist whether or not an
-    entry is loaded, as Home Assistant recommends, and say so when none
-    is.
+    Once per run: here rather than in `async_setup_entry`, which runs
+    again on every reload; see `dashboard_card`. The talk-back command
+    resolves the hub per request, so it outlives reloads the way the AV
+    view does. The services exist whether or not an entry is loaded, as
+    Home Assistant recommends, and say so when none is.
     """
     await async_register_card(hass)
+    async_register_talk_api(hass, _resolve_hub)
     _register_services(hass)
     return True
 
