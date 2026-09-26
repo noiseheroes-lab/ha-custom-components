@@ -7,8 +7,10 @@ behaviours need pinning down.
 """
 
 import asyncio
+import logging
 import ssl
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -696,3 +698,199 @@ def test_the_shipped_ca_file_produces_a_verifying_context():
     ctx = sip._create_ssl_context()
     assert ctx.verify_mode == ssl.CERT_REQUIRED
     assert ctx.check_hostname is True
+
+
+# ─── Locating the SIP server (RFC 3263) ──────────────────────────────
+
+VIMAR_SRV = [
+    sip.locate.SrvRecord(0, 30, 7042, f"flexiprod{n}.ipvdes2.vimarsso.cloud")
+    for n in (1, 2, 3)
+]
+VIMAR_SERVERS = {r.target for r in VIMAR_SRV}
+
+
+class _RecordingWriter:
+    def __init__(self):
+        self.sent = b""
+
+    def write(self, data):
+        self.sent += data
+
+    async def drain(self):
+        return None
+
+    def is_closing(self):
+        return False
+
+    def close(self):
+        return None
+
+
+@pytest.fixture
+def dialled(monkeypatch):
+    """Record every TLS connection attempt instead of making it.
+
+    Hosts listed in `dialled.dead` never answer, like the blackholed
+    port that stalled the supervisor.
+    """
+    attempts = []
+    dead: set[str] = set()
+
+    async def _open_connection(host, port, **kwargs):
+        attempts.append({"host": host, "port": port, **kwargs})
+        if host in dead:
+            await asyncio.Event().wait()
+        return object(), _RecordingWriter()
+
+    monkeypatch.setattr(asyncio, "open_connection", _open_connection)
+    monkeypatch.setattr(sip, "MY_IP", "192.0.2.5")
+    return SimpleNamespace(attempts=attempts, dead=dead)
+
+
+def _srv_answers(monkeypatch, records):
+    queries = []
+
+    async def _query(name):
+        queries.append(name)
+        return list(records)
+
+    monkeypatch.setattr(sip.locate, "_aiodns_srv", _query)
+    return queries
+
+
+def _cloud_config(options=None):
+    fields = {**QR_FIELDS, "CPROXY": "ipvdes.vimar.cloud", "PROXY": "192.0.2.10"}
+    return runtime.build_runtime_config(
+        runtime.entry_data_from_qr(fields), options or {})
+
+
+def test_the_cloud_proxy_is_dialled_through_srv_but_verified_as_the_domain(
+        monkeypatch, dialled):
+    """The owner's failure: v2 dialled the SIP domain itself, which is dead."""
+    queries = _srv_answers(monkeypatch, VIMAR_SRV)
+    monkeypatch.setattr(sip, "CFG", _cloud_config())
+
+    run(sip.connect())
+
+    assert queries == ["_sips._tcp.ipvdes.vimar.cloud"]
+    [attempt] = dialled.attempts
+    assert attempt["host"] in VIMAR_SERVERS
+    assert attempt["port"] == 7042
+    # SNI and the certificate hostname check stay on the QR's name.
+    assert attempt["server_hostname"] == "ipvdes.vimar.cloud"
+    assert attempt["ssl"].check_hostname is True
+    assert attempt["ssl"].verify_mode == ssl.CERT_REQUIRED
+
+
+def test_the_sip_headers_still_name_the_domain_after_srv(monkeypatch, dialled):
+    _srv_answers(monkeypatch, VIMAR_SRV)
+    monkeypatch.setattr(sip, "CFG", _cloud_config())
+
+    async def _no_answer(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(sip, "_wait_final", _no_answer)
+
+    async def _scenario():
+        await sip.connect()
+        await sip.do_register()
+
+    run(_scenario())
+
+    sent = sip.writer.sent.decode()
+    assert sent.startswith("REGISTER sip:example.invalid SIP/2.0\r\n")
+    assert "Route: <sip:ipvdes.vimar.cloud;transport=tls;lr>\r\n" in sent
+    assert "vimarsso" not in sent
+
+
+def test_a_dead_srv_server_is_skipped_for_the_next(monkeypatch, dialled):
+    monkeypatch.setattr(sip.C, "SIP_CONNECT_TIMEOUT", 0.05)
+    _srv_answers(monkeypatch, VIMAR_SRV)
+    monkeypatch.setattr(sip, "CFG", _cloud_config())
+    # Whichever server the weighted draw picks first, make it the dead one.
+    monkeypatch.setattr(
+        sip.locate, "order_srv",
+        lambda records, rng=None: [
+            sip.locate.Target(r.target, r.port) for r in records])
+    dialled.dead.add("flexiprod1.ipvdes2.vimarsso.cloud")
+
+    run(sip.connect())
+
+    assert [a["host"] for a in dialled.attempts] == [
+        "flexiprod1.ipvdes2.vimarsso.cloud",
+        "flexiprod2.ipvdes2.vimarsso.cloud",
+    ]
+    assert {a["server_hostname"] for a in dialled.attempts} == {
+        "ipvdes.vimar.cloud"}
+
+
+def test_a_connect_that_never_completes_raises_instead_of_hanging(
+        monkeypatch, dialled):
+    monkeypatch.setattr(sip.C, "SIP_CONNECT_TIMEOUT", 0.05)
+    _srv_answers(monkeypatch, VIMAR_SRV)
+    monkeypatch.setattr(sip, "CFG", _cloud_config())
+    dialled.dead.update(VIMAR_SERVERS)
+
+    started = time.monotonic()
+    with pytest.raises(ConnectionError):
+        run(sip.connect())
+    assert time.monotonic() - started < 2
+    assert len(dialled.attempts) == 3
+
+
+def test_every_reconnect_looks_the_servers_up_again(monkeypatch, dialled):
+    queries = _srv_answers(monkeypatch, VIMAR_SRV)
+    monkeypatch.setattr(sip, "CFG", _cloud_config())
+
+    run(sip.connect())
+    run(sip.connect())
+
+    assert len(queries) == 2
+
+
+def test_without_srv_records_the_configured_host_is_dialled(monkeypatch, dialled):
+    _srv_answers(monkeypatch, [])
+    monkeypatch.setattr(sip, "CFG", _cloud_config({"sip_port": 5061}))
+
+    run(sip.connect())
+
+    [attempt] = dialled.attempts
+    assert (attempt["host"], attempt["port"]) == ("ipvdes.vimar.cloud", 5061)
+
+
+def test_a_port_override_applies_to_the_srv_servers(monkeypatch, dialled):
+    _srv_answers(monkeypatch, VIMAR_SRV)
+    monkeypatch.setattr(sip, "CFG", _cloud_config({"sip_port": 5061}))
+
+    run(sip.connect())
+
+    [attempt] = dialled.attempts
+    assert attempt["host"] in VIMAR_SERVERS
+    assert attempt["port"] == 5061
+
+
+def test_the_local_panel_is_dialled_directly_without_srv(monkeypatch, dialled):
+    async def _query(_name):
+        raise AssertionError("the local panel must not go through SRV")
+
+    monkeypatch.setattr(sip.locate, "_aiodns_srv", _query)
+    monkeypatch.setattr(sip, "CFG", _cloud_config({"prefer_local": True}))
+
+    run(sip.connect())
+
+    [attempt] = dialled.attempts
+    assert (attempt["host"], attempt["port"]) == ("192.0.2.10", 5060)
+    assert attempt["server_hostname"] == "ipvdes.vimar.cloud"
+
+
+def test_connecting_never_logs_a_credential(monkeypatch, dialled, caplog):
+    _srv_answers(monkeypatch, VIMAR_SRV)
+    config = _cloud_config()
+    monkeypatch.setattr(sip, "CFG", config)
+
+    with caplog.at_level(logging.DEBUG):
+        run(sip.connect())
+
+    assert "examplepassword" not in caplog.text
+    assert config.sip_ha1 not in caplog.text
+    assert "established with flexiprod" in caplog.text

@@ -9,3 +9,6 @@ Pillow>=10.0
 numpy>=1.26
 pyzbar>=0.1.9
 qrcode>=7.4
+# The SRV lookup's aiodns adapter. Home Assistant core requires aiodns, so
+# the component never declares it; without it those two tests skip.
+aiodns>=4.0

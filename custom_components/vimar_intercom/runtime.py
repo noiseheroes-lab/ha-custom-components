@@ -83,6 +83,12 @@ class RuntimeConfig:
     rtp_video_port: int
     av_audio_port: int
     user_agent: str
+    # True for the cloud proxy, whose name is a SIP domain located through
+    # SRV; False for the panel's LAN address, which is dialled as given.
+    locate_by_srv: bool = False
+    # The options flow's port when it differs from the default. It then
+    # replaces the port the SRV records advertise.
+    proxy_port_override: int | None = None
 
     @property
     def sip_ha1(self) -> str:
@@ -265,9 +271,15 @@ def build_runtime_config(
         # at the local panel.
         proxy_host = local_proxy
         proxy_port = DEFAULT_LOCAL_SIP_PORT
+        port_override = None
     else:
         proxy_host = cloud_proxy
         proxy_port = int(options.get(CONF_SIP_PORT, DEFAULT_SIP_PORT))
+        # The options flow always saves this field, so a stored default
+        # cannot be told apart from one typed in. Only a value that
+        # differs from the default is read as the user's choice; the
+        # default itself defers to whatever port SRV publishes.
+        port_override = proxy_port if proxy_port != DEFAULT_SIP_PORT else None
 
     rtp_base = int(options.get(CONF_RTP_PORT_BASE, DEFAULT_RTP_PORT_BASE))
 
@@ -295,4 +307,6 @@ def build_runtime_config(
         rtp_video_port=rtp_base + VIDEO_PORT_OFFSET,
         av_audio_port=rtp_base + AV_AUDIO_PORT_OFFSET,
         user_agent=USER_AGENT,
+        locate_by_srv=not prefer_local,
+        proxy_port_override=port_override,
     )

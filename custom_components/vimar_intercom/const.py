@@ -28,6 +28,19 @@ MY_NAME = "Home Assistant"
 
 SIP_LOCAL_PORT = 5070
 
+# RFC 3263: a TLS SIP domain is located through this SRV service. The
+# cloud proxy name in the QR is such a domain, not a host that listens.
+SIP_SRV_SERVICE = "_sips._tcp"
+SIP_SRV_LOOKUP_TIMEOUT = 10  # seconds for the whole SRV query
+# Seconds one server gets for its TCP connect and TLS handshake together.
+# Without a bound, a blackholed host stalled the supervisor silently, for
+# as long as the kernel kept retrying the SYN.
+SIP_CONNECT_TIMEOUT = 15
+# RFC 8305's recommended stagger. A server name with several addresses,
+# one of them unreachable, is otherwise tried an address at a time and
+# can spend the whole connect timeout on the dead one.
+SIP_HAPPY_EYEBALLS_DELAY = 0.25
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CA_PATH = os.path.join(SCRIPT_DIR, "vimar_rootca.pem")
 

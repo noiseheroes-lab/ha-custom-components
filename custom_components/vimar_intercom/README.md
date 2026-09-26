@@ -32,7 +32,11 @@ anywhere else.
 
 - Access to the indoor unit's settings, to generate a QR code for Home
   Assistant (Settings → Network and devices → Mobile device pairing)
-- A Home Assistant host that can reach `ipvdes.vimar.cloud` on TCP 7042
+- A Home Assistant host that can look up DNS SRV records and reach the
+  Vimar SIP servers on TCP 7042. `ipvdes.vimar.cloud`, the name in the
+  QR code, is a SIP domain rather than a server: its
+  `_sips._tcp.ipvdes.vimar.cloud` SRV records name the servers to
+  connect to, which the integration looks up on every connection
 - `ffmpeg`, bundled with Home Assistant OS and Home Assistant Container
 
 ## Installation
@@ -168,7 +172,10 @@ Assistant UI would: the panel stops ringing elsewhere in the house.
   between the two.
 - **Cloud SIP proxy port** — only applies when the local panel is *not*
   preferred; the local panel's own SIP port is fixed by the device and is
-  not configurable.
+  not configurable. Leave it at 7042 to use the port the Vimar cloud
+  publishes in DNS. Any other value replaces that port for every
+  server the SRV records name, or, where the proxy has no SRV records,
+  is the port its name is dialled on.
 - **RTP base port** — the local UDP port range used for the media
   streams.
 
@@ -240,10 +247,13 @@ look like bugs:
 - **"No QR code was found in that image"** — use a sharp, straight-on
   photo or a screenshot with the whole QR code in view, or paste the
   text.
-- **Registration stays off** — check the host can reach the proxy shown
-  in the sensor's attributes; press the Reconnect button. The integration
-  retries forever, so a repair issue after five minutes means the panel
-  or the network is the problem, not Home Assistant.
+- **Registration stays off** — the log names each SIP server tried and
+  why it failed. `ipvdes.vimar.cloud` is not itself a SIP server, so a
+  direct connection to it failing proves nothing; check the host can
+  resolve its `_sips._tcp` SRV records and reach the servers they name,
+  then press the Reconnect button. The integration retries forever, so
+  a repair issue after five minutes means the panel or the network is
+  the problem, not Home Assistant.
 - **No video** — video only flows inside a call, so the camera is black
   until something opens the stream; check `ffmpeg` is present; check the
   RTP base port is not firewalled. See also the camera limitation above.

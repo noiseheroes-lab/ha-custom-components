@@ -12,6 +12,7 @@ import logging
 
 from . import const as C
 from . import media_handler as media
+from . import sip_locate as locate
 from .backoff import reconnect_delay
 from .runtime import RuntimeConfig
 from .sip_parser import (
@@ -366,15 +367,39 @@ def _create_ssl_context():
     return ctx
 
 
+async def _connect_targets() -> list[locate.Target]:
+    """Where this connection attempt may open its socket, in order.
+
+    The cloud proxy is a SIP domain and is located through SRV, afresh on
+    every attempt. The local panel is a LAN address and is dialled as
+    configured: SRV is the cloud's arrangement, not the panel's.
+    """
+    if not CFG.locate_by_srv:
+        return [locate.Target(CFG.proxy_host, CFG.proxy_port)]
+    return await locate.resolve_targets(
+        CFG.proxy_host, CFG.proxy_port,
+        port_override=CFG.proxy_port_override)
+
+
 async def connect():
     global reader, writer, lock
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ctx = await loop.run_in_executor(None, _create_ssl_context)
-    _LOGGER.info("Connecting to the SIP proxy %s:%d", CFG.proxy_host, CFG.proxy_port)
-    reader, writer = await asyncio.open_connection(
-        CFG.proxy_host, CFG.proxy_port, ssl=ctx, server_hostname=CFG.sni)
+    targets = await _connect_targets()
+
+    async def _open(target: locate.Target):
+        # Only the TCP destination follows SRV. `server_hostname` stays
+        # the name from the QR, so SNI and the certificate hostname check
+        # are made against the domain the certificate is issued for, never
+        # against whichever server SRV happened to pick.
+        return await asyncio.open_connection(
+            target.host, target.port, ssl=ctx, server_hostname=CFG.sni,
+            happy_eyeballs_delay=C.SIP_HAPPY_EYEBALLS_DELAY)
+
+    target, (reader, writer) = await locate.open_first(
+        targets, _open, timeout=C.SIP_CONNECT_TIMEOUT, domain=CFG.sni)
     lock = asyncio.Lock()
-    _LOGGER.info("SIP TLS connection established")
+    _LOGGER.info("SIP TLS connection established with %s", target)
 
 
 async def send(msg: str):

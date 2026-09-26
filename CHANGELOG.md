@@ -34,6 +34,29 @@ by hand any more.
   running in CI.
 
 #### Fixed
+- **SIP registration never came up: the cloud proxy name was dialled
+  as if it were a server.** The QR's `CPROXY`, `ipvdes.vimar.cloud`, is
+  a SIP domain whose `_sips._tcp` SRV records name the servers that
+  actually listen; a TCP connection to the name itself times out. 1.x
+  worked because it hardcoded one of those servers; the rewrite lost
+  that. The integration now locates the server the RFC 3263 way, as the
+  vendor's app does: it looks up the SRV records on every connection
+  attempt, tries the servers in RFC 2782 order (priority, then weighted
+  random) and moves to the next one when a server fails. Without SRV
+  records the name is dialled directly, so a literal host or IP still
+  works. The TLS SNI, the certificate hostname check, the `Route`
+  header and the SIP domain still use the names from the QR; only the
+  TCP destination changed. A cloud SIP port set in the options to
+  anything other than 7042 overrides the SRV port. The local panel
+  path is unchanged. The lookup uses `aiodns`, which Home Assistant
+  core already requires; the manifest gains no requirement.
+- **A dead SIP server stalled the connection silently.** Connecting had
+  no timeout, so a blackholed host left the log at "Connecting to the
+  SIP proxy" with no error and no retry. Each server now gets 15
+  seconds for its TCP connect and TLS handshake; a failure is logged
+  with its cause at WARNING, the next server is tried, and after the
+  last one the usual backoff applies. The server chosen is logged at
+  INFO.
 - **A phone photo of the indoor unit's screen was usually not read.**
   The decoder made a single zbar pass over the full 12 MP frame, and a
   photo of a backlit LCD (moire from the subpixel grid, glare, noise, a

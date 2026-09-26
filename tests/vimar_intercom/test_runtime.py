@@ -237,3 +237,35 @@ def test_prefer_local_is_ignored_without_a_local_proxy():
 def test_runtime_config_repr_hides_the_password():
     cfg = runtime.build_runtime_config(runtime.entry_data_from_qr(QR_FIELDS), {})
     assert "examplepassword" not in repr(cfg)
+
+
+def test_the_cloud_proxy_is_located_through_srv():
+    cfg = runtime.build_runtime_config(runtime.entry_data_from_qr(QR_FIELDS), {})
+    assert cfg.locate_by_srv is True
+    # The name stays the SIP domain everywhere it is used; SRV only
+    # changes where the socket goes.
+    assert cfg.proxy_host == cfg.sni == cfg.route == "ipvdes.vimar.cloud"
+
+
+def test_the_local_panel_is_never_located_through_srv():
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(QR_FIELDS), {"prefer_local": True})
+    assert cfg.locate_by_srv is False
+    assert cfg.proxy_port_override is None
+
+
+@pytest.mark.parametrize("options", [{}, {"sip_port": 7042}])
+def test_the_default_port_defers_to_srv(options):
+    # The options flow always saves sip_port, so the default cannot be
+    # read as a deliberate choice.
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(QR_FIELDS), options)
+    assert cfg.proxy_port == 7042
+    assert cfg.proxy_port_override is None
+
+
+def test_a_changed_port_overrides_srv():
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr(QR_FIELDS), {"sip_port": 5061})
+    assert cfg.proxy_port == 5061
+    assert cfg.proxy_port_override == 5061

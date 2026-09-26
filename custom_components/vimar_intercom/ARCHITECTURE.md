@@ -4,8 +4,9 @@
 
 This integration speaks the SIP dialect the Vimar cloud uses for the
 Vimar View app. It is not a generic SIP client for local Vimar/Elvox
-panels: the panel is reached through Vimar's own cloud proxy
-(`ipvdes.vimar.cloud:7042` by default), the same path the phone app uses,
+panels: the panel is reached through Vimar's own cloud proxy (the SIP
+domain `ipvdes.vimar.cloud` by default, whose servers are located through
+DNS SRV on port 7042), the same path the phone app uses,
 using a user agent string and REGISTER/INVITE shape the cloud is known to
 accept. This dialect is not documented by Vimar; it was reverse
 engineered from the app and from captured traffic. It works today and it
@@ -19,6 +20,7 @@ can break the day Vimar changes something on their end.
 | `hub.py` | Orchestrates SIP registration, calls, door control and media lifecycle; the only module that talks to both `sip_client` and Home Assistant |
 | `sip_client.py` | The SIP stack itself: connection, digest auth, REGISTER/INVITE/BYE/MESSAGE, transaction correlation, reconnection |
 | `sip_parser.py` | Pure text handling: header parsing, transaction keys, registration expiry parsing — no I/O, no Home Assistant |
+| `sip_locate.py` | Where the SIP socket goes: RFC 3263 SRV lookup of the cloud proxy domain (via `aiodns`, a Home Assistant core requirement), RFC 2782 ordering, and trying each server in turn under a connect timeout — no Home Assistant |
 | `backoff.py` | The jittered exponential reconnect delay schedule |
 | `qr.py` | Reads the QR code from an uploaded image (pyzbar, imported lazily) and decrypts and parses the configuration payload the indoor unit generates |
 | `runtime.py` | `RuntimeConfig` — every value the integration needs, derived once from the config entry; no Home Assistant import, fully unit testable |
@@ -59,6 +61,33 @@ Registration itself has its own lifetime: `is_registered()` reflects the
 runs out. A registration that stays down for more than five minutes
 raises a Home Assistant repair issue; it clears itself automatically once
 registration recovers.
+
+## Locating the SIP server
+
+The QR's `CPROXY` (`ipvdes.vimar.cloud` by default) names a SIP
+domain, not a server, and nothing answers on it directly. Per RFC 3263,
+every connection attempt looks up `_sips._tcp.<CPROXY>` SRV records
+and tries the servers they name in RFC 2782 order: lowest priority
+first, weighted random within a priority. Each server gets
+`SIP_CONNECT_TIMEOUT` seconds for its TCP connect and TLS handshake;
+a server that fails or stalls is logged and the next one tried, and
+only when all have failed does the supervisor's backoff start. The
+lookup is repeated on every reconnect, so a server change or a DNS
+failover is picked up. With no SRV record, or a failed lookup, the
+name itself is dialled on the configured port, which keeps a literal
+host or IP address working.
+
+Only the TCP destination changes. The TLS SNI and the certificate
+hostname check, the `Route` header of every request and the SIP
+domain keep using the names from the QR, so the certificate is
+verified against the domain it is issued for rather than against
+whichever server SRV picked.
+
+The options flow's port is read as a deliberate override only when it
+differs from the default 7042 (the flow always saves the field, so a
+saved default cannot be told apart from a typed one); it then
+replaces the port of every SRV server. `prefer_local` dials the
+panel's LAN address directly and never goes through SRV.
 
 ## Transaction model
 
