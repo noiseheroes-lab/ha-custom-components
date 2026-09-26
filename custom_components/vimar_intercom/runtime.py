@@ -159,6 +159,11 @@ _HOST_LABEL_RE = re.compile(r"\A[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _MAC_RE = re.compile(r"\A[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}\Z")
 
 
+def valid_sip_token(value: str) -> bool:
+    """True if `value` is safe as a SIP URI's user part (an extension)."""
+    return bool(_SIP_TOKEN_RE.match(value or ""))
+
+
 def _checked_token(value: str, field: str) -> str:
     """Return `value` if it is safe in a SIP URI's user part."""
     if not _SIP_TOKEN_RE.match(value):
