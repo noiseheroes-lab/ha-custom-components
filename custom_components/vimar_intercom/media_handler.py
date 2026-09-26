@@ -846,6 +846,9 @@ AV_CHUNK_BYTES = 4096
 # Per-viewer buffering before the slowest viewer starts losing chunks.
 # 256 * 4 KB is 1 MB, roughly eight seconds of a 1 Mbps stream.
 AV_QUEUE_CHUNKS = 256
+# How long ffmpeg may probe each input before it starts muxing, in
+# microseconds, as ffmpeg wants it on the command line.
+AV_ANALYZE_MICROSECONDS = "500000"
 
 
 def _write_av_sdp(port: int) -> str:
@@ -896,11 +899,22 @@ async def _start_av_pipeline() -> None:
 
     loop = asyncio.get_running_loop()
     sdp_path = await loop.run_in_executor(None, _write_av_sdp, CFG.av_audio_port)
+    # Raw H.264 on a pipe carries no timestamps, and `-fflags +genpts`
+    # cannot invent them for a stream with no container: with `-c copy`
+    # the MPEG-TS muxer rejected every packet as invalid data and the
+    # viewer got the stream headers and nothing else. Stamping each
+    # packet with the time it arrives is right for a live source anyway.
+    # The short analyze window keeps ffmpeg from spending its default
+    # five seconds probing both inputs before writing a byte, which is
+    # half of the time a panel keeps an auto-on call open.
     cmd = [
         "ffmpeg", "-y", "-loglevel", "warning",
         "-fflags", "+genpts+discardcorrupt",
+        "-analyzeduration", AV_ANALYZE_MICROSECONDS,
+        "-use_wallclock_as_timestamps", "1",
         "-f", "h264", "-i", "pipe:0",
         "-protocol_whitelist", "file,udp,rtp",
+        "-analyzeduration", AV_ANALYZE_MICROSECONDS,
         "-i", sdp_path,
         "-map", "0:v", "-map", "1:a",
         "-c", "copy",

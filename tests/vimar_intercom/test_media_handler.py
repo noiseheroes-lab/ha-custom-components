@@ -1042,3 +1042,57 @@ def test_ffmpeg_warnings_are_summarised_once_not_logged_per_frame(caplog):
     assert len(caplog.records) == 1
     assert "5000" in caplog.records[0].getMessage()
     assert caplog.records[0].levelno == logging.DEBUG
+
+
+# ─── the ffmpeg command line ─────────────────────────────────────────
+
+def test_the_video_input_is_stamped_with_arrival_time(cfg, monkeypatch):
+    """Raw H.264 on a pipe has no timestamps. Copied into MPEG-TS without
+    them, every packet was refused as invalid data and a viewer received
+    the stream headers and nothing else, while the call itself carried
+    video. The flags only apply to the input that follows them, so their
+    position matters as much as their presence.
+    """
+    registry = media.VideoStreamRegistry()
+    monkeypatch.setattr(media, "video_registry", registry)
+    monkeypatch.setattr(media, "_av_subscribers", [])
+    monkeypatch.setattr(media, "_av_reader_task", None)
+    monkeypatch.setattr(media, "_av_consumer", None)
+    monkeypatch.setattr(media, "_av_sdp_path", None)
+    monkeypatch.setattr(media, "av_ffmpeg_proc", None)
+
+    spawned: list[_LiveProc] = []
+    commands: list[list[str]] = []
+
+    def _spawn_proc(cmd):
+        commands.append(cmd)
+        spawned.append(_LiveProc())
+        return spawned[-1]
+
+    async def _no_reader(_proc):
+        return None
+
+    monkeypatch.setattr(media, "_spawn_av_ffmpeg", _spawn_proc)
+    monkeypatch.setattr(media, "_read_av_ffmpeg_stdout", _no_reader)
+    monkeypatch.setattr(media, "_read_av_ffmpeg_stderr", _no_reader)
+
+    try:
+        run(media.start_av_ffmpeg())
+        [cmd] = commands
+        video_input = cmd.index("pipe:0")
+        audio_input = cmd.index(media._av_sdp_path)
+        before_video = cmd[:video_input]
+        between = cmd[video_input:audio_input]
+
+        assert "-use_wallclock_as_timestamps" in before_video
+        assert before_video[before_video.index(
+            "-use_wallclock_as_timestamps") + 1] == "1"
+        assert "-analyzeduration" in before_video
+        assert "-analyzeduration" in between
+    finally:
+        sdp = media._av_sdp_path
+        run(media.stop_av_ffmpeg())
+        for proc in spawned:
+            proc.release()
+        if sdp and os.path.exists(sdp):
+            os.unlink(sdp)
