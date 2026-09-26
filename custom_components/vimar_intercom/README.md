@@ -1,10 +1,10 @@
 # Vimar Intercom — Home Assistant Integration
 
-> **Status: version 2.0.0, in active development.** `main` carries the v2
-> rewrite, so that is what HACS installs from the default branch. It has
-> not been verified against a live panel — the camera in particular has
-> never been run against one. Upgrading from 1.x is a remove-and-re-add,
-> not an in-place update.
+> **Status: version 2.0.0.** `main` carries the v2 rewrite, so that is
+> what HACS installs from the default branch. Registration, the plant
+> phonebook, the doorbell, door release and live video with audio have
+> been verified against a live Tab 5S Plus on a 2-wire plant. Upgrading
+> from 1.x is a remove-and-re-add, not an in-place update.
 
 Integrate a **Vimar Elvox** video door entry system into Home Assistant:
 doorbell events, live video (with audio from the panel), door release and
@@ -15,9 +15,6 @@ call control, over the same cloud SIP protocol the Vimar View app uses.
 Developed against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due
 Fili Plus system. Other panels speak the same protocol and may work, but
 are untested — please open an issue with your results.
-
-The camera has never been run against a live panel; see Limitations
-below. Nothing in this repository claims it is verified.
 
 ## Before you install: only one registration exists per account
 
@@ -288,14 +285,9 @@ phonebook door inherits the original door lock.
   Call and Answer control the call — they do not open a conversation.
 - **One Vimar system per Home Assistant installation.** The integration
   declares `single_config_entry`.
-- **The camera is implemented but not verified end to end against a live
-  panel.** It streams the panel's H.264 video and PCMU audio, remuxed to
-  MPEG-TS by ffmpeg, over a signed URL that Home Assistant's `stream`
-  component fetches without a bearer token. The pipeline that feeds it —
-  depacketisation, SPS/PPS replay, the ffmpeg consumer — is built and
-  unit tested, but has never run against a real Vimar panel; see "Before
-  you install" above for why that has not been tried yet. Remove this
-  sentence once a validation session against real hardware confirms it.
+- **An auto-on view lasts as long as the panel allows** (about thirty
+  seconds on the reference plant). The panel ends the call; watching
+  again places a new one.
 - **There is no still image outside a call.** The panel only sends video
   inside a call, so a snapshot is taken from the call in progress, and
   outside one the camera has nothing to return. A still request never

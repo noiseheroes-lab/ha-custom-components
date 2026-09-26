@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.0.0] — 2026-09-10
+## [2.0.0] — 2026-09-26
 
 ### vimar_intercom v2.0.0
 
@@ -33,6 +33,10 @@ by hand any more.
   and removes the ones that are gone. Existing panel buttons and the
   door lock keep their unique IDs. Without a phonebook the options are
   used as before.
+- **The indoor unit is discovered on the local network** (it announces
+  itself over mDNS as `_eipvdes._tcp`), so Home Assistant offers to set
+  it up. The QR code is still what supplies the credentials; a QR from a
+  different unit than the one discovered is refused.
 - **A dashboard card ships with the integration** (`custom:vimar-intercom-card`):
   live video with a panel selector, a ringing banner with Answer,
   Dismiss and Open door, door buttons that need a second tap or a hold,
@@ -136,10 +140,20 @@ by hand any more.
   mid-stream, or recovering from lost sync, can still decode. A
   transiently stalling consumer gets a small bounded backlog instead of
   being dropped outright.
-- The camera streams the panel's video and audio: ffmpeg remuxes
-  (`-c copy`) the depacketised H.264 and the RTP audio into MPEG-TS, and
-  the camera entity fetches it over a signed URL, so the underlying HTTP
-  view still requires authentication.
+- The camera streams the panel's video and audio: ffmpeg copies the
+  depacketised H.264 and encodes the panel's G.711 audio to AAC into
+  MPEG-TS, and the camera entity fetches it over a signed URL, so the
+  underlying HTTP view still requires authentication.
+- **The stream carried no frames.** Raw H.264 on ffmpeg's stdin has no
+  timestamps, and the MPEG-TS muxer refused every packet: a viewer got
+  the stream headers and nothing else. Packets are now stamped with
+  their arrival time, and ffmpeg probes for half a second instead of
+  five, so video starts within the auto-on call.
+- **The stream was silent in browsers.** G.711 in MPEG-TS is an opaque
+  data stream no player decodes; the audio is now AAC.
+- **Auto-on views were cut to eight seconds.** A call carrying no media
+  from this side was ended by the far end after about ten seconds. The
+  client now sends muted-microphone silence for the length of the call.
 
 #### Changed
 - **A camera snapshot no longer places a call.** Stills used to be taken
@@ -158,10 +172,6 @@ by hand any more.
   with "Migration handler not found for entry".
 
 #### Known limitations
-- The camera is implemented but not verified end to end against a live
-  panel: it is built and unit tested, but a second SIP registration
-  would deregister the production panel, so real-hardware validation is
-  a scheduled session, not something to try casually.
 - There is no still image outside a call.
 - Audio flows from the panel only. There is no talk-back.
 - One Vimar system per Home Assistant installation.
