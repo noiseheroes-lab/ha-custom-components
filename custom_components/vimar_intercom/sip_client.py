@@ -639,13 +639,16 @@ def build_sdp():
     """Offer PCMU audio and H.264 video over SAVP.
 
     The two `a=crypto` keys describe the streams this client would send.
-    It never sends media — Home Assistant has no talk-back path to the
-    panel — but SAVP requires the attribute, so a fresh random key is
-    offered for each and then discarded.
+    Home Assistant has no talk-back path to the panel, but it does send
+    silent audio, or the far end ends the call after about ten seconds.
+    That audio is encrypted under the audio key offered here. The video
+    key is never used, but SAVP requires the attribute.
     """
     sid = str(int(time.time()))
     audio_crypto_key = base64.b64encode(os.urandom(30)).decode()
     video_crypto_key = base64.b64encode(os.urandom(30)).decode()
+    # The audio key is kept: the media layer sends silence under it.
+    media.local_audio_key = audio_crypto_key
     return (
         f"v=0\r\n"
         f"o=- {sid} {sid} IN IP4 {MY_IP}\r\n"

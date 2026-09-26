@@ -567,6 +567,15 @@ audio_proto: RTPAudioProtocol | None = None
 video_proto: RTPVideoProtocol | None = None
 av_ffmpeg_proc = None
 _stun_task = None
+_silence_task = None
+# The SRTP master key this client offered for the audio it sends. The
+# SDP builder in sip_client sets it for every offer or answer.
+local_audio_key: str | None = None
+
+# G.711 µ-law silence: 20 ms at 8 kHz is 160 samples, and 0xFF is the
+# µ-law code for zero amplitude.
+SILENCE_PAYLOAD = b"\xff" * 160
+SILENCE_INTERVAL = 0.020
 _av_sdp_path: str | None = None
 _av_consumer = None
 # One asyncio.Queue per attached AV viewer. The pipeline is started when
@@ -733,13 +742,24 @@ async def setup_media(remote_sdp):
         _stun_task.cancel()
     _stun_task = asyncio.create_task(_stun_keepalive())
 
+    global _silence_task
+    if _silence_task:
+        _silence_task.cancel()
+        _silence_task = None
+    if audio_proto and audio_proto.remote_addr and local_audio_key:
+        _silence_task = asyncio.create_task(
+            _send_silence(SRTPContext(local_audio_key)))
+
 
 async def stop_media():
     """Stop all media. Called on hangup/bye."""
-    global _stun_task
+    global _stun_task, _silence_task
     if _stun_task:
         _stun_task.cancel()
         _stun_task = None
+    if _silence_task:
+        _silence_task.cancel()
+        _silence_task = None
 
     # The one and only place the media layer reports what it saw: one
     # DEBUG line for a whole call, instead of a line per packet.
@@ -824,6 +844,38 @@ def close_transports():
 
 
 # ─── STUN keepalive ─────────────────────────────────────────────────
+
+async def _send_silence(srtp_tx: SRTPContext) -> None:
+    """Send the panel a steady stream of silent audio for the whole call.
+
+    Home Assistant has nothing to say to the panel, but a call that
+    carries no media from this side is ended by the far end after about
+    ten seconds, which cut every auto-on view short. Silence at the
+    normal packet rate is what a phone with its microphone muted sends.
+    """
+    ssrc = struct.unpack("!I", os.urandom(4))[0]
+    seq = struct.unpack("!H", os.urandom(2))[0]
+    timestamp = struct.unpack("!I", os.urandom(4))[0]
+    loop = asyncio.get_running_loop()
+    next_at = loop.time()
+    try:
+        while True:
+            proto = audio_proto
+            if proto is None or proto.transport is None or not proto.remote_addr:
+                return
+            header = struct.pack("!BBHII", 0x80, 0, seq, timestamp, ssrc)
+            try:
+                proto.transport.sendto(
+                    srtp_tx.protect(header + SILENCE_PAYLOAD), proto.remote_addr)
+            except OSError:
+                pass
+            seq = (seq + 1) & 0xFFFF
+            timestamp = (timestamp + len(SILENCE_PAYLOAD)) & 0xFFFFFFFF
+            next_at += SILENCE_INTERVAL
+            await asyncio.sleep(max(0.0, next_at - loop.time()))
+    except asyncio.CancelledError:
+        pass
+
 
 async def _stun_keepalive():
     try:

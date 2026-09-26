@@ -1099,3 +1099,84 @@ def test_the_video_input_is_stamped_with_arrival_time(cfg, monkeypatch):
             proc.release()
         if sdp and os.path.exists(sdp):
             os.unlink(sdp)
+
+
+# ─── the audio this side sends ───────────────────────────────────────
+
+class _RecordingTransport:
+    def __init__(self):
+        self.sent: list[tuple[bytes, tuple]] = []
+
+    def sendto(self, data, addr):
+        self.sent.append((data, addr))
+
+
+def test_a_call_sends_the_panel_silent_audio_until_it_ends(cfg, monkeypatch):
+    """A call carrying no media from this side was ended by the far end
+    after about ten seconds, cutting every auto-on view short. The client
+    sends muted-microphone silence, encrypted under the key it offered,
+    for as long as the call lasts.
+    """
+    import base64
+
+    from custom_components.vimar_intercom.srtp import SRTPContext
+
+    key = base64.b64encode(os.urandom(30)).decode()
+    audio = media.RTPAudioProtocol()
+    transport = _RecordingTransport()
+    audio.transport = transport
+    monkeypatch.setattr(media, "audio_proto", audio)
+    monkeypatch.setattr(media, "video_proto", None)
+    monkeypatch.setattr(media, "local_audio_key", key)
+    monkeypatch.setattr(media, "_stun_task", None)
+    monkeypatch.setattr(media, "_silence_task", None)
+
+    remote = {"audio": {"port": 40000, "ip": "192.0.2.20"}}
+
+    async def scenario():
+        await media.setup_media(remote)
+        await asyncio.sleep(0.11)
+        await media.stop_media()
+        sent_during = len(transport.sent)
+        await asyncio.sleep(0.06)
+        return sent_during
+
+    try:
+        sent_during = run(scenario())
+        # One STUN binding, then a packet every 20 ms.
+        media_packets = [d for d, _ in transport.sent if d[0] & 0xC0 == 0x80]
+        assert len(media_packets) >= 3
+        assert len(transport.sent) == sent_during, "silence outlived the call"
+        assert all(addr == ("192.0.2.20", 40000) for _, addr in transport.sent)
+
+        rx = SRTPContext(key)
+        first, second = (rx.unprotect(p) for p in media_packets[:2])
+        assert first is not None and second is not None
+        assert first[1] & 0x7F == 0  # PCMU
+        assert first[12:] == b"\xff" * 160
+        seq = struct.unpack_from("!H", first, 2)[0]
+        assert struct.unpack_from("!H", second, 2)[0] == (seq + 1) & 0xFFFF
+    finally:
+        audio.close()
+
+
+def test_no_offered_key_means_no_silence(cfg, monkeypatch):
+    audio = media.RTPAudioProtocol()
+    transport = _RecordingTransport()
+    audio.transport = transport
+    monkeypatch.setattr(media, "audio_proto", audio)
+    monkeypatch.setattr(media, "video_proto", None)
+    monkeypatch.setattr(media, "local_audio_key", None)
+    monkeypatch.setattr(media, "_stun_task", None)
+    monkeypatch.setattr(media, "_silence_task", None)
+
+    async def scenario():
+        await media.setup_media({"audio": {"port": 40000, "ip": "192.0.2.20"}})
+        await asyncio.sleep(0.05)
+        await media.stop_media()
+
+    try:
+        run(scenario())
+        assert all(d[0] & 0xC0 != 0x80 for d, _ in transport.sent)
+    finally:
+        audio.close()
