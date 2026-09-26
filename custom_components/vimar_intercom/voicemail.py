@@ -189,7 +189,7 @@ def playback_extension(message: VideoMessage, prefix: str | None) -> str:
     """
     filename = str(message.filename)
     mailbox = str(message.mailbox)
-    if prefix and valid_sip_token(prefix) and prefix.isdigit():
-        if filename.startswith(mailbox):
-            return prefix + filename[len(mailbox):]
+    if (prefix and valid_sip_token(prefix) and prefix.isdigit()
+            and filename.startswith(mailbox)):
+        return prefix + filename[len(mailbox):]
     return filename

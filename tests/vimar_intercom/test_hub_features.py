@@ -14,7 +14,8 @@ import sqlite3
 import pytest
 
 from custom_components.vimar_intercom import call_log as cl
-from custom_components.vimar_intercom import hub, plant_config as pc, runtime
+from custom_components.vimar_intercom import hub, runtime
+from custom_components.vimar_intercom import plant_config as pc
 from custom_components.vimar_intercom import sip_client as sip
 
 QR_FIELDS = {"ID": "60901", "PWD": "examplepassword", "CDOMAIN": "example.invalid"}

@@ -66,7 +66,7 @@ _MILLIS_THRESHOLD = 100_000_000_000
 _MAX_TEXT = 64
 
 
-def epoch_seconds(raw: int | float | None) -> float | None:
+def epoch_seconds(raw: float | None) -> float | None:
     """A Unix time from the unit, in seconds, whatever unit it came in.
 
     The SDK stores `TS` and `ORIGTIME` as longs without converting them,

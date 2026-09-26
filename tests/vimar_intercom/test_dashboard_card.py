@@ -107,7 +107,7 @@ class FakeHub:
         self.mailbox_usage = (3, 20)
         self.video_messages = ()
         self.panel_names = {p.address: p.name for p in panels}
-        self.call_log = types.SimpleNamespace(missed_count=0, recent=lambda: [])
+        self.call_log = types.SimpleNamespace(missed_count=0, recent=list)
         self.apartment = types.SimpleNamespace(
             dnd=None, voicemail=None, vm_timeout=None, vm_timeout_values=())
         self.apartment_intercom = None
