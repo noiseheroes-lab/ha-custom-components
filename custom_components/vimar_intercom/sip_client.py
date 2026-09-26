@@ -22,7 +22,9 @@ from .sip_parser import (
     call_id_key,
     granted_expiry,
     header_params,
+    header_values,
     parse_message,
+    reason_cause,
     response_keys,
     tag_of,
     transaction_key,
@@ -138,6 +140,7 @@ def reset_state() -> None:
     pending_incoming.update(
         active=False, cid=None, from_hdr=None, to_hdr=None, cseq=None,
         via_block=None, my_tag=None, caller_uri=None, caller_tag=None,
+        call_ids=(),
         body=None)
     pending_transactions.clear()
 
@@ -538,7 +541,7 @@ async def _reader_loop() -> None:
     buf = b""
     while not _connection_lost.is_set():
         try:
-            chunk = await asyncio.wait_for(reader.read(8192), timeout=30)
+            chunk = await asyncio.wait_for(reader.read(65536), timeout=30)
         except asyncio.TimeoutError:
             # RFC 5626 CRLF keepalive, so the proxy does not drop us.
             async with lock:
@@ -551,11 +554,15 @@ async def _reader_loop() -> None:
         buf = await _dispatch_buffer(buf)
 
 
-# Largest SIP body this client will frame. Everything it legitimately
-# receives is an SDP offer or answer, a few kilobytes at most. The value
-# comes off the wire, so without a ceiling a peer can name a huge length
-# and make the reader buffer until the host runs out of memory.
-MAX_BODY_BYTES = 128 * 1024
+# Largest SIP body this client will frame. Most of what it receives is
+# an SDP offer or answer, a few kilobytes, but the indoor unit sends its
+# video-message mailbox as one MESSAGE whose body is the whole SQLite
+# file in base64 (`voicemail.py`), so the ceiling is sized for that: the
+# largest mailbox `voicemail` accepts, base64-encoded, with room to
+# spare. The value comes off the wire, so without a ceiling a peer can
+# name a huge length and make the reader buffer until the host runs out
+# of memory.
+MAX_BODY_BYTES = 3 * 1024 * 1024
 
 
 async def _dispatch_buffer(buf: bytes) -> bytes:
@@ -874,9 +881,14 @@ async def do_system_message(target_uri, body_text, extra_headers=None):
     response otherwise.
     """
     if not is_registered():
-        _LOGGER.warning("do_system_message: not registered, target=%s body=%s", target_uri, body_text)
+        # Never the body: it can be a door command, a call ID or a
+        # setting, and the log is readable by anyone the user shares it
+        # with. Its kind is what a warning needs.
+        _LOGGER.warning("Cannot send a system message (%s) to %s: not registered",
+                        summarize_body(body_text), target_uri)
         return False, "Not registered"
-    _LOGGER.debug("Sending %s to %s", body_text, target_uri)
+    _LOGGER.debug("Sending a system message (%s) to %s",
+                  summarize_body(body_text), target_uri)
     ftag = _gen("")
     cid = _gen("sys-")
 
@@ -1256,7 +1268,7 @@ async def do_hangup():
 pending_incoming = {
     "active": False, "cid": None, "from_hdr": None, "to_hdr": None,
     "cseq": None, "via_block": None, "my_tag": None,
-    "caller_uri": None, "caller_tag": None, "body": None,
+    "caller_uri": None, "caller_tag": None, "body": None, "call_ids": (),
 }
 
 
@@ -1275,10 +1287,21 @@ async def handle_incoming_invite(raw):
 
     my_tag = _gen("")
 
+    # Every call identifier the INVITE carries, first one first. The SDK
+    # reads the ring's call ID with linphone's `getCustomHeader("Call-ID")`,
+    # which looks the name up among all the INVITE's headers and returns
+    # the first match: the SIP Call-ID, unless a sender put its own
+    # `Call-ID` ahead of it. The first one is what `C;<id>;ANSWERED` is
+    # sent with; all of them (and an `X-Call-ID`) are what the unit's
+    # notice from another device is matched against, since which one a
+    # device reports cannot be verified from here.
+    call_ids = tuple(dict.fromkeys(header_values(raw, "Call-ID", "X-Call-ID")))
+
     pending_incoming.update(
         active=True, cid=cid, from_hdr=from_hdr, to_hdr=to_hdr,
         cseq=cseq, via_block=via_block, my_tag=my_tag,
         caller_uri=caller_uri, caller_tag=caller_tag, body=msg.body,
+        call_ids=call_ids,
     )
 
     await send(
@@ -1413,7 +1436,8 @@ async def handle_incoming_cancel(raw):
         f"Call-ID: {cid}\r\nCSeq: {cseq}\r\n"
         f"Content-Length: 0\r\n\r\n")
 
-    if pending_incoming["active"] and pending_incoming["cid"] == cid:
+    ours = bool(pending_incoming["active"] and pending_incoming["cid"] == cid)
+    if ours:
         p = pending_incoming
         invite_cseq = p["cseq"]
         await send(
@@ -1423,7 +1447,24 @@ async def handle_incoming_cancel(raw):
             f"Content-Length: 0\r\n\r\n")
         pending_incoming["active"] = False
 
-    await broadcast("ring_ended", "Call cancelled")
+    # `Reason: SIP;cause=200` is the proxy saying another device took the
+    # call — the SDK's "answered by others".
+    await broadcast("ring_ended", RingEnded(
+        call_id=cid, ours=ours,
+        answered_elsewhere=reason_cause(msg.headers.get("reason", "")) == 200))
+
+
+@dataclass(frozen=True)
+class RingEnded:
+    """The panel cancelled a ringing INVITE.
+
+    `ours` is True when it was the INVITE this client had pending;
+    `answered_elsewhere` when the CANCEL said another device answered.
+    """
+
+    call_id: str
+    ours: bool
+    answered_elsewhere: bool
 
 
 @dataclass(frozen=True)
@@ -1432,17 +1473,19 @@ class InboundMessage:
 
     `panda` is the `Panda` header — the message family (`blue` for
     status replies and notifications) — or None when there was none.
+    `koala` names what a `grey` message carries (`mailbox.db`).
     """
 
     sender: str
     panda: str | None
     body: str
+    koala: str | None = None
 
     def __repr__(self) -> str:
         # The body of a status reply carries the phonebook token. A
         # stray `%s` of this object must not put it in a log.
         return (f"InboundMessage(sender={self.sender!r}, panda={self.panda!r}, "
-                f"body=<{summarize_body(self.body)}>)")
+                f"koala={self.koala!r}, body=<{len(self.body)} chars>)")
 
 
 async def handle_incoming_message(msg: ParsedMessage) -> None:
@@ -1461,7 +1504,14 @@ async def handle_incoming_message(msg: ParsedMessage) -> None:
     to_hdr = msg.headers.get("to", "")
     msg_cid = msg.headers.get("call-id", "")
     msg_cseq = msg.headers.get("cseq", "1 MESSAGE")
-    _LOGGER.debug("SIP MESSAGE received (%s)", summarize_body(msg.body))
+    panda = msg.headers.get("panda")
+    if panda is None or panda.strip().lower() == "blue":
+        _LOGGER.debug("SIP MESSAGE received (%s)", summarize_body(msg.body))
+    else:
+        # A `grey` mailbox is a whole database in base64, possibly
+        # wrapped into thousands of lines: its size says enough.
+        _LOGGER.debug("SIP MESSAGE received (family %s, %d bytes)",
+                      panda.strip(), len(msg.body))
     try:
         await send(
             f"SIP/2.0 200 OK\r\n"
@@ -1469,11 +1519,12 @@ async def handle_incoming_message(msg: ParsedMessage) -> None:
             f"Call-ID: {msg_cid}\r\nCSeq: {msg_cseq}\r\n"
             f"Content-Length: 0\r\n\r\n")
     finally:
-        panda = msg.headers.get("panda")
+        koala = msg.headers.get("koala")
         await broadcast("message", InboundMessage(
             sender=addr_uri(from_hdr) if from_hdr else "",
             panda=panda.strip() if panda else None,
-            body=msg.body))
+            body=msg.body,
+            koala=koala.strip() if koala else None))
 
 
 async def request_processor():

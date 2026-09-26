@@ -176,3 +176,39 @@ def granted_expiry(msg: ParsedMessage, contact_user: str, requested: int) -> int
         return int(header)
 
     return requested
+
+
+def header_values(raw: str, *names: str) -> list[str]:
+    """Every value of the named headers, in the order they appear.
+
+    `parse_message` keeps one value per header name. A few questions need
+    all of them — an INVITE whose `Call-ID` appears twice, once from the
+    SIP stack and once as the Vimar SDK's own call identifier — so this
+    re-reads the header block. Names are matched case-insensitively.
+    """
+    wanted = {name.lower() for name in names}
+    head = raw.partition("\r\n\r\n")[0]
+    values: list[str] = []
+    for line in head.split("\r\n")[1:]:
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() in wanted and value.strip():
+            values.append(value.strip())
+    return values
+
+
+def reason_cause(value: str) -> int | None:
+    """The `cause` of the SIP entry of a Reason header (RFC 3326), or None.
+
+    A CANCEL carrying `Reason: SIP;cause=200` means another device
+    answered the call; it is what the SDK reads as "answered by others".
+    A header can list several protocols (`Q.850;cause=16, SIP;cause=200`);
+    only the SIP one counts.
+    """
+    for entry in value.split(","):
+        protocol, _, params = entry.partition(";")
+        if protocol.strip().upper() != "SIP":
+            continue
+        cause = header_params(params).get("cause", "")
+        if cause.isdigit():
+            return int(cause)
+    return None

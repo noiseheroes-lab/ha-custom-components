@@ -1114,3 +1114,112 @@ def test_the_phonebook_token_never_reaches_the_log(monkeypatch, caplog):
     assert "secret-token" not in caplog.text
     assert "secret-token" not in repr(message)
     assert "init_status_reply" in caplog.text
+
+
+# ─── rings: the call IDs they carry, and how the panel ends them ─────
+
+def _raw_invite(extra: str = "") -> str:
+    return (
+        "INVITE sip:60901@example.invalid SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bK-ring\r\n"
+        "From: <sip:55001@example.invalid>;tag=ptag\r\n"
+        "To: <sip:60901@example.invalid>\r\n"
+        "Call-ID: ring-1@pbx\r\n"
+        f"{extra}"
+        "CSeq: 1 INVITE\r\n"
+        "Content-Length: 0\r\n\r\n")
+
+
+def _capture(monkeypatch):
+    sent: list[str] = []
+    seen: list[tuple[str, object]] = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    async def _broadcast(msg_type, msg):
+        seen.append((msg_type, msg))
+
+    monkeypatch.setattr(sip, "send", _send)
+    monkeypatch.setattr(sip, "_broadcast", _broadcast)
+    return sent, seen
+
+
+def test_a_ring_records_every_call_id_it_carries_first_first(
+        configured, monkeypatch):
+    _capture(monkeypatch)
+    run(sip.handle_incoming_invite(
+        _raw_invite("X-Call-ID: abcde12345\r\n")))
+    assert sip.pending_incoming["call_ids"] == ("ring-1@pbx", "abcde12345")
+
+
+def _raw_cancel(reason: str | None) -> str:
+    reason_line = f"Reason: {reason}\r\n" if reason else ""
+    return (
+        "CANCEL sip:60901@example.invalid SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bK-ring\r\n"
+        "From: <sip:55001@example.invalid>;tag=ptag\r\n"
+        "To: <sip:60901@example.invalid>\r\n"
+        "Call-ID: ring-1@pbx\r\n"
+        "CSeq: 1 CANCEL\r\n"
+        f"{reason_line}"
+        "Content-Length: 0\r\n\r\n")
+
+
+@pytest.mark.parametrize(("reason", "elsewhere"), [
+    ('SIP;cause=200;text="Call completed elsewhere"', True),
+    (None, False),
+    ("SIP;cause=487", False),
+])
+def test_a_cancel_says_whether_another_device_answered(
+        configured, monkeypatch, reason, elsewhere):
+    _sent, seen = _capture(monkeypatch)
+    run(sip.handle_incoming_invite(_raw_invite()))
+    run(sip.handle_incoming_cancel(_raw_cancel(reason)))
+    kind, ended = seen[-1]
+    assert kind == "ring_ended"
+    assert ended.ours is True
+    assert ended.answered_elsewhere is elsewhere
+    assert sip.pending_incoming["active"] is False
+
+
+def test_a_cancel_for_another_call_is_not_ours(configured, monkeypatch):
+    _sent, seen = _capture(monkeypatch)
+    run(sip.handle_incoming_cancel(_raw_cancel(None)))
+    assert seen[-1][1].ours is False
+
+
+# ─── the mailbox MESSAGE ─────────────────────────────────────────────
+
+def test_a_grey_message_carries_its_koala_header(monkeypatch):
+    raw = _raw_message("QUJD", panda="grey").replace(
+        "Content-Type:", "Koala: mailbox.db\r\nContent-Type:")
+    _sent, [(_kind, message)] = _deliver(monkeypatch, raw)
+    assert message.panda == "grey"
+    assert message.koala == "mailbox.db"
+
+
+def test_a_mailbox_sized_body_is_framed_not_refused(monkeypatch):
+    reconnects: list[bool] = []
+    monkeypatch.setattr(sip, "request_reconnect",
+                        lambda: reconnects.append(True))
+    body = "QUJD" * 100_000  # 400 KB of base64
+    raw = _raw_message(body, panda="grey").encode()
+
+    async def _scenario():
+        monkeypatch.setattr(sip, "incoming_requests", asyncio.Queue())
+        rest = await sip._dispatch_buffer(raw)
+        return rest, sip.incoming_requests.qsize()
+
+    rest, queued = run(_scenario())
+    assert (rest, queued, reconnects) == (b"", 1, [])
+
+
+def test_a_system_message_body_is_never_logged_when_unregistered(
+        monkeypatch, caplog):
+    monkeypatch.setattr(sip, "is_registered", lambda: False)
+    caplog.set_level(logging.DEBUG)
+    ok, _msg = run(sip.do_system_message(
+        "sip:21@example.invalid", "C;secret-call-id;ANSWERED"))
+    assert ok is False
+    assert "secret-call-id" not in caplog.text

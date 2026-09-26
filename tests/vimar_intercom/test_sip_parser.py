@@ -1,5 +1,7 @@
 """Tests for SIP message parsing and transaction correlation."""
 
+import pytest
+
 from custom_components.vimar_intercom import sip_parser as sp
 
 REGISTER_200 = (
@@ -169,3 +171,28 @@ def test_granted_expiry_falls_back_to_the_requested_value():
 def test_granted_expiry_ignores_a_contact_for_another_user():
     raw = REGISTER_200.replace("<sip:60901@192.0.2.5", "<sip:99999@192.0.2.5")
     assert sp.granted_expiry(sp.parse_message(raw), "60901", 3600) == 3600
+
+
+def test_header_values_returns_every_occurrence_in_order():
+    raw = ("INVITE sip:a@example.invalid SIP/2.0\r\n"
+           "Call-ID: first@host\r\n"
+           "call-id: second10ch\r\n"
+           "X-Call-ID: custom\r\n"
+           "Content-Length: 0\r\n\r\n"
+           "Call-ID: in-the-body")
+    assert sp.header_values(raw, "Call-ID") == ["first@host", "second10ch"]
+    assert sp.header_values(raw, "Call-ID", "X-Call-ID") == [
+        "first@host", "second10ch", "custom"]
+    assert sp.header_values(raw, "Absent") == []
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ('SIP;cause=200;text="Call completed elsewhere"', 200),
+    ("SIP ;cause=487", 487),
+    ("Q.850;cause=16, SIP;cause=200", 200),
+    ("Q.850;cause=16", None),
+    ("", None),
+    ("SIP;text=x", None),
+])
+def test_reason_cause_reads_the_sip_entry(value, expected):
+    assert sp.reason_cause(value) == expected
