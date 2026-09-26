@@ -85,3 +85,16 @@ DEFAULT_RTP_PORT_BASE = 7200
 DEFAULT_REGISTER_EXPIRY = 3600
 MIN_REGISTER_EXPIRY = 60  # floor for a clamped registration lifetime, seconds
 STABLE_CONNECTION_SECONDS = 60  # a connection must stay up this long before a fresh failure resets the backoff ladder
+
+# ─── Plant configuration (phonebook) ─────────────────────────────
+# The indoor unit ("PICG") answers GET_INIT_STATUS. The SDK addresses it
+# as 60001 on 2-wire V2 plants, cloud-only connections and VGIP units
+# (RubricaDbManager.getPicg); other plants learn it from GET_NICKS,
+# which this integration does not send yet.
+PICG_ADDRESS = "60001"
+# Seconds to wait for GET_INIT_STATUS_REPLY after asking for it.
+PLANT_STATUS_TIMEOUT = 15
+# The last good plant configuration, per entry, in `.storage`. It never
+# holds the phonebook token.
+PLANT_STORAGE_VERSION = 1
+PLANT_STORAGE_KEY = "vimar_intercom.{entry_id}.plant"

@@ -9,6 +9,7 @@ import socket
 import ssl
 import time
 import logging
+from dataclasses import dataclass
 
 from . import const as C
 from . import media_handler as media
@@ -26,6 +27,7 @@ from .sip_parser import (
     tag_of,
     transaction_key,
 )
+from .system_messages import summarize_body
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1421,6 +1423,56 @@ async def handle_incoming_cancel(raw):
     await broadcast("ring_ended", "Call cancelled")
 
 
+@dataclass(frozen=True)
+class InboundMessage:
+    """A MESSAGE the indoor unit, or the cloud, sent to this client.
+
+    `panda` is the `Panda` header — the message family (`blue` for
+    status replies and notifications) — or None when there was none.
+    """
+
+    sender: str
+    panda: str | None
+    body: str
+
+    def __repr__(self) -> str:
+        # The body of a status reply carries the phonebook token. A
+        # stray `%s` of this object must not put it in a log.
+        return (f"InboundMessage(sender={self.sender!r}, panda={self.panda!r}, "
+                f"body=<{summarize_body(self.body)}>)")
+
+
+async def handle_incoming_message(msg: ParsedMessage) -> None:
+    """Acknowledge a MESSAGE, then hand it to the hub.
+
+    The 200 OK goes first: the indoor unit retransmits a MESSAGE it has
+    no answer for, and the hub's handling (a phonebook download, later)
+    is no reason to keep it waiting. The hub still hears about it if the
+    answer cannot be sent — the content arrived either way.
+
+    Only the kinds of lines the body held are logged, never the body: a
+    GET_INIT_STATUS_REPLY carries the password of the phonebook
+    download, and this runs for every one.
+    """
+    from_hdr = msg.headers.get("from", "")
+    to_hdr = msg.headers.get("to", "")
+    msg_cid = msg.headers.get("call-id", "")
+    msg_cseq = msg.headers.get("cseq", "1 MESSAGE")
+    _LOGGER.debug("SIP MESSAGE received (%s)", summarize_body(msg.body))
+    try:
+        await send(
+            f"SIP/2.0 200 OK\r\n"
+            f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
+            f"Call-ID: {msg_cid}\r\nCSeq: {msg_cseq}\r\n"
+            f"Content-Length: 0\r\n\r\n")
+    finally:
+        panda = msg.headers.get("panda")
+        await broadcast("message", InboundMessage(
+            sender=addr_uri(from_hdr) if from_hdr else "",
+            panda=panda.strip() if panda else None,
+            body=msg.body))
+
+
 async def request_processor():
     """Dispatch inbound SIP requests forever.
 
@@ -1453,17 +1505,7 @@ async def _process_one_request():
     elif method == "OPTIONS":
         asyncio.create_task(handle_incoming_options(raw))
     elif method == "MESSAGE":
-        _LOGGER.debug("SIP MESSAGE: %s", msg.body[:200])
-        await broadcast("message", msg.body[:200])
-        from_hdr = msg.headers.get("from", "")
-        to_hdr = msg.headers.get("to", "")
-        msg_cid = msg.headers.get("call-id", "")
-        msg_cseq = msg.headers.get("cseq", "1 MESSAGE")
-        await send(
-            f"SIP/2.0 200 OK\r\n"
-            f"{_via_block(msg)}To: {to_hdr}\r\nFrom: {from_hdr}\r\n"
-            f"Call-ID: {msg_cid}\r\nCSeq: {msg_cseq}\r\n"
-            f"Content-Length: 0\r\n\r\n")
+        await handle_incoming_message(msg)
     elif method == "INFO":
         from_hdr = msg.headers.get("from", "")
         to_hdr = msg.headers.get("to", "")

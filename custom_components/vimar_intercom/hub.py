@@ -3,12 +3,21 @@
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from . import sip_client as sip
 from . import media_handler as media
-from .const import DOOR_COMMAND_CURRENT, EVENT_RING, REGISTRATION_DOWN_GRACE
-from .runtime import RuntimeConfig
+from . import system_messages as sm
+from .const import (
+    DOOR_COMMAND_CURRENT,
+    EVENT_RING,
+    PICG_ADDRESS,
+    PLANT_STATUS_TIMEOUT,
+    REGISTRATION_DOWN_GRACE,
+)
+from .phonebook import PhonebookError
+from .plant_config import PlantConfig
+from .runtime import RuntimeConfig, valid_door_command, valid_sip_token
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,6 +27,14 @@ MAX_CALL_DURATION = 300  # 5 minutes — auto-hangup safety net
 # must not be able to block on a socket the peer has stopped answering.
 HANGUP_ON_UNLOAD_TIMEOUT = 5
 REGISTRATION_WATCHDOG_INTERVAL = 30
+
+# Downloads the phonebook the status reply names and parses it for the
+# given apartment group. Supplied by `__init__.py`, which owns the HTTP
+# session and the executor; raises on any failure.
+PlantFetcher = Callable[[sm.InitStatus, str], Awaitable[PlantConfig]]
+# Told about every newly downloaded plant configuration, with the one
+# it replaces, so it can be persisted. Returns nothing.
+PlantListener = Callable[[PlantConfig | None, PlantConfig], Awaitable[None]]
 
 
 class VimarIntercomHub:
@@ -44,6 +61,17 @@ class VimarIntercomHub:
         self._clear_issue: Callable | None = None
         self._hass = None
         self._entry_id = ""
+        # Plant configuration sync. See `set_plant_sync`.
+        self._plant: PlantConfig | None = None
+        self._plant_fetcher: PlantFetcher | None = None
+        self._plant_listener: PlantListener | None = None
+        self._reload_entry: Callable[[], None] | None = None
+        self._reload_pending = False
+        self._status_waiter: asyncio.Future | None = None
+        self._init_status: sm.InitStatus | None = None
+        self._sync_task: asyncio.Task | None = None
+        self._sync_again = False
+        self._was_registered = False
 
     @property
     def config(self) -> RuntimeConfig:
@@ -123,6 +151,14 @@ class VimarIntercomHub:
                 cb()
             except Exception:
                 _LOGGER.exception("State callback error")
+        registered = sip.is_registered()
+        if registered and not self._was_registered and self._running:
+            # Every fresh registration asks the indoor unit for its
+            # status: after a restart, after an outage, after the cloud
+            # moved us to another server. It costs one MESSAGE, and a
+            # download only when the phonebook version has changed.
+            self.request_plant_sync()
+        self._was_registered = registered
 
     def set_issue_callbacks(self, raise_issue: Callable, clear_issue: Callable) -> None:
         """Install the callbacks used to raise and clear the repair issue."""
@@ -412,6 +448,11 @@ class VimarIntercomHub:
         for t in list(self._background):
             t.cancel()
         self._background.clear()
+        self._sync_task = None
+        if self._status_waiter and not self._status_waiter.done():
+            self._status_waiter.cancel()
+        self._status_waiter = None
+        self._was_registered = False
 
         for t in self._tasks:
             t.cancel()
@@ -494,7 +535,20 @@ class VimarIntercomHub:
     async def async_door(
         self, target: str | None = None, command: str | None = None
     ) -> tuple[bool, str]:
-        """Open a door. See `_door_target` for which one, and with what."""
+        """Open a door. See `_door_target` for which one, and with what.
+
+        An actuator from the phonebook comes through here too, as an
+        explicit target and command — the SDK's `sysMsgActuatorAction`
+        is exactly this MESSAGE, `Panda: command` with the command as
+        the body, sent to the actuator's GID. Both are checked again
+        before they reach the wire: they were checked when the phonebook
+        was parsed, but this is the last point before a SIP URI and a
+        MESSAGE body are built from them.
+        """
+        if target is not None and not valid_sip_token(target):
+            return False, "That door is not a valid SIP extension."
+        if command is not None and not valid_door_command(command):
+            return False, "That door command is not a valid command."
         uri, body = self._door_target(target, command)
         _LOGGER.debug("Door command %s to %s (registered=%s)", body, uri, sip.is_registered())
 
@@ -543,8 +597,219 @@ class VimarIntercomHub:
             _LOGGER.error("Door retry error: %s", err)
             return False, str(err)
 
+    # ─── Plant configuration ─────────────────────────────────────────
+
+    @property
+    def plant(self) -> PlantConfig | None:
+        """The plant configuration the entities were built from, if any."""
+        return self._plant
+
+    @property
+    def init_status(self) -> sm.InitStatus | None:
+        """The indoor unit's last status reply, kept in memory only.
+
+        It holds the phonebook token, so it is never persisted; the next
+        registration asks for a fresh one anyway.
+        """
+        return self._init_status
+
+    def set_plant_sync(
+        self,
+        current: PlantConfig | None,
+        fetch: PlantFetcher,
+        on_change: PlantListener,
+        reload_entry: Callable[[], None],
+    ) -> None:
+        """Enable the phonebook sync.
+
+        `current` is the configuration the entities are being built from
+        (the stored one, or None); a status reply naming the same version
+        downloads nothing. `on_change` persists a new configuration, and
+        `reload_entry` rebuilds the entities when one changes what they
+        are. Both are Home Assistant's business, so they are handed in
+        rather than done here, and the hub stays testable without it.
+        """
+        self._plant = current
+        self._plant_fetcher = fetch
+        self._plant_listener = on_change
+        self._reload_entry = reload_entry
+
+    def request_plant_sync(self) -> None:
+        """Ask the indoor unit for its status, and act on the answer.
+
+        One sync at a time. A request that arrives while one is running
+        — a NEW_PHONEBOOK notification during the download the last
+        registration started — runs it once more when it finishes,
+        rather than racing it.
+        """
+        if self._plant_fetcher is None:
+            return
+        if self._sync_task is not None and not self._sync_task.done():
+            self._sync_again = True
+            return
+        self._sync_task = self._track(self._plant_sync_loop())
+
+    async def _plant_sync_loop(self) -> None:
+        while True:
+            self._sync_again = False
+            try:
+                await self._sync_plant_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a failed sync keeps the old plant
+                _LOGGER.exception("Plant configuration sync failed")
+            if not self._sync_again:
+                return
+
+    async def _request_init_status(self) -> sm.InitStatus | None:
+        """Send GET_INIT_STATUS and wait for the reply, or give up."""
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future = loop.create_future()
+        self._status_waiter = waiter
+        try:
+            ok, msg = await sip.do_system_message(
+                self._cfg.panel_uri(PICG_ADDRESS), sm.GET_INIT_STATUS,
+                extra_headers={sm.PANDA_HEADER: sm.PANDA_BLUE})
+            if not ok:
+                _LOGGER.debug("GET_INIT_STATUS was not accepted (%s); "
+                              "keeping the current panels", msg)
+                return None
+            return await asyncio.wait_for(waiter, PLANT_STATUS_TIMEOUT)
+        except asyncio.TimeoutError:
+            # Plants whose indoor unit is not at 60001 never answer, and
+            # neither does one that is offline. Both keep what they have.
+            _LOGGER.debug("No GET_INIT_STATUS_REPLY within %ss; keeping the "
+                          "current panels", PLANT_STATUS_TIMEOUT)
+            return None
+        finally:
+            if self._status_waiter is waiter:
+                self._status_waiter = None
+
+    def _group_for(self, status: sm.InitStatus) -> str:
+        """The apartment group the phonebook is read for.
+
+        The status reply's GID when it names one (the SDK adopts it), the
+        QR's otherwise.
+        """
+        if status.gid and valid_sip_token(status.gid):
+            return status.gid
+        return self._cfg.group_id
+
+    async def _sync_plant_once(self) -> None:
+        status = await self._request_init_status()
+        if status is None:
+            return
+        if not status.rubrica_ver or not status.token:
+            _LOGGER.debug("The indoor unit announced no phonebook; keeping "
+                          "the current panels")
+            return
+        if (self._plant is not None
+                and self._plant.version == status.rubrica_ver.strip().lower()):
+            _LOGGER.debug("Phonebook unchanged")
+            return
+        assert self._plant_fetcher is not None
+        try:
+            plant = await self._plant_fetcher(status, self._group_for(status))
+        except asyncio.CancelledError:
+            raise
+        except (PhonebookError, ValueError) as err:
+            # Both carry messages written to be safe to log.
+            self._warn_fetch_failed(str(err))
+            return
+        except Exception as err:  # noqa: BLE001 - transport errors vary by library
+            self._warn_fetch_failed(type(err).__name__)
+            return
+        await self._apply_plant(plant)
+
+    def _warn_fetch_failed(self, reason: str) -> None:
+        _LOGGER.warning(
+            "Could not load the plant's phonebook (%s); keeping the %s",
+            reason,
+            "last known plant configuration" if self._plant is not None
+            else "panels from the integration options")
+
+    async def _apply_plant(self, plant: PlantConfig) -> None:
+        """Adopt a freshly downloaded configuration.
+
+        Persisted first, so a reload — or a restart — builds from it.
+        The entry is reloaded only when the entities change; a phonebook
+        edit elsewhere in the building must not drop the registration.
+        A reload in the middle of a call would hang up on the visitor,
+        so it waits for the call to end.
+        """
+        previous = self._plant
+        self._plant = plant
+        _LOGGER.info(
+            "Plant configuration loaded from the phonebook: %d panel(s), "
+            "%d actuator(s)", len(plant.panels), len(plant.actuators))
+        if self._plant_listener is not None:
+            await self._plant_listener(previous, plant)
+        if plant.entities_equal(previous) or self._reload_entry is None:
+            return
+        if sip.in_call or sip.calling:
+            _LOGGER.info("Plant configuration changed; the entities will be "
+                         "rebuilt when the current call ends")
+            self._reload_pending = True
+            return
+        _LOGGER.info("Plant configuration changed; rebuilding the entities")
+        self._reload_entry()
+
+    def _handle_message(self, message: sip.InboundMessage) -> None:
+        """Dispatch the lines of a MESSAGE from the indoor unit.
+
+        Only the families this integration acts on are handled: the
+        status reply this hub asked for, and the notification that the
+        phonebook changed. Every other line is classified and ignored,
+        which is where do-not-disturb and voicemail updates will plug in.
+
+        A MESSAGE with a `Panda` header other than `blue` belongs to
+        another family (text messages, the voicemail database) and is
+        not read as a system notification, whatever its text says. One
+        with no header at all is accepted: whether the indoor unit
+        always sets it on its replies has not been confirmed.
+        """
+        if message.panda is not None and message.panda.lower() != sm.PANDA_BLUE:
+            _LOGGER.debug("Ignoring a MESSAGE of family %s", message.panda)
+            return
+        _LOGGER.debug("System MESSAGE from %s (%s)", message.sender,
+                      sm.summarize_body(message.body))
+        for kind, line in sm.classify_body(message.body):
+            if kind == sm.KIND_INIT_STATUS_REPLY:
+                self._on_init_status_line(line)
+            elif kind == sm.KIND_NEW_PHONEBOOK:
+                self._on_new_phonebook_line(line)
+
+    def _on_init_status_line(self, line: str) -> None:
+        try:
+            status = sm.parse_init_status_reply(line)
+        except ValueError as err:
+            _LOGGER.debug("Unreadable GET_INIT_STATUS_REPLY: %s", err)
+            return
+        self._init_status = status
+        waiter = self._status_waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(status)
+
+    def _on_new_phonebook_line(self, line: str) -> None:
+        try:
+            note = sm.parse_new_phonebook(line)
+        except ValueError as err:
+            _LOGGER.debug("Unreadable NEW_PHONEBOOK: %s", err)
+            return
+        if self._plant is not None and self._plant.version == note.version.lower():
+            return
+        _LOGGER.info("The installer changed the plant configuration; "
+                     "fetching the new phonebook")
+        # A fresh status rather than the cached token: the token may have
+        # changed with the phonebook, and after a restart there is none.
+        self.request_plant_sync()
+
     async def _handle_broadcast(self, msg_type, msg):
         """React to a SIP-layer event."""
+        if msg_type == "message":
+            # Never the body: a status reply carries the phonebook token.
+            self._handle_message(msg)
+            return
         _LOGGER.debug("[%s] %s", msg_type, msg)
 
         if msg_type == "call_started":
@@ -557,6 +822,12 @@ class VimarIntercomHub:
             # the one place every ending converges, so it is where the
             # auto-call record is torn down.
             self._clear_auto_call()
+            if self._reload_pending:
+                # A new plant configuration arrived during the call and
+                # waited for it to end; see `_apply_plant`.
+                self._reload_pending = False
+                if self._reload_entry is not None:
+                    self._reload_entry()
 
         if msg_type == "ring":
             caller_uri = sip.pending_incoming.get("caller_uri", "")

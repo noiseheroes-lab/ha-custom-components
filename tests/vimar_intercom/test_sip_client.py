@@ -1022,3 +1022,95 @@ def test_an_ipv6_source_keeps_the_previous_local_address(monkeypatch, dialled):
     run(sip.connect())
 
     assert sip.MY_IP == "192.0.2.5"
+
+
+# ─── an incoming MESSAGE is acknowledged, handed on, never logged ────
+
+STATUS_BODY = ('GET_INIT_STATUS_REPLY;[{"PARAM":"token","VALUE":"secret-token"},'
+               '{"PARAM":"rubrica_ver","VALUE":"abc"}]')
+
+
+def _raw_message(body: str, panda: str | None = "blue") -> str:
+    """One MESSAGE from the indoor unit carrying `body`."""
+    panda_line = f"Panda: {panda}\r\n" if panda else ""
+    encoded = body.encode()
+    return (
+        "MESSAGE sip:60901@example.invalid SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bK-picg\r\n"
+        "From: <sip:60001@example.invalid>;tag=ptag\r\n"
+        "To: <sip:60901@example.invalid>\r\n"
+        "Call-ID: msg-1\r\n"
+        "CSeq: 7 MESSAGE\r\n"
+        f"{panda_line}"
+        "Content-Type: text/plain\r\n"
+        f"Content-Length: {len(encoded)}\r\n\r\n{body}")
+
+
+def _deliver(monkeypatch, raw: str):
+    sent: list[str] = []
+    seen: list[tuple[str, object]] = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    async def _broadcast(msg_type, msg):
+        seen.append((msg_type, msg))
+
+    monkeypatch.setattr(sip, "send", _send)
+    monkeypatch.setattr(sip, "_broadcast", _broadcast)
+
+    async def _scenario():
+        monkeypatch.setattr(sip, "incoming_requests", asyncio.Queue())
+        await sip.incoming_requests.put(raw)
+        await sip._process_one_request()
+
+    run(_scenario())
+    return sent, seen
+
+
+def test_an_incoming_message_is_answered_and_broadcast_whole(monkeypatch):
+    long_body = STATUS_BODY + " " * 300  # longer than the old 200-char cut
+    sent, seen = _deliver(monkeypatch, _raw_message(long_body))
+
+    assert sent and sent[0].startswith("SIP/2.0 200 OK")
+    assert "CSeq: 7 MESSAGE" in sent[0]
+    [(kind, message)] = seen
+    assert kind == "message"
+    assert message.body == long_body
+    assert message.panda == "blue"
+    assert message.sender == "sip:60001@example.invalid"
+
+
+def test_an_incoming_message_without_a_panda_header(monkeypatch):
+    _sent, [(_kind, message)] = _deliver(
+        monkeypatch, _raw_message("NEW_PHONEBOOK;abc;21", panda=None))
+    assert message.panda is None
+
+
+def test_an_incoming_message_is_broadcast_even_if_the_answer_fails(monkeypatch):
+    seen: list = []
+
+    async def _raises(_msg):
+        raise ConnectionResetError
+
+    async def _broadcast(msg_type, msg):
+        seen.append(msg)
+
+    monkeypatch.setattr(sip, "send", _raises)
+    monkeypatch.setattr(sip, "_broadcast", _broadcast)
+
+    async def _scenario():
+        with pytest.raises(ConnectionResetError):
+            await sip.handle_incoming_message(
+                sip.parse_message(_raw_message(STATUS_BODY)))
+
+    run(_scenario())
+    assert len(seen) == 1
+
+
+def test_the_phonebook_token_never_reaches_the_log(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    _sent, [(_kind, message)] = _deliver(monkeypatch, _raw_message(STATUS_BODY))
+    assert "secret-token" not in caplog.text
+    assert "secret-token" not in repr(message)
+    assert "init_status_reply" in caplog.text

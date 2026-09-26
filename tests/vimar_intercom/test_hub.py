@@ -545,3 +545,239 @@ def test_a_hang_up_that_never_returns_cannot_block_the_unload(
     run(asyncio.wait_for(h.async_stop(), 5))
     assert "hangup" in sip_stub
     assert h._stream_viewers == 0
+
+
+# ─── plant configuration sync ────────────────────────────────────────
+
+from custom_components.vimar_intercom import plant_config as pc  # noqa: E402
+from custom_components.vimar_intercom import system_messages as sm  # noqa: E402
+from custom_components.vimar_intercom.phonebook import PhonebookError  # noqa: E402
+
+VERSION = "0123456789abcdef0123456789abcdef"
+STATUS = ('GET_INIT_STATUS_REPLY;[{"PARAM":"GID","VALUE":"21"},'
+          '{"PARAM":"rubrica_ver","VALUE":"' + VERSION + '"},'
+          '{"PARAM":"token","VALUE":"secret-token"}]')
+PLANT = pc.PlantConfig(
+    version=VERSION, group=pc.Group("21", "21", "55001"),
+    panels=(pc.Panel("55001", "Front gate"),),
+    actuators=(pc.Actuator("55001", "OPEN_2F", "Main gate", "DOOR"),))
+
+
+def _inbound(body: str, panda: str | None = "blue") -> sip.InboundMessage:
+    return sip.InboundMessage(
+        sender="sip:60001@example.invalid", panda=panda, body=body)
+
+
+class PlantRig:
+    """A hub with a scripted indoor unit, fetcher, listener and reload."""
+
+    def __init__(self, monkeypatch, *, current=None, plant=PLANT,
+                 reply=STATUS, fetch_error=None):
+        self.hub = _hub()
+        self.hub._running = True
+        self.sent: list[tuple[str, str, dict | None]] = []
+        self.fetched: list[tuple[str, str]] = []
+        self.changes: list[tuple] = []
+        self.reloads = 0
+        self.reply = reply
+        rig = self
+
+        async def _send(uri, body, extra_headers=None):
+            rig.sent.append((uri, body, extra_headers))
+            if body == sm.GET_INIT_STATUS and rig.reply is not None:
+                # The indoor unit answers with a MESSAGE of its own.
+                asyncio.get_running_loop().call_soon(
+                    lambda: asyncio.ensure_future(rig.hub._handle_broadcast(
+                        "message", _inbound(rig.reply))))
+            return True, "OK (200)"
+
+        async def _fetch(status, group):
+            rig.fetched.append((status.rubrica_ver, group))
+            if fetch_error is not None:
+                raise fetch_error
+            return plant
+
+        async def _on_change(previous, new):
+            rig.changes.append((previous, new))
+
+        def _reload():
+            rig.reloads += 1
+
+        monkeypatch.setattr(sip, "do_system_message", _send)
+        monkeypatch.setattr(hub, "PLANT_STATUS_TIMEOUT", 0.2)
+        self.hub.set_plant_sync(current, _fetch, _on_change, _reload)
+
+    def sync(self):
+        async def scenario():
+            self.hub.request_plant_sync()
+            await self.hub._sync_task
+        run(scenario())
+
+
+def test_a_registration_asks_the_indoor_unit_for_its_status(
+        sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch)
+    monkeypatch.setattr(sip, "is_registered", lambda: True)
+
+    async def scenario():
+        rig.hub._on_sip_state_change()
+        await rig.hub._sync_task
+
+    run(scenario())
+    uri, body, headers = rig.sent[0]
+    assert uri == "sip:60001@example.invalid"
+    assert body == "GET_INIT_STATUS"
+    assert headers == {"Panda": "blue"}
+
+
+def test_a_new_phonebook_is_fetched_persisted_and_reloads_the_entry(
+        sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch)
+    rig.sync()
+    assert rig.fetched == [(VERSION, "21")]
+    assert rig.changes == [(None, PLANT)]
+    assert rig.reloads == 1
+    assert rig.hub.plant is PLANT
+    assert rig.hub.init_status.token == "secret-token"
+
+
+def test_an_unchanged_version_downloads_nothing(sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch, current=PLANT)
+    rig.sync()
+    assert rig.fetched == []
+    assert rig.reloads == 0
+
+
+def test_a_new_version_with_the_same_entities_is_saved_without_reloading(
+        sip_stub, monkeypatch):
+    old = pc.PlantConfig(version="f" * 32, group=PLANT.group,
+                         panels=PLANT.panels, actuators=PLANT.actuators)
+    rig = PlantRig(monkeypatch, current=old)
+    rig.sync()
+    assert rig.changes == [(old, PLANT)]
+    assert rig.reloads == 0
+
+
+def test_a_change_during_a_call_reloads_when_the_call_ends(
+        sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch)
+    monkeypatch.setattr(sip, "in_call", True)
+    rig.sync()
+    assert rig.reloads == 0
+
+    run(rig.hub._handle_broadcast("call_ended", "BYE"))
+    assert rig.reloads == 1
+
+
+def test_no_reply_keeps_what_there_is(sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch, reply=None)
+    rig.sync()
+    assert rig.fetched == [] and rig.changes == [] and rig.reloads == 0
+
+
+def test_a_status_without_a_phonebook_keeps_what_there_is(
+        sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch, reply='GET_INIT_STATUS_REPLY;[{"PARAM":"dnd","VALUE":"0"}]')
+    rig.sync()
+    assert rig.fetched == []
+
+
+def test_a_failed_download_warns_without_the_token(
+        sip_stub, monkeypatch, caplog):
+    rig = PlantRig(monkeypatch,
+                   fetch_error=PhonebookError("the phonebook server answered HTTP 503"))
+    with caplog.at_level("DEBUG"):
+        rig.sync()
+    assert rig.changes == [] and rig.reloads == 0
+    assert "HTTP 503" in caplog.text
+    assert "secret-token" not in caplog.text
+
+
+def test_a_transport_error_is_reported_by_type_only(
+        sip_stub, monkeypatch, caplog):
+    rig = PlantRig(monkeypatch, fetch_error=OSError("secret-token in a URL"))
+    with caplog.at_level("WARNING"):
+        rig.sync()
+    assert "OSError" in caplog.text
+    assert "secret-token" not in caplog.text
+
+
+def test_new_phonebook_with_a_new_version_starts_a_sync(sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch, current=pc.PlantConfig(
+        version="f" * 32, group=None, panels=(), actuators=()))
+
+    async def scenario():
+        await rig.hub._handle_broadcast(
+            "message", _inbound(f"NEW_PHONEBOOK;{VERSION};21"))
+        await rig.hub._sync_task
+
+    run(scenario())
+    assert rig.fetched == [(VERSION, "21")]
+
+
+def test_new_phonebook_naming_the_current_version_is_ignored(
+        sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch, current=PLANT)
+    run(rig.hub._handle_broadcast(
+        "message", _inbound(f"NEW_PHONEBOOK;{VERSION};21")))
+    assert rig.hub._sync_task is None
+
+
+def test_a_message_of_another_family_is_not_read_as_a_notification(
+        sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch)
+    run(rig.hub._handle_broadcast(
+        "message", _inbound(f"NEW_PHONEBOOK;{VERSION};21", panda="white")))
+    assert rig.hub._sync_task is None
+
+
+def test_a_second_request_during_a_sync_runs_it_once_more(
+        sip_stub, monkeypatch):
+    rig = PlantRig(monkeypatch)
+
+    async def scenario():
+        rig.hub.request_plant_sync()
+        while not rig.sent:  # the first pass is under way
+            await asyncio.sleep(0)
+        rig.hub.request_plant_sync()
+        rig.hub.request_plant_sync()
+        await rig.hub._sync_task
+
+    run(scenario())
+    # Requests made during a pass collapse into one more pass, which
+    # finds the version the first one has just stored.
+    statuses = [s for s in rig.sent if s[1] == sm.GET_INIT_STATUS]
+    assert len(statuses) == 2
+    assert len(rig.fetched) == 1
+
+
+# ─── actuators go through the door path ──────────────────────────────
+
+def test_an_actuator_is_its_command_to_its_target_with_panda_command(
+        sip_stub, monkeypatch):
+    sent: list = []
+
+    async def _send(uri, body, extra_headers=None):
+        sent.append((uri, body, extra_headers))
+        return True, "OK (200)"
+
+    monkeypatch.setattr(sip, "do_system_message", _send)
+    ok, _ = run(_hub().async_door(target="45001", command="AUX6"))
+    assert ok
+    assert sent == [("sip:45001@example.invalid", "AUX6",
+                     {"Panda": "command"})]
+
+
+@pytest.mark.parametrize("target,command", [
+    ("45001", "AUX6\r\nBYE"), ("4500 1", "AUX6"), ("", "OPEN_2F")])
+def test_an_unsafe_actuator_never_reaches_the_wire(
+        sip_stub, monkeypatch, target, command):
+    sent: list = []
+
+    async def _send(uri, body, extra_headers=None):
+        sent.append(uri)
+        return True, "OK (200)"
+
+    monkeypatch.setattr(sip, "do_system_message", _send)
+    ok, _ = run(_hub().async_door(target=target, command=command))
+    assert not ok and sent == []
