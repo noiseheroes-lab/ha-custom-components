@@ -12,7 +12,20 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import (
+    ATTR_INTERCOM_ROLE,
+    ATTR_PANEL,
+    ATTR_PANEL_NAME,
+    DOMAIN,
+    MANUFACTURER,
+    MODEL,
+    ROLE_ACTUATOR,
+    ROLE_ANSWER,
+    ROLE_CALL,
+    ROLE_HANGUP,
+    ROLE_OPEN,
+    ROLE_RECONNECT,
+)
 from .entity_plan import ButtonPlan
 
 # The phonebook's actuator icons, as Home Assistant icons.
@@ -61,12 +74,25 @@ class VimarButtonBase(ButtonEntity):
     """Common wiring for the intercom buttons."""
 
     _attr_has_entity_name = True
+    # What the button does, as the dashboard card reads it (see const.py).
+    _role: str
 
     def __init__(self, hub, entry_id: str, unique_suffix: str) -> None:
         """Attach the button to the intercom device."""
         self._hub = hub
         self._attr_unique_id = f"{entry_id}_{unique_suffix}"
         self._attr_device_info = _device_info(entry_id)
+        self._attr_extra_state_attributes = {ATTR_INTERCOM_ROLE: self._role}
+
+    def _belongs_to(self, panel) -> None:
+        """Name the panel this button acts on, for the dashboard card.
+
+        The card pairs a panel's call and open buttons and labels its
+        chip with these; the entity name alone carries neither reliably,
+        since it is the installer's and the user can rename it.
+        """
+        self._attr_extra_state_attributes[ATTR_PANEL] = panel.address
+        self._attr_extra_state_attributes[ATTR_PANEL_NAME] = panel.name
 
 
 class VimarCallButton(VimarButtonBase):
@@ -74,11 +100,13 @@ class VimarCallButton(VimarButtonBase):
 
     _attr_translation_key = "call"
     _attr_icon = "mdi:phone-outgoing"
+    _role = ROLE_CALL
 
     def __init__(self, hub, entry_id: str, panel) -> None:
         """Remember which panel this button calls."""
         super().__init__(hub, entry_id, f"call_{panel.address}")
         self._panel = panel
+        self._belongs_to(panel)
         self._attr_name = f"Call {panel.name}"
 
     async def async_press(self) -> None:
@@ -98,11 +126,13 @@ class VimarDoorButton(VimarButtonBase):
 
     _attr_translation_key = "open_door"
     _attr_icon = "mdi:door-open"
+    _role = ROLE_OPEN
 
     def __init__(self, hub, entry_id: str, panel) -> None:
         """Remember which panel this button opens."""
         super().__init__(hub, entry_id, f"door_{panel.address}")
         self._panel = panel
+        self._belongs_to(panel)
         self._attr_name = f"Open {panel.name}"
 
     async def async_press(self) -> None:
@@ -121,6 +151,7 @@ class VimarActuatorButton(VimarButtonBase):
     """
 
     _attr_icon = "mdi:gesture-tap-button"
+    _role = ROLE_ACTUATOR
 
     def __init__(self, hub, entry_id: str, plan: ButtonPlan) -> None:
         """Remember what this button sends, and to whom."""
@@ -144,6 +175,7 @@ class VimarAnswerButton(VimarButtonBase):
 
     _attr_translation_key = "answer"
     _attr_icon = "mdi:phone-incoming"
+    _role = ROLE_ANSWER
 
     def __init__(self, hub, entry_id: str) -> None:
         """Create the answer button."""
@@ -162,6 +194,7 @@ class VimarHangupButton(VimarButtonBase):
 
     _attr_translation_key = "hang_up"
     _attr_icon = "mdi:phone-hangup"
+    _role = ROLE_HANGUP
 
     def __init__(self, hub, entry_id: str) -> None:
         """Create the hang-up button."""
@@ -178,6 +211,7 @@ class VimarReconnectButton(VimarButtonBase):
     _attr_translation_key = "reconnect"
     _attr_icon = "mdi:restart"
     _attr_entity_category = EntityCategory.CONFIG
+    _role = ROLE_RECONNECT
 
     def __init__(self, hub, entry_id: str) -> None:
         """Create the reconnect button."""

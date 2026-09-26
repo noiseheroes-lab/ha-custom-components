@@ -10,7 +10,13 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import (
+    ATTR_INTERCOM_ROLE,
+    DOMAIN,
+    MANUFACTURER,
+    MODEL,
+    ROLE_DOORBELL,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +53,8 @@ class VimarDoorbellEvent(EventEntity):
     _attr_icon = "mdi:bell-ring"
     _attr_device_class = EventDeviceClass.DOORBELL
     _attr_event_types = ["ring"]
+    # Alongside the event's own `panel`; see const.py.
+    _attr_extra_state_attributes = {ATTR_INTERCOM_ROLE: ROLE_DOORBELL}
 
     def __init__(self, hub, entry_id: str) -> None:
         self._hub = hub

@@ -47,6 +47,30 @@ CA_PATH = os.path.join(SCRIPT_DIR, "vimar_rootca.pem")
 # ─── Events ──────────────────────────────────────────────────────
 EVENT_RING = "vimar_intercom_ring"
 
+# ─── Dashboard card contract ─────────────────────────────────────
+# State attributes the bundled dashboard card reads to tell the
+# entities apart. The frontend sees neither unique IDs nor the entity
+# plan, and names are the installer's, so every entity states what it
+# is, and the per-panel buttons which panel they belong to. Public:
+# other cards may rely on them too.
+ATTR_INTERCOM_ROLE = "intercom_role"
+ATTR_PANEL = "panel"
+ATTR_PANEL_NAME = "panel_name"
+ATTR_DEFAULT_PANEL = "default_panel"
+ATTR_DEFAULT_PANEL_NAME = "default_panel_name"
+
+ROLE_CAMERA = "camera"
+ROLE_DOORBELL = "doorbell"
+ROLE_REGISTRATION = "registration"
+ROLE_IN_CALL = "in_call"
+ROLE_ANSWER = "answer"
+ROLE_HANGUP = "hangup"
+ROLE_RECONNECT = "reconnect"
+ROLE_CALL = "call"
+ROLE_OPEN = "open"
+ROLE_DOOR = "door"
+ROLE_ACTUATOR = "actuator"
+
 # ─── Repair issues ───────────────────────────────────────────────
 ISSUE_REGISTRATION_DOWN = "registration_down"
 REGISTRATION_DOWN_GRACE = 300  # seconds before raising the repair issue

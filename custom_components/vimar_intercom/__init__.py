@@ -13,10 +13,12 @@ from homeassistant.components.http import KEY_HASS, HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.typing import ConfigType
 
 from . import media_handler as media
 from .const import (
@@ -27,6 +29,7 @@ from .const import (
     PLANT_STORAGE_KEY,
     PLANT_STORAGE_VERSION,
 )
+from .dashboard_card import async_register_card
 from .entity_plan import EntityPlan, plan_entities
 from .hub import VimarIntercomHub
 from .phonebook import download_phonebook, phonebook_url
@@ -38,6 +41,11 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["camera", "lock", "button", "event", "binary_sensor"]
 
+# Set up from the UI only. Declared because `async_setup` exists: without
+# it a stray `vimar_intercom:` key in configuration.yaml would be
+# accepted silently.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 # Key under which the "AV view already registered" marker is kept in
 # hass.data[DOMAIN]. Config entry IDs are lowercase alphanumeric ULIDs,
 # so this cannot collide with one.
@@ -45,6 +53,16 @@ VIEW_REGISTERED = "av_view_registered"
 
 # How long the view waits for the call it triggered to establish.
 CALL_SETUP_TIMEOUT = 15.0
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Serve the dashboard card, once per Home Assistant run.
+
+    Here rather than in `async_setup_entry`, which runs again on every
+    reload; see `dashboard_card`.
+    """
+    await async_register_card(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

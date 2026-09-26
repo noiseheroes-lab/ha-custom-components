@@ -8,6 +8,7 @@
   "dependencies": [
     "ffmpeg",
     "file_upload",
+    "frontend",
     "http",
     "stream"
   ],

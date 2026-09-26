@@ -13,7 +13,15 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.network import get_url
 
 from . import media_handler as media
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import (
+    ATTR_DEFAULT_PANEL,
+    ATTR_DEFAULT_PANEL_NAME,
+    ATTR_INTERCOM_ROLE,
+    DOMAIN,
+    MANUFACTURER,
+    MODEL,
+    ROLE_CAMERA,
+)
 from .hub import MAX_CALL_DURATION
 
 AV_PATH = "/api/vimar_intercom/av"
@@ -65,6 +73,15 @@ class VimarIntercomCamera(Camera):
         self._hub = hub
         self._attr_unique_id = f"{entry_id}_camera"
         self._attr_device_info = _device_info(entry_id)
+        # The panel the stream calls. The dashboard card labels its play
+        # button with it and knows that watching it needs no call button.
+        # Fixed for the life of the entry: a new plant reloads it.
+        default = hub.config.default_panel
+        self._attr_extra_state_attributes = {
+            ATTR_INTERCOM_ROLE: ROLE_CAMERA,
+            ATTR_DEFAULT_PANEL: default.address,
+            ATTR_DEFAULT_PANEL_NAME: default.name,
+        }
 
     @property
     def is_streaming(self) -> bool:

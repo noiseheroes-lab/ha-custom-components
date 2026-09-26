@@ -33,6 +33,20 @@ by hand any more.
   and removes the ones that are gone. Existing panel buttons and the
   door lock keep their unique IDs. Without a phonebook the options are
   used as before.
+- **A dashboard card ships with the integration** (`custom:vimar-intercom-card`):
+  live video with a panel selector, a ringing banner with Answer,
+  Dismiss and Open door, door buttons that need a second tap or a hold,
+  the other actuators, and the registration state with Reconnect. It is
+  served and loaded on every dashboard by the integration itself, so
+  there is no resource to add; it appears in the card picker and has a
+  visual editor. English and Italian, light and dark themes. A ring
+  does not start the video on its own, because opening the stream while
+  a panel rings answers the call. The integration now declares
+  `frontend` as a dependency.
+- Every entity carries an `intercom_role` attribute, the call and open
+  buttons `panel` and `panel_name`, and the camera `default_panel` and
+  `default_panel_name`, so a card can tell them apart without guessing
+  from names.
 - `vimar_intercom_ring` event on the Home Assistant bus, carrying the
   panel address and name.
 - Reconnect button and a repair issue raised when registration has been

@@ -12,7 +12,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import ATTR_INTERCOM_ROLE, DOMAIN, MANUFACTURER, MODEL, ROLE_DOOR
 from .entity_plan import LockPlan
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,6 +65,8 @@ class VimarIntercomLock(LockEntity):
     _attr_has_entity_name = True
     _attr_translation_key = "door"
     _attr_icon = "mdi:door-closed-lock"
+    # Every lock is a door release; the card shows it as an open button.
+    _attr_extra_state_attributes = {ATTR_INTERCOM_ROLE: ROLE_DOOR}
 
     def __init__(self, hub, entry_id: str, plan: LockPlan) -> None:
         self._hub = hub

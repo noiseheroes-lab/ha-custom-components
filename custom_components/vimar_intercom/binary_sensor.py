@@ -11,7 +11,14 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import (
+    ATTR_INTERCOM_ROLE,
+    DOMAIN,
+    MANUFACTURER,
+    MODEL,
+    ROLE_IN_CALL,
+    ROLE_REGISTRATION,
+)
 
 
 async def async_setup_entry(
@@ -58,9 +65,10 @@ class VimarSIPRegistrationSensor(BinarySensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
-        """Expose the proxy the client is talking to."""
+        """Expose the proxy the client is talking to, and the card role."""
         cfg = self._hub.config
         return {
+            ATTR_INTERCOM_ROLE: ROLE_REGISTRATION,
             "proxy_host": cfg.proxy_host,
             "proxy_port": str(cfg.proxy_port),
         }
@@ -84,6 +92,7 @@ class VimarInCallSensor(BinarySensorEntity):
     _attr_has_entity_name = True
     _attr_translation_key = "in_call"
     _attr_icon = "mdi:phone-in-talk"
+    _attr_extra_state_attributes = {ATTR_INTERCOM_ROLE: ROLE_IN_CALL}
 
     def __init__(self, hub, entry_id: str) -> None:
         """Attach the sensor to the intercom device."""

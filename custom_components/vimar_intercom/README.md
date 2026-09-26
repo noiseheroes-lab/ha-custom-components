@@ -126,6 +126,70 @@ the generic lock stays as it was. Door actuators are locks because a
 door release is what Home Assistant's lock entity is for; `AUX` outputs
 drive anything from a light to a second gate, so they are plain buttons.
 
+## Dashboard card
+
+The integration comes with a dashboard card: live video, the doorbell,
+the doors and the other controls of your intercom in one place, laid
+out like an intercom app. It is installed with the integration and
+loaded on every dashboard automatically, so there is no resource to
+add and nothing to install from HACS's frontend section. Edit a
+dashboard, **Add card**, and pick **Vimar Intercom**; it finds your
+intercom on its own.
+
+```yaml
+type: custom:vimar-intercom-card
+# All optional:
+title: Front door
+device_id: <your intercom device>   # defaults to the first Vimar Intercom device
+show_actuators: true                # lights and other AUX outputs
+hidden_entities:                    # leave these out of the card
+  - button.vimar_intercom_garage
+```
+
+The visual editor offers the same options. `hidden_entities` takes the
+door locks, the controls, and a panel's call button (which removes that
+panel from the panel selector) or open button (which removes Open door
+from that panel's calls).
+
+What it does:
+
+- **Watch** shows the live stream of the default panel. As with the
+  camera entity, opening the stream places the call, and the call ends
+  shortly after the last viewer leaves. With more than one entrance
+  panel, a panel selector appears: choosing another panel presses its
+  Call button and shows the stream once the call is up. **Stop** ends a
+  call the card placed or answered.
+- **When a panel rings**, a banner names it, with **Answer**,
+  **Dismiss** and **Open door**. The video does not start on its own:
+  the panel sends no video until the call is answered, and opening the
+  stream while it rings answers the call, so a wall tablet showing the
+  card would otherwise take every visitor and stop the rest of the
+  house ringing. Answer starts the video. Dismiss only hides the banner
+  on this dashboard; the other devices keep ringing. During a call the
+  card shows its duration, **Hang up**, and Open door for that panel.
+- **Doors** are large buttons that need a confirmation: tap twice
+  within three seconds, or press and hold. An opened door shows
+  *Opened* for a moment.
+- **Controls** (lights and other AUX outputs) are smaller buttons,
+  pressed with a single tap.
+- The footer shows whether the intercom is registered, with a
+  **Reconnect** action when it is not.
+
+The card follows your Home Assistant theme, light or dark, and is in
+English or Italian after your profile language. Errors, such as a door
+command with no reply, appear as a notification with the reason.
+
+The card is told when a panel rings, not when it stops ringing or
+another device answers, so an unanswered ring banner disappears after
+30 seconds. A call answered anywhere else removes it straight away.
+
+Every entity of the integration carries an `intercom_role` attribute
+(`camera`, `doorbell`, `registration`, `in_call`, `answer`, `hangup`,
+`reconnect`, `call`, `open`, `door`, `actuator`); call and open buttons
+also carry `panel` and `panel_name`, and the camera `default_panel` and
+`default_panel_name`. The card relies on them, and so can your own
+cards and templates.
+
 ## The `vimar_intercom_ring` event
 
 Every time a panel calls in, the integration fires `vimar_intercom_ring`

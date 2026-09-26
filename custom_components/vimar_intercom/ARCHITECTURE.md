@@ -37,6 +37,7 @@ can break the day Vimar changes something on their end.
 | `lock.py` | Door locks: the generic one (the relay group from the QR) or the phonebook's door actuators |
 | `button.py` | Call, door, answer, hang-up and reconnect buttons, and the phonebook's other actuators |
 | `binary_sensor.py` | SIP registration and in-call sensors |
+| `dashboard_card.py`, `frontend/vimar-intercom-card.js` | The dashboard card: served from a static path and added to every frontend page once per run, from `async_setup`. The card is one self-contained ES module with no build step; it reads the entities through their `intercom_role`/`panel` attributes (`const.py`) and acts only through the entities' own services |
 | `const.py` | True constants — protocol values, config keys, defaults. Installation-specific values live in the config entry, not here |
 | `manifest.json`, `strings.json`, `translations/` | Integration metadata and UI strings |
 
@@ -197,6 +198,38 @@ artifacts, is behavioural and needs a live Vimar panel — see the
 README's note on why that validation is a scheduled session, not
 something to try casually.
 
+## Dashboard card
+
+`async_setup` registers `frontend/vimar-intercom-card.js` as a static
+path and adds it to every frontend page with `add_extra_js_url`, with
+the manifest version as a `?v=` cache buster. It runs once per Home
+Assistant run, not per entry reload, and a failure is logged rather
+than raised: the doorbell must not depend on a card.
+
+The card is a plain `HTMLElement` with a shadow root. Home Assistant
+does not export Lit, and borrowing it through an internal element's
+prototype breaks the day the frontend's bundling changes. Each section
+is rendered to a string and replaced only when the string changes, so
+the stream element (`ha-camera-stream`, the frontend's own HLS/WebRTC
+player) is created once per viewing and only has its `hass` updated.
+
+It finds its entities in `hass.entities` (platform, device, translation
+key) and tells them apart by the `intercom_role` attribute every
+entity carries, and the `panel` attribute of the call and open buttons;
+the camera's `default_panel` says which panel watching calls on its
+own. It calls nothing but the entities' services (`button.press`,
+`lock.unlock`), so it can do nothing an automation could not.
+
+Two choices follow from the hub rather than from taste. A ring does
+not start the video: opening the stream while a panel rings answers it
+(`_do_auto_call`), so a card that auto-played would pick up every
+visitor on every open dashboard. And the red button while ringing is
+Dismiss, which only hides the banner: there is no decline entity, Hang
+up does not refuse a pending INVITE, and a 603 would stop the rest of
+the house ringing. The frontend is told when a ring starts (the event
+entity's state) but not when it is cancelled, so the banner expires
+after 30 seconds, or as soon as `in_call` turns on.
+
 ## Threat model
 
 - The config entry holds the SIP account credentials in Home Assistant's
@@ -246,6 +279,10 @@ something to try casually.
   plaintext and any host on the LAN could inject frames into the video
   the camera shows. No inbound TCP port is opened, and nothing from
   outside the local network can reach either socket.
+- The dashboard card's static path is served without authentication,
+  as every frontend file is. It holds the card's code and nothing
+  else: no entity, no name, no address. The card itself acts only
+  through entity services, under the logged-in user's own permissions.
 - The AV stream view is reachable by any authenticated Home Assistant
   user, including non-admins and users for whom the camera entity is
   hidden: entity permissions do not apply to a `HomeAssistantView`. That
