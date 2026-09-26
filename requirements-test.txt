@@ -2,6 +2,10 @@ pytest>=8.0
 cryptography>=42.0
 # The QR image tests. pyzbar also needs the native libzbar; without it
 # those tests skip rather than fail. qrcode only builds test fixtures.
+# numpy is used by the decoder itself (Home Assistant installs it for the
+# stream integration, a dependency of vimar_intercom) and by the synthetic
+# photo generator.
 Pillow>=10.0
+numpy>=1.26
 pyzbar>=0.1.9
 qrcode>=7.4

@@ -34,6 +34,18 @@ by hand any more.
   running in CI.
 
 #### Fixed
+- **A phone photo of the indoor unit's screen was usually not read.**
+  The decoder made a single zbar pass over the full 12 MP frame, and a
+  photo of a backlit LCD (moire from the subpixel grid, glare, noise, a
+  slight angle, a dense code in a corner of the frame) defeats that about
+  two times in three. It now tries the image several ways, cheapest
+  first, stopping at the first success: the image as uploaded, rescaled
+  copies, a local-mean (adaptive) threshold, the QR region located and
+  straightened out of its perspective, and an inverted threshold for a
+  code drawn light on dark. The search is bounded to 12 attempts and 3
+  seconds. On synthetic phone photos of an LCD it reads about 98% where
+  the single pass read about 33%. Pillow and numpy only; no new
+  requirement.
 - **The setup instructions pointed to a menu that does not exist.** They
   sent users to "Settings → System → Export configuration" in the Vimar
   View app, which only scans QR codes. The QR is generated on the indoor
