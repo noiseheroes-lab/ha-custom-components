@@ -24,7 +24,8 @@ from custom_components.vimar_intercom import runtime
 from custom_components.vimar_intercom.entity_plan import ButtonPlan, LockPlan
 
 ENTRY = "01JTESTENTRY"
-PLATFORMS = ("button", "lock", "camera", "event", "binary_sensor")
+PLATFORMS = ("button", "lock", "camera", "event", "binary_sensor",
+             "switch", "select", "sensor")
 PANELS = (runtime.PanelConfig("55001", "Front gate"),
           runtime.PanelConfig("55002", "Lobby"))
 
@@ -60,6 +61,13 @@ def _install_ha_stubs(monkeypatch):
     module("homeassistant.components.binary_sensor",
            BinarySensorEntity=type("BinarySensorEntity", (_Entity,), {}),
            BinarySensorDeviceClass=enum(CONNECTIVITY="connectivity"))
+    module("homeassistant.components.switch",
+           SwitchEntity=type("SwitchEntity", (_Entity,), {}))
+    module("homeassistant.components.select",
+           SelectEntity=type("SelectEntity", (_Entity,), {}))
+    module("homeassistant.components.sensor",
+           SensorEntity=type("SensorEntity", (_Entity,), {}),
+           SensorStateClass=enum(MEASUREMENT="measurement"))
     module("homeassistant.components.http")
     module("homeassistant.components.http.auth", async_sign_path=None)
     module("homeassistant.config_entries", ConfigEntry=object)
@@ -89,12 +97,21 @@ def platforms(monkeypatch):
 
 
 class FakeHub:
-    """A hub with the one thing the entities read at construction."""
+    """A hub with what the entities read for their attributes."""
 
     def __init__(self, panels=PANELS):
         self.config = types.SimpleNamespace(
             panels=panels, default_panel=panels[0],
             proxy_host="sip.example.invalid", proxy_port=7042)
+        self.ringing = None
+        self.mailbox_usage = (3, 20)
+        self.video_messages = ()
+        self.panel_names = {p.address: p.name for p in panels}
+        self.call_log = types.SimpleNamespace(missed_count=0, recent=lambda: [])
+        self.apartment = types.SimpleNamespace(
+            dnd=None, voicemail=None, vm_timeout=None, vm_timeout_values=())
+        self.apartment_intercom = None
+        self.camera_switch_available = False
 
 
 def _role(entity) -> str:
@@ -117,6 +134,96 @@ def test_every_fixed_entity_states_its_role(platforms):
     }
     assert roles == {"camera", "doorbell", "registration", "in_call",
                      "answer", "hangup", "reconnect"}
+
+
+def test_every_native_app_entity_states_its_role(platforms):
+    hub = FakeHub()
+    b, bs = platforms.button, platforms.binary_sensor
+    sensor, switch = platforms.sensor, platforms.switch
+    roles = [
+        _role(b.VimarDeclineButton(hub, ENTRY)),
+        _role(b.VimarCameraSwitchButton(hub, ENTRY, forward=True)),
+        _role(b.VimarCameraSwitchButton(hub, ENTRY, forward=False)),
+        _role(bs.VimarRingingSensor(hub, ENTRY)),
+        _role(switch.VimarDndSwitch(hub, ENTRY)),
+        _role(switch.VimarVoicemailSwitch(hub, ENTRY)),
+        _role(platforms.select.VimarVoicemailTimeoutSelect(hub, ENTRY)),
+        _role(sensor.VimarMailboxUsageSensor(hub, ENTRY)),
+        _role(sensor.VimarVideoMessagesSensor(hub, ENTRY)),
+        _role(sensor.VimarMissedCallsSensor(hub, ENTRY)),
+    ]
+    assert roles == ["decline", "camera_next", "camera_previous", "ringing",
+                     "dnd", "voicemail", "voicemail_timeout", "mailbox_usage",
+                     "video_messages", "missed_calls"]
+
+
+def test_the_ringing_sensor_names_who_is_ringing(platforms):
+    hub = FakeHub()
+    sensor = platforms.binary_sensor.VimarRingingSensor(hub, ENTRY)
+    assert sensor.extra_state_attributes["panel"] is None
+    hub.ringing = types.SimpleNamespace(panel="55002", panel_name="Lobby")
+    assert sensor.is_on is True
+    assert sensor.extra_state_attributes == {
+        "intercom_role": "ringing", "panel": "55002", "panel_name": "Lobby"}
+
+
+def test_live_buttons_follow_the_call_state(platforms):
+    hub = FakeHub()
+    decline = platforms.button.VimarDeclineButton(hub, ENTRY)
+    nxt = platforms.button.VimarCameraSwitchButton(hub, ENTRY, forward=True)
+    assert (decline.available, nxt.available) == (False, False)
+    hub.ringing = object()
+    hub.camera_switch_available = True
+    assert (decline.available, nxt.available) == (True, True)
+
+
+def test_the_apartment_switches_are_unavailable_until_the_unit_says(platforms):
+    hub = FakeHub()
+    dnd = platforms.switch.VimarDndSwitch(hub, ENTRY)
+    assert dnd.available is False
+    hub.apartment_intercom = "21"
+    hub.apartment.dnd = True
+    assert dnd.available is True and dnd.is_on is True
+
+
+def test_the_mailbox_usage_is_a_percentage_of_the_capacity(platforms):
+    usage = platforms.sensor.VimarMailboxUsageSensor(FakeHub(), ENTRY)
+    assert usage.native_value == 15
+    assert usage.extra_state_attributes["capacity"] == 20
+
+
+def test_the_timeout_select_offers_the_units_values(platforms):
+    hub = FakeHub()
+    select = platforms.select.VimarVoicemailTimeoutSelect(hub, ENTRY)
+    assert select.available is False
+    hub.apartment.vm_timeout_values = (15, 30)
+    hub.apartment.vm_timeout = 30
+    assert select.options == ["15", "30"]
+    assert select.current_option == "30"
+
+
+def test_unique_ids_stay_out_of_the_stale_entity_families(platforms):
+    """The registry cleanup removes unknown `call_`/`door_`/`actuator_`
+    IDs; a fixed entity named like one would be deleted on every setup."""
+    from custom_components.vimar_intercom.entity_plan import DYNAMIC_PREFIXES
+    hub = FakeHub()
+    b, bs, sensor = platforms.button, platforms.binary_sensor, platforms.sensor
+    entities = [
+        b.VimarDeclineButton(hub, ENTRY),
+        b.VimarCameraSwitchButton(hub, ENTRY, forward=True),
+        b.VimarCameraSwitchButton(hub, ENTRY, forward=False),
+        bs.VimarRingingSensor(hub, ENTRY),
+        platforms.switch.VimarDndSwitch(hub, ENTRY),
+        platforms.switch.VimarVoicemailSwitch(hub, ENTRY),
+        platforms.select.VimarVoicemailTimeoutSelect(hub, ENTRY),
+        sensor.VimarMailboxUsageSensor(hub, ENTRY),
+        sensor.VimarVideoMessagesSensor(hub, ENTRY),
+        sensor.VimarMissedCallsSensor(hub, ENTRY),
+    ]
+    ids = [e._attr_unique_id for e in entities]
+    assert len(set(ids)) == len(ids)
+    for uid in ids:
+        assert not uid.removeprefix(f"{ENTRY}_").startswith(DYNAMIC_PREFIXES)
 
 
 def test_panel_buttons_name_their_panel(platforms):

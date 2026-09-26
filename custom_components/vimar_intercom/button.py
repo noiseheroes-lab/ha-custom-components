@@ -6,7 +6,7 @@ import logging
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
@@ -22,6 +22,9 @@ from .const import (
     ROLE_ACTUATOR,
     ROLE_ANSWER,
     ROLE_CALL,
+    ROLE_CAMERA_NEXT,
+    ROLE_CAMERA_PREVIOUS,
+    ROLE_DECLINE,
     ROLE_HANGUP,
     ROLE_OPEN,
     ROLE_RECONNECT,
@@ -49,8 +52,11 @@ async def async_setup_entry(
     hub, plan = data["hub"], data["plan"]
     entities: list[ButtonEntity] = [
         VimarAnswerButton(hub, entry.entry_id),
+        VimarDeclineButton(hub, entry.entry_id),
         VimarHangupButton(hub, entry.entry_id),
         VimarReconnectButton(hub, entry.entry_id),
+        VimarCameraSwitchButton(hub, entry.entry_id, forward=True),
+        VimarCameraSwitchButton(hub, entry.entry_id, forward=False),
     ]
     for panel in plan.panels:
         entities.append(VimarCallButton(hub, entry.entry_id, panel))
@@ -220,3 +226,83 @@ class VimarReconnectButton(VimarButtonBase):
     async def async_press(self) -> None:
         """Drop the connection so the supervisor rebuilds it."""
         await self._hub.async_reconnect()
+
+
+class VimarLiveButton(VimarButtonBase):
+    """A button that is only available in some call states.
+
+    It follows both the SIP state (a call starting or ending) and the
+    hub's feature updates (a ring, a CALL_INFO), since either can change
+    whether it can act.
+    """
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the hub."""
+        self._hub.register_state_callback(self._on_update)
+        self._hub.register_update_callback(self._on_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop following the hub."""
+        self._hub.unregister_state_callback(self._on_update)
+        self._hub.unregister_update_callback(self._on_update)
+
+    @callback
+    def _on_update(self) -> None:
+        self.async_write_ha_state()
+
+
+class VimarDeclineButton(VimarLiveButton):
+    """Refuse the ringing call.
+
+    Available only while a panel is ringing. It answers the INVITE with
+    603 Decline, which the proxy takes as the whole call being refused:
+    the rest of the house stops ringing too.
+    """
+
+    _attr_translation_key = "decline"
+    _attr_icon = "mdi:phone-cancel"
+    _role = ROLE_DECLINE
+
+    def __init__(self, hub, entry_id: str) -> None:
+        """Create the decline button."""
+        super().__init__(hub, entry_id, "decline")
+
+    @property
+    def available(self) -> bool:
+        """True while a panel is ringing."""
+        return self._hub.ringing is not None
+
+    async def async_press(self) -> None:
+        """Send 603 Decline."""
+        await self._hub.async_decline()
+
+
+class VimarCameraSwitchButton(VimarLiveButton):
+    """Show the calling panel's next or previous camera.
+
+    Available only during a call whose panel said it has more than one
+    camera (CALL_INFO with VIDEO_SRC 1).
+    """
+
+    _attr_icon = "mdi:camera-switch"
+
+    def __init__(self, hub, entry_id: str, forward: bool) -> None:
+        """Create the next- or previous-camera button."""
+        self._role = ROLE_CAMERA_NEXT if forward else ROLE_CAMERA_PREVIOUS
+        super().__init__(hub, entry_id,
+                         "camera_next" if forward else "camera_previous")
+        self._forward = forward
+        self._attr_translation_key = (
+            "camera_next" if forward else "camera_previous")
+
+    @property
+    def available(self) -> bool:
+        """True during a call whose camera can be switched."""
+        return self._hub.camera_switch_available
+
+    async def async_press(self) -> None:
+        """Ask the panel for its next (or previous) camera."""
+        ok, msg = await self._hub.async_switch_camera(self._forward)
+        if not ok:
+            _LOGGER.error("Switching the camera failed: %s", msg)
+            raise HomeAssistantError(msg)

@@ -91,6 +91,15 @@
       },
       "reconnect": {
         "name": "Reconnect"
+      },
+      "decline": {
+        "name": "Decline"
+      },
+      "camera_next": {
+        "name": "Next camera"
+      },
+      "camera_previous": {
+        "name": "Previous camera"
       }
     },
     "event": {
@@ -104,6 +113,33 @@
       },
       "in_call": {
         "name": "In call"
+      },
+      "ringing": {
+        "name": "Ringing"
+      }
+    },
+    "switch": {
+      "dnd": {
+        "name": "Do not disturb"
+      },
+      "voicemail": {
+        "name": "Answering machine"
+      }
+    },
+    "select": {
+      "voicemail_timeout": {
+        "name": "Answering machine delay"
+      }
+    },
+    "sensor": {
+      "mailbox_usage": {
+        "name": "Mailbox usage"
+      },
+      "video_messages": {
+        "name": "Unread video messages"
+      },
+      "missed_calls": {
+        "name": "Missed calls"
       }
     }
   },
@@ -115,6 +151,46 @@
     "migration_required": {
       "title": "Vimar Intercom must be set up again",
       "description": "This Home Assistant was using Vimar Intercom 1.x, and version 2 cannot reuse its configuration: the credentials used to be edited into the integration's source and now come from a QR code the indoor unit generates, which Home Assistant cannot fetch for you. The intercom will not work until you do this: go to Settings > Devices & services, delete the Vimar Intercom entry, then add the integration again and upload the QR code generated on the indoor unit (Settings > Network and devices > Mobile device pairing). Most entity IDs change; see the integration's README before rewriting your automations."
+    }
+  },
+  "services": {
+    "mark_video_message_read": {
+      "name": "Mark video message read",
+      "description": "Marks one video message of the indoor unit's answering machine as read, for every device of the apartment.",
+      "fields": {
+        "message_id": {
+          "name": "Message ID",
+          "description": "The `id` of the message, as listed in the video messages sensor's `messages` attribute."
+        }
+      }
+    },
+    "delete_video_message": {
+      "name": "Delete video message",
+      "description": "Deletes one video message from the indoor unit's mailbox.",
+      "fields": {
+        "message_id": {
+          "name": "Message ID",
+          "description": "The `id` of the message, as listed in the video messages sensor's `messages` attribute."
+        }
+      }
+    },
+    "delete_all_video_messages": {
+      "name": "Delete all video messages",
+      "description": "Empties the indoor unit's video-message mailbox."
+    },
+    "play_video_message": {
+      "name": "Play video message",
+      "description": "Plays a video message on the intercom camera: the indoor unit plays it as a call, which the camera shows like any call. Playing an unread message marks it read.",
+      "fields": {
+        "message_id": {
+          "name": "Message ID",
+          "description": "The `id` of the message, as listed in the video messages sensor's `messages` attribute."
+        }
+      }
+    },
+    "clear_missed_calls": {
+      "name": "Clear missed calls",
+      "description": "Resets the missed-calls count. The recent calls stay listed."
     }
   }
 }

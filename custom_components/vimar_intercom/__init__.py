@@ -7,12 +7,13 @@ import logging
 import os
 from functools import partial
 
+import voluptuous as vol
 from aiohttp import web
 
 from homeassistant.components.http import KEY_HASS, HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
@@ -21,13 +22,23 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from . import media_handler as media
+from .call_log import CallLog
 from .const import (
+    ATTR_MESSAGE_ID,
     CA_PATH,
+    CALL_LOG_SAVE_DELAY,
+    CALL_LOG_STORAGE_KEY,
+    CALL_LOG_STORAGE_VERSION,
     DOMAIN,
     ISSUE_MIGRATION_REQUIRED,
     ISSUE_REGISTRATION_DOWN,
     PLANT_STORAGE_KEY,
     PLANT_STORAGE_VERSION,
+    SERVICE_CLEAR_MISSED_CALLS,
+    SERVICE_DELETE_ALL_VIDEO_MESSAGES,
+    SERVICE_DELETE_VIDEO_MESSAGE,
+    SERVICE_MARK_VIDEO_MESSAGE_READ,
+    SERVICE_PLAY_VIDEO_MESSAGE,
 )
 from .dashboard_card import async_register_card
 from .entity_plan import EntityPlan, plan_entities
@@ -39,7 +50,8 @@ from .system_messages import InitStatus
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["camera", "lock", "button", "event", "binary_sensor"]
+PLATFORMS = ["camera", "lock", "button", "event", "binary_sensor",
+             "sensor", "switch", "select"]
 
 # Set up from the UI only. Declared because `async_setup` exists: without
 # it a stray `vimar_intercom:` key in configuration.yaml would be
@@ -55,14 +67,70 @@ VIEW_REGISTERED = "av_view_registered"
 CALL_SETUP_TIMEOUT = 15.0
 
 
+_MESSAGE_SCHEMA = vol.Schema({vol.Required(ATTR_MESSAGE_ID): cv.string})
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Serve the dashboard card, once per Home Assistant run.
+    """Serve the dashboard card and register the services, once per run.
 
     Here rather than in `async_setup_entry`, which runs again on every
-    reload; see `dashboard_card`.
+    reload; see `dashboard_card`. The services exist whether or not an
+    entry is loaded, as Home Assistant recommends, and say so when none
+    is.
     """
     await async_register_card(hass)
+    _register_services(hass)
     return True
+
+
+def _register_services(hass: HomeAssistant) -> None:
+    """The video-message and call-log services.
+
+    Each resolves the live hub per call, so a reload never leaves one
+    acting through a hub that has been torn down, and raises the hub's
+    own reason when it fails: a service that only logs looks identical
+    to one that worked.
+    """
+
+    def _hub() -> VimarIntercomHub:
+        hub = _resolve_hub(hass)
+        if hub is None:
+            raise HomeAssistantError("Vimar Intercom is not loaded.")
+        return hub
+
+    def _checked(result: tuple[bool, str]) -> None:
+        ok, msg = result
+        if not ok:
+            raise HomeAssistantError(msg)
+
+    async def _mark_read(call: ServiceCall) -> None:
+        _checked(await _hub().async_mark_video_message_read(
+            call.data[ATTR_MESSAGE_ID]))
+
+    async def _delete(call: ServiceCall) -> None:
+        _checked(await _hub().async_delete_video_message(
+            call.data[ATTR_MESSAGE_ID]))
+
+    async def _delete_all(call: ServiceCall) -> None:
+        _checked(await _hub().async_delete_all_video_messages())
+
+    async def _play(call: ServiceCall) -> None:
+        _checked(await _hub().async_play_video_message(
+            call.data[ATTR_MESSAGE_ID]))
+
+    async def _clear_missed(call: ServiceCall) -> None:
+        await _hub().async_clear_missed_calls()
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_MARK_VIDEO_MESSAGE_READ, _mark_read, _MESSAGE_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_DELETE_VIDEO_MESSAGE, _delete, _MESSAGE_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_DELETE_ALL_VIDEO_MESSAGES, _delete_all, vol.Schema({}))
+    hass.services.async_register(
+        DOMAIN, SERVICE_PLAY_VIDEO_MESSAGE, _play, _MESSAGE_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLEAR_MISSED_CALLS, _clear_missed, vol.Schema({}))
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -102,6 +170,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     hub.set_hass(hass, entry.entry_id)
+    # The call log survives restarts; a damaged store gives an empty log
+    # rather than a failed setup (`CallLog.from_dict`).
+    log_store = _call_log_store(hass, entry.entry_id)
+    call_log = CallLog.from_dict(await log_store.async_load())
+    hub.set_call_log(call_log, partial(
+        log_store.async_delay_save, call_log.to_dict, CALL_LOG_SAVE_DELAY))
     # Before the hub starts: its first registration asks for the status.
     # A changed configuration reloads the entry rather than adding and
     # removing entities in place: the plan, the runtime config the SIP
@@ -149,6 +223,12 @@ def _plant_store(hass: HomeAssistant, entry_id: str) -> Store:
     """The per-entry store of the last good plant configuration."""
     return Store(hass, PLANT_STORAGE_VERSION,
                  PLANT_STORAGE_KEY.format(entry_id=entry_id))
+
+
+def _call_log_store(hass: HomeAssistant, entry_id: str) -> Store:
+    """The per-entry store of the local call log."""
+    return Store(hass, CALL_LOG_STORAGE_VERSION,
+                 CALL_LOG_STORAGE_KEY.format(entry_id=entry_id))
 
 
 async def _async_load_plant(store: Store) -> PlantConfig | None:
@@ -212,8 +292,9 @@ def _remove_stale_entities(
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Delete the stored plant configuration along with the entry."""
+    """Delete the stored plant configuration and call log with the entry."""
     await _plant_store(hass, entry.entry_id).async_remove()
+    await _call_log_store(hass, entry.entry_id).async_remove()
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

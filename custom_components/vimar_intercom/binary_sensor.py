@@ -13,11 +13,14 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     ATTR_INTERCOM_ROLE,
+    ATTR_PANEL,
+    ATTR_PANEL_NAME,
     DOMAIN,
     MANUFACTURER,
     MODEL,
     ROLE_IN_CALL,
     ROLE_REGISTRATION,
+    ROLE_RINGING,
 )
 
 
@@ -26,11 +29,12 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the SIP registration and in-call binary sensors."""
+    """Set up the SIP registration, in-call and ringing binary sensors."""
     hub = hass.data[DOMAIN][entry.entry_id]["hub"]
     async_add_entities([
         VimarSIPRegistrationSensor(hub, entry.entry_id),
         VimarInCallSensor(hub, entry.entry_id),
+        VimarRingingSensor(hub, entry.entry_id),
     ])
 
 
@@ -115,4 +119,52 @@ class VimarInCallSensor(BinarySensorEntity):
 
     @callback
     def _on_state_change(self) -> None:
+        self.async_write_ha_state()
+
+
+class VimarRingingSensor(BinarySensorEntity):
+    """On while a panel is ringing Home Assistant.
+
+    From the INVITE until Home Assistant answers or declines it, the
+    panel cancels it, or another device of the house answers it (the
+    unit's C;<id>;ANSWERED, or a CANCEL saying so). `panel` and
+    `panel_name` say who is ringing, and are None when nobody is.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_translation_key = "ringing"
+    _attr_icon = "mdi:bell-ring"
+
+    def __init__(self, hub, entry_id: str) -> None:
+        """Attach the sensor to the intercom device."""
+        self._hub = hub
+        self._attr_unique_id = f"{entry_id}_ringing"
+        self._attr_device_info = _device_info(entry_id)
+
+    @property
+    def is_on(self) -> bool:
+        """True while a panel is ringing."""
+        return self._hub.ringing is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        """Who is ringing, and the card role."""
+        ring = self._hub.ringing
+        return {
+            ATTR_INTERCOM_ROLE: ROLE_RINGING,
+            ATTR_PANEL: ring.panel if ring else None,
+            ATTR_PANEL_NAME: ring.panel_name if ring else None,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the hub's feature updates."""
+        self._hub.register_update_callback(self._on_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop following the hub."""
+        self._hub.unregister_update_callback(self._on_update)
+
+    @callback
+    def _on_update(self) -> None:
         self.async_write_ha_state()

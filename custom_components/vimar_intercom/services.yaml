@@ -1,0 +1,27 @@
+mark_video_message_read:
+  fields:
+    message_id:
+      required: true
+      example: "12"
+      selector:
+        text:
+
+delete_video_message:
+  fields:
+    message_id:
+      required: true
+      example: "12"
+      selector:
+        text:
+
+delete_all_video_messages:
+
+play_video_message:
+  fields:
+    message_id:
+      required: true
+      example: "12"
+      selector:
+        text:
+
+clear_missed_calls:

@@ -91,6 +91,15 @@
       },
       "reconnect": {
         "name": "Riconnetti"
+      },
+      "decline": {
+        "name": "Rifiuta"
+      },
+      "camera_next": {
+        "name": "Telecamera successiva"
+      },
+      "camera_previous": {
+        "name": "Telecamera precedente"
       }
     },
     "event": {
@@ -104,6 +113,33 @@
       },
       "in_call": {
         "name": "In chiamata"
+      },
+      "ringing": {
+        "name": "Squillo in corso"
+      }
+    },
+    "switch": {
+      "dnd": {
+        "name": "Non disturbare"
+      },
+      "voicemail": {
+        "name": "Segreteria"
+      }
+    },
+    "select": {
+      "voicemail_timeout": {
+        "name": "Ritardo segreteria"
+      }
+    },
+    "sensor": {
+      "mailbox_usage": {
+        "name": "Occupazione casella"
+      },
+      "video_messages": {
+        "name": "Videomessaggi non letti"
+      },
+      "missed_calls": {
+        "name": "Chiamate perse"
       }
     }
   },
@@ -115,6 +151,46 @@
     "migration_required": {
       "title": "Il videocitofono Vimar va riconfigurato",
       "description": "Questo Home Assistant usava Vimar Intercom 1.x e la versione 2 non può riutilizzarne la configurazione: le credenziali prima venivano scritte nel codice dell'integrazione e ora provengono da un codice QR generato dal posto interno, che Home Assistant non può recuperare al posto tuo. Il videocitofono non funzionerà finché non fai così: apri Impostazioni > Dispositivi e servizi, elimina la voce Vimar Intercom, poi aggiungi di nuovo l'integrazione e carica il codice QR generato sul posto interno (Impostazioni > Rete e dispositivi > Associazione dispositivo mobile). Quasi tutti gli ID delle entità cambiano: leggi il README dell'integrazione prima di riscrivere le tue automazioni."
+    }
+  },
+  "services": {
+    "mark_video_message_read": {
+      "name": "Segna videomessaggio come letto",
+      "description": "Segna come letto un videomessaggio della segreteria del posto interno, per tutti i dispositivi dell'appartamento.",
+      "fields": {
+        "message_id": {
+          "name": "ID del messaggio",
+          "description": "L'`id` del messaggio, come elencato nell'attributo `messages` del sensore dei videomessaggi."
+        }
+      }
+    },
+    "delete_video_message": {
+      "name": "Elimina videomessaggio",
+      "description": "Elimina un videomessaggio dalla casella del posto interno.",
+      "fields": {
+        "message_id": {
+          "name": "ID del messaggio",
+          "description": "L'`id` del messaggio, come elencato nell'attributo `messages` del sensore dei videomessaggi."
+        }
+      }
+    },
+    "delete_all_video_messages": {
+      "name": "Elimina tutti i videomessaggi",
+      "description": "Svuota la casella dei videomessaggi del posto interno."
+    },
+    "play_video_message": {
+      "name": "Riproduci videomessaggio",
+      "description": "Riproduce un videomessaggio sulla telecamera del citofono: il posto interno lo riproduce come una chiamata, che la telecamera mostra come qualsiasi chiamata. Riprodurre un messaggio non letto lo segna come letto.",
+      "fields": {
+        "message_id": {
+          "name": "ID del messaggio",
+          "description": "L'`id` del messaggio, come elencato nell'attributo `messages` del sensore dei videomessaggi."
+        }
+      }
+    },
+    "clear_missed_calls": {
+      "name": "Azzera chiamate perse",
+      "description": "Azzera il conteggio delle chiamate perse. Le chiamate recenti restano nell'elenco."
     }
   }
 }
