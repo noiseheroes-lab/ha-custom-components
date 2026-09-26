@@ -1089,6 +1089,9 @@ def test_the_video_input_is_stamped_with_arrival_time(cfg, monkeypatch):
             "-use_wallclock_as_timestamps") + 1] == "1"
         assert "-analyzeduration" in before_video
         assert "-analyzeduration" in between
+        # G.711 in MPEG-TS is a data stream no browser plays.
+        assert cmd[cmd.index("-c:a") + 1] == "aac"
+        assert cmd[cmd.index("-c:v") + 1] == "copy"
     finally:
         sdp = media._av_sdp_path
         run(media.stop_av_ffmpeg())

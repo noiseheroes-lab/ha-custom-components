@@ -917,7 +917,12 @@ async def _start_av_pipeline() -> None:
         "-analyzeduration", AV_ANALYZE_MICROSECONDS,
         "-i", sdp_path,
         "-map", "0:v", "-map", "1:a",
-        "-c", "copy",
+        # Video is copied as it arrives. The panel's audio is G.711,
+        # which MPEG-TS can only carry as an opaque data stream that no
+        # browser plays, so it is encoded to AAC; at 8 kHz mono that
+        # costs next to nothing.
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "32k",
         "-f", "mpegts",
         "pipe:1",
     ]
