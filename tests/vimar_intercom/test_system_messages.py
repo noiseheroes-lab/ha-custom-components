@@ -164,3 +164,138 @@ def test_summary_names_the_kinds_and_never_the_content():
     assert "not-a-real-token" not in summary
     assert "hello" not in summary
     assert sm.KIND_INIT_STATUS_REPLY in summary
+
+
+# ─── do-not-disturb, voicemail, apartment parameters ─────────────────
+
+@pytest.mark.parametrize(("line", "expected"), [
+    ("DND;ON", True), ("DND;OFF", False), ("DND;on", True), ("DND; ON ", True),
+    ("DND;", False), ("DND;1", False),
+])
+def test_dnd_is_on_only_for_on(line, expected):
+    assert sm.parse_switch(line, sm.DND_PREFIX) is expected
+
+
+@pytest.mark.parametrize(("line", "expected"), [
+    ("VOICEMAIL;ON", True), ("VOICEMAIL;OFF", False),
+])
+def test_voicemail_status(line, expected):
+    assert sm.classify_line(line) == sm.KIND_VOICEMAIL_STATUS
+    assert sm.parse_switch(line, sm.VOICEMAIL_PREFIX) is expected
+
+
+def test_switch_commands_are_the_sdk_strings():
+    assert sm.dnd_command(True) == "DND;ON"
+    assert sm.dnd_command(False) == "DND;OFF"
+    assert sm.voicemail_command(True) == "VOICEMAIL;ON"
+    assert sm.voicemail_command(False) == "VOICEMAIL;OFF"
+
+
+def test_set_vm_timeout_is_compact_json_in_the_sdk_key_order():
+    body = sm.set_vm_timeout_command("aB3dE5gH", 60)
+    assert body == ('SET_APT_PARAMS;{"MSGID":"aB3dE5gH","PARAM":"vm_timeout",'
+                    '"VALUE":60}')
+
+
+@pytest.mark.parametrize("seconds", [-1, True, "30"])
+def test_set_vm_timeout_refuses_anything_but_a_non_negative_int(seconds):
+    with pytest.raises(ValueError):
+        sm.set_vm_timeout_command("aB3dE5gH", seconds)
+
+
+def test_message_ids_are_eight_alphanumerics_and_differ():
+    first, second = sm.new_message_id(), sm.new_message_id()
+    assert len(first) == 8 and first.isalnum() and first.isascii()
+    assert first != second
+
+
+def test_apt_params_reply_success_and_failure():
+    ok = sm.parse_apt_params_reply(
+        'SET_APT_PARAMS_REPLY;{"MSGID":"abc","ERRCODE":"ERR_NONE"}')
+    assert (ok.msg_id, ok.ok) == ("abc", True)
+    bad = sm.parse_apt_params_reply(
+        'SET_APT_PARAMS_REPLY;{"MSGID":"abc","ERRCODE":"ERR_INVALID_VALUE"}')
+    assert (bad.ok, bad.error_code) == (False, "ERR_INVALID_VALUE")
+
+
+def test_an_unreadable_apt_params_reply_is_a_failure_without_an_id():
+    reply = sm.parse_apt_params_reply("SET_APT_PARAMS_REPLY;not json")
+    assert reply.msg_id is None
+    assert reply.ok is False
+
+
+def test_apt_params_changed_names_the_timeout():
+    change = sm.parse_apt_params_changed(
+        'APT_PARAMS_CHANGED;{"PARAM":"vm_timeout","VALUE":45}')
+    assert change.vm_timeout == 45
+    other = sm.parse_apt_params_changed(
+        'APT_PARAMS_CHANGED;{"PARAM":"apt_names","VALUE":["a"]}')
+    assert other.vm_timeout is None
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("3/20", (3, 20)), (" 0 / 10 ", (0, 10)), ("7/0", (7, 0)),
+    ("x/10", None), ("3", None), (None, None), ("-1/10", None),
+])
+def test_vm_level_is_used_over_capacity(raw, expected):
+    assert sm.parse_vm_level(raw) == expected
+
+
+# ─── calls ───────────────────────────────────────────────────────────
+
+def test_missed_call_carries_the_panel_and_its_timestamp():
+    missed = sm.parse_missed_call('MISSED_CALL;{"SIP_ID":"55001","TS":"1700000000"}')
+    assert missed.sip_id == "55001"
+    assert missed.timestamp == 1700000000
+
+
+def test_a_numeric_missed_call_timestamp_is_accepted():
+    missed = sm.parse_missed_call('MISSED_CALL;{"SIP_ID":"55001","TS":1700000000}')
+    assert missed.timestamp == 1700000000
+
+
+@pytest.mark.parametrize("line", [
+    "MISSED_CALL;{}", "MISSED_CALL;not json", 'MISSED_CALL;{"TS":"x"}',
+])
+def test_a_missed_call_without_usable_fields_has_none(line):
+    missed = sm.parse_missed_call(line)
+    assert missed.timestamp is None
+    assert missed.sip_id in (None,)
+
+
+def test_call_info_says_when_the_camera_can_be_switched():
+    info = sm.parse_call_info(
+        'CALL_INFO;{"SIP_ID":"55001","REASON":0,"MEDIA_TYPE":1,"VIDEO_SRC":1}')
+    assert info.sip_id == "55001"
+    assert info.switch_available is True
+    assert info.is_video is True
+    assert sm.parse_call_info('CALL_INFO;{"VIDEO_SRC":0}').switch_available is False
+    assert sm.parse_call_info("CALL_INFO;{}").switch_available is False
+
+
+def test_call_answered_lines_name_their_call():
+    assert sm.parse_call_answered("C;abc123@host;ANSWERED") == "abc123@host"
+    assert sm.parse_call_answered("C;;ANSWERED") is None
+
+
+def test_the_answered_notification_is_the_sdk_string():
+    assert sm.call_answered_command("abc@host") == "C;abc@host;ANSWERED"
+
+
+@pytest.mark.parametrize("call_id", ["", "a;b", "a\nb", "a b", "x" * 200])
+def test_an_unsafe_call_id_never_reaches_a_body(call_id):
+    with pytest.raises(ValueError):
+        sm.call_answered_command(call_id)
+
+
+def test_camera_switch_commands():
+    assert sm.switch_source_command(True) == 'CALL_SWITCH_SOURCE;{"SOURCE_TYPE":"VINN"}'
+    assert sm.switch_source_command(False) == 'CALL_SWITCH_SOURCE;{"SOURCE_TYPE":"VINP"}'
+
+
+def test_new_video_message_says_whether_the_mailbox_is_full():
+    assert sm.classify_line("VM;VIDEO_MESSAGE_CHANGE;NEW;1") == sm.KIND_NEW_VOICEMAIL
+    assert sm.mailbox_full("VM;VIDEO_MESSAGE_CHANGE;NEW;1") is True
+    assert sm.mailbox_full("VM;VIDEO_MESSAGE_CHANGE;NEW;0") is False
+    assert sm.classify_line("VM;VIDEO_MESSAGE_CHANGE;UPDATE") == (
+        sm.KIND_VOICEMAIL_CHANGE)

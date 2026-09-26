@@ -11,11 +11,13 @@ app's SDK parses (`SystemMsgModelReceiver.handleType`,
 `SystemMessageReceiverVM`).
 
 Nothing here imports Home Assistant or does I/O, so the whole of it is
-unit tested directly. Only the messages phase 1 acts on are parsed into
-dataclasses — the status reply and the new-phonebook notification — but
-every line is classified, so a later phase (do-not-disturb, voicemail,
-call-log sync) plugs a parser into `classify_body` instead of re-reading
-the wire format.
+unit tested directly. Every line is classified, and the lines the
+integration acts on are parsed into dataclasses: the status reply, the
+new-phonebook notification, do-not-disturb and voicemail switches, the
+apartment-parameter replies, missed calls, call information and the
+"answered elsewhere" notice. The requests the integration sends are
+built here too, so the exact strings the SDK sends live in one place
+and are tested against it.
 
 Nothing in this module logs. The status reply carries the phonebook
 download password (`token`), so a body must never be written to a log,
@@ -26,6 +28,9 @@ which is what a debug line actually needs.
 from __future__ import annotations
 
 import json
+import re
+import secrets
+import string
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,6 +40,16 @@ GET_INIT_STATUS = "GET_INIT_STATUS"
 PANDA_HEADER = "Panda"
 PANDA_BLUE = "blue"
 PANDA_COMMAND = "command"
+# Apartment-parameter changes (the voicemail timeout) go out as `set`.
+PANDA_SET = "set"
+# The voicemail database comes back as `grey`, with `Koala: mailbox.db`.
+PANDA_GREY = "grey"
+KOALA_HEADER = "Koala"
+KOALA_MAILBOX = "mailbox.db"
+
+VM_GET_DB = "VM;GET_DB"
+DND_PREFIX = "DND;"
+VOICEMAIL_PREFIX = "VOICEMAIL;"
 
 # The prefixes the SDK recognises, as (kind, marker, match) in the order
 # `handleType` checks them. The order matters: the SDK tests
@@ -260,3 +275,234 @@ def parse_new_phonebook(body: str) -> NewPhonebook:
         raise ValueError("the NEW_PHONEBOOK notification names no version")
     gid = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
     return NewPhonebook(version=version, gid=gid)
+
+
+# ─── do-not-disturb and voicemail ────────────────────────────────────
+
+def parse_switch(line: str, prefix: str) -> bool:
+    """`DND;ON` / `VOICEMAIL;OFF`: on only for a case-insensitive "ON".
+
+    The SDK removes every occurrence of the prefix and compares what is
+    left with "ON", ignoring case (`MsgDndStatusReceiver`,
+    `MsgVoicemailStatusReceiver`); anything else is off.
+    """
+    return line.replace(prefix, "").strip().upper() == "ON"
+
+
+def dnd_command(on: bool) -> str:
+    """The body that turns do-not-disturb on or off (to the SGA)."""
+    return f"{DND_PREFIX}{'ON' if on else 'OFF'}"
+
+
+def voicemail_command(on: bool) -> str:
+    """The body that turns the answering machine on or off (to the SGA)."""
+    return f"{VOICEMAIL_PREFIX}{'ON' if on else 'OFF'}"
+
+
+_MSG_ID_ALPHABET = string.ascii_letters + string.digits
+
+
+def new_message_id() -> str:
+    """A fresh SET_APT_PARAMS message ID: eight letters and digits.
+
+    The SDK draws the same alphabet (`generateRandomString`, default
+    length 8). The reply echoes it, which is how a reply is matched to
+    its request when two are in flight.
+    """
+    return "".join(secrets.choice(_MSG_ID_ALPHABET) for _ in range(8))
+
+
+def _compact(obj: Any) -> str:
+    """JSON the way Android's JSONObject.toString writes it: no spaces."""
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def set_vm_timeout_command(msg_id: str, seconds: int) -> str:
+    """`SET_APT_PARAMS;{"MSGID":..,"PARAM":"vm_timeout","VALUE":<int>}`.
+
+    Sent with `Panda: set` to the indoor unit. The keys are in the order
+    the SDK puts them in; the unit parses JSON, so the order should not
+    matter, but there is no reason to find out.
+    """
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 0:
+        raise ValueError("the voicemail timeout must be a non-negative integer")
+    if not msg_id.isalnum():
+        raise ValueError("a message ID is letters and digits only")
+    return "SET_APT_PARAMS;" + _compact(
+        {"MSGID": msg_id, "PARAM": "vm_timeout", "VALUE": seconds})
+
+
+def _json_after(line: str, marker: str) -> dict[str, Any]:
+    """The JSON object after a line's marker, or {} when there is none.
+
+    The SDK removes the marker and parses the rest, falling back to an
+    empty object when that fails; a malformed line then reads as a line
+    with no fields rather than as an error.
+    """
+    try:
+        decoded = json.loads(line.replace(marker, "", 1).strip())
+    except ValueError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _opt_text(obj: dict[str, Any], key: str) -> str | None:
+    value = obj.get(key)
+    if value is None or isinstance(value, (dict, list, bool)):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _opt_int(obj: dict[str, Any], key: str) -> int | None:
+    """A non-negative int field, as the SDK's `optInt(key, -1)` reads it."""
+    return _int(obj.get(key))
+
+
+@dataclass(frozen=True)
+class AptParamsReply:
+    """`SET_APT_PARAMS_REPLY;{"MSGID","ERRCODE"}`: how a change went."""
+
+    msg_id: str | None
+    error_code: str | None
+
+    @property
+    def ok(self) -> bool:
+        """True for ERR_NONE, compared ignoring case as the SDK does."""
+        return (self.error_code or "").upper() == "ERR_NONE"
+
+
+def parse_apt_params_reply(line: str) -> AptParamsReply:
+    """Parse a SET_APT_PARAMS_REPLY line; never raises."""
+    obj = _json_after(line, "SET_APT_PARAMS_REPLY;")
+    return AptParamsReply(msg_id=_opt_text(obj, "MSGID"),
+                          error_code=_opt_text(obj, "ERRCODE"))
+
+
+@dataclass(frozen=True)
+class AptParamsChanged:
+    """`APT_PARAMS_CHANGED;{"PARAM","VALUE"}`: someone changed a setting."""
+
+    param: str | None
+    vm_timeout: int | None
+
+
+def parse_apt_params_changed(line: str) -> AptParamsChanged:
+    """Parse an APT_PARAMS_CHANGED line. Only vm_timeout is read, as in the SDK."""
+    obj = _json_after(line, "APT_PARAMS_CHANGED;")
+    param = _opt_text(obj, "PARAM")
+    timeout = (_opt_int(obj, "VALUE")
+               if param is not None and param.lower() == "vm_timeout" else None)
+    return AptParamsChanged(param=param, vm_timeout=timeout)
+
+
+_VM_LEVEL_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
+
+
+def parse_vm_level(raw: str | None) -> tuple[int, int] | None:
+    """`vm_level` — "<messages stored>/<capacity>" — as two ints, or None."""
+    if raw is None:
+        return None
+    match = _VM_LEVEL_RE.match(raw)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+# ─── calls ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class MissedCall:
+    """`MISSED_CALL;{"SIP_ID","TS"}`: a panel rang and nobody answered.
+
+    `timestamp` is the number the unit sent, unconverted: the SDK only
+    stores it, and whether it counts seconds or milliseconds is not
+    visible from the app (see `call_log.epoch_seconds`).
+    """
+
+    sip_id: str | None
+    timestamp: int | None
+
+
+def parse_missed_call(line: str) -> MissedCall:
+    """Parse a MISSED_CALL line; never raises."""
+    obj = _json_after(line, "MISSED_CALL;")
+    sip_id = _opt_text(obj, "SIP_ID")
+    ts = _opt_text(obj, "TS")
+    timestamp = int(ts) if ts is not None and ts.isdigit() else None
+    return MissedCall(sip_id=sip_id, timestamp=timestamp)
+
+
+@dataclass(frozen=True)
+class CallInfo:
+    """`CALL_INFO;{"SIP_ID","REASON","MEDIA_TYPE","VIDEO_SRC"}`.
+
+    `VIDEO_SRC` 1 means the calling panel has more than one camera and
+    CALL_SWITCH_SOURCE can step through them (`isSwitchVideoAvailable`).
+    """
+
+    sip_id: str | None
+    reason: int | None
+    media_type: int | None
+    video_source: int | None
+
+    @property
+    def switch_available(self) -> bool:
+        """True when the camera of this call can be switched."""
+        return self.video_source == 1
+
+    @property
+    def is_video(self) -> bool:
+        """MEDIA_TYPE 1 or 2 is a video call, 0 an audio-only one."""
+        return self.media_type in (1, 2)
+
+
+def parse_call_info(line: str) -> CallInfo:
+    """Parse a CALL_INFO line; never raises."""
+    obj = _json_after(line, "CALL_INFO;")
+    return CallInfo(sip_id=_opt_text(obj, "SIP_ID"),
+                    reason=_opt_int(obj, "REASON"),
+                    media_type=_opt_int(obj, "MEDIA_TYPE"),
+                    video_source=_opt_int(obj, "VIDEO_SRC"))
+
+
+def parse_call_answered(line: str) -> str | None:
+    """The call ID of a `C;<call id>;ANSWERED` line, or None.
+
+    The SDK takes the second `;`-field of each line
+    (`MsgCallAnsweredReceiver`).
+    """
+    parts = line.split(";")
+    if len(parts) < 2:
+        return None
+    return parts[1].strip() or None
+
+
+# Printable ASCII without spaces or `;`. A call ID comes off the wire, in
+# an INVITE header, and goes back out inside a MESSAGE body whose lines
+# are split on newlines and fields on `;`: either would forge a field or
+# a whole extra notification.
+_CALL_ID_RE = re.compile(r"^[!-:<-~]{1,128}$")
+
+
+def valid_call_id(call_id: str) -> bool:
+    """True when a call ID may be embedded in a system-message body."""
+    return bool(_CALL_ID_RE.match(call_id))
+
+
+def call_answered_command(call_id: str) -> str:
+    """`C;<call id>;ANSWERED`: tell the other devices this one answered."""
+    if not valid_call_id(call_id):
+        raise ValueError("that call ID cannot be sent in a system message")
+    return f"C;{call_id};ANSWERED"
+
+
+def switch_source_command(forward: bool) -> str:
+    """`CALL_SWITCH_SOURCE;{"SOURCE_TYPE":"VINN"|"VINP"}`: next/previous camera."""
+    return "CALL_SWITCH_SOURCE;" + _compact(
+        {"SOURCE_TYPE": "VINN" if forward else "VINP"})
+
+
+def mailbox_full(line: str) -> bool:
+    """`VM;VIDEO_MESSAGE_CHANGE;NEW;1` says the mailbox is now full."""
+    return line.replace("VM;VIDEO_MESSAGE_CHANGE;NEW;", "").strip() == "1"
