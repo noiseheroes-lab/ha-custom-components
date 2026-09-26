@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.1.0] — 2026-09-26
 
 ### vimar_intercom — native-app parity
 
@@ -35,6 +35,20 @@
   instead of a 30-second guess, do-not-disturb and answering-machine
   toggles, video-message and missed-call lists, and camera switching
   during a call.
+- **Talk-back from the dashboard card.** While a call is being watched
+  in the card, **Hold to talk** plays the browser's microphone out of
+  the entrance panel: hold while speaking, or tap to keep talking and
+  tap again to stop. The audio travels over the frontend's existing
+  websocket through a binary handler (`vimar_intercom/talk`, the
+  mechanism Assist uses), as 8 kHz 16-bit PCM the card resamples to,
+  and is encoded to G.711 µ-law in pure Python and sent in the call's
+  SRTP audio stream in place of the silence, with a 200 ms jitter
+  buffer. One person talks at a time, the newest taking over. The
+  stream's sound is muted while talking, so your own voice does not
+  come back from the panel seconds later. Needs HTTPS and microphone
+  permission; over plain HTTP the card says so.
+- The mailbox table is found whatever the case of its name: the indoor
+  unit names it in lower case.
 
 #### Changed
 - The SIP reader accepts MESSAGE bodies up to 3 MB (was 128 KB): the
@@ -42,7 +56,7 @@
 - A system message that cannot be sent is logged with its kind only,
   never its body.
 
-## [2.0.0] — 2026-09-10
+## [2.0.0] — 2026-09-26
 
 ### vimar_intercom v2.0.0
 
@@ -75,6 +89,10 @@ by hand any more.
   and removes the ones that are gone. Existing panel buttons and the
   door lock keep their unique IDs. Without a phonebook the options are
   used as before.
+- **The indoor unit is discovered on the local network** (it announces
+  itself over mDNS as `_eipvdes._tcp`), so Home Assistant offers to set
+  it up. The QR code is still what supplies the credentials; a QR from a
+  different unit than the one discovered is refused.
 - **A dashboard card ships with the integration** (`custom:vimar-intercom-card`):
   live video with a panel selector, a ringing banner with Answer,
   Dismiss and Open door, door buttons that need a second tap or a hold,
@@ -85,19 +103,6 @@ by hand any more.
   does not start the video on its own, because opening the stream while
   a panel rings answers the call. The integration now declares
   `frontend` as a dependency.
-- **Talk-back from the dashboard card.** While a call is being watched
-  in the card, **Hold to talk** plays the browser's microphone out of
-  the entrance panel: hold while speaking, or tap to keep talking and
-  tap again to stop. The audio travels over the frontend's existing
-  websocket through a binary handler (`vimar_intercom/talk`, the
-  mechanism Assist uses), as 8 kHz 16-bit PCM the card resamples to,
-  and is encoded to G.711 µ-law in pure Python and sent in the call's
-  SRTP audio stream in place of the silence, with a 200 ms jitter
-  buffer. One person talks at a time, the newest taking over. The
-  stream's sound is muted while talking, so your own voice does not
-  come back from the panel seconds later. Needs HTTPS and microphone
-  permission; over plain HTTP the card says so. Not yet tried against
-  a live panel.
 - Every entity carries an `intercom_role` attribute, the call and open
   buttons `panel` and `panel_name`, and the camera `default_panel` and
   `default_panel_name`, so a card can tell them apart without guessing
@@ -191,10 +196,20 @@ by hand any more.
   mid-stream, or recovering from lost sync, can still decode. A
   transiently stalling consumer gets a small bounded backlog instead of
   being dropped outright.
-- The camera streams the panel's video and audio: ffmpeg remuxes
-  (`-c copy`) the depacketised H.264 and the RTP audio into MPEG-TS, and
-  the camera entity fetches it over a signed URL, so the underlying HTTP
-  view still requires authentication.
+- The camera streams the panel's video and audio: ffmpeg copies the
+  depacketised H.264 and encodes the panel's G.711 audio to AAC into
+  MPEG-TS, and the camera entity fetches it over a signed URL, so the
+  underlying HTTP view still requires authentication.
+- **The stream carried no frames.** Raw H.264 on ffmpeg's stdin has no
+  timestamps, and the MPEG-TS muxer refused every packet: a viewer got
+  the stream headers and nothing else. Packets are now stamped with
+  their arrival time, and ffmpeg probes for half a second instead of
+  five, so video starts within the auto-on call.
+- **The stream was silent in browsers.** G.711 in MPEG-TS is an opaque
+  data stream no player decodes; the audio is now AAC.
+- **Auto-on views were cut to eight seconds.** A call carrying no media
+  from this side was ended by the far end after about ten seconds. The
+  client now sends muted-microphone silence for the length of the call.
 
 #### Changed
 - **A camera snapshot no longer places a call.** Stills used to be taken
@@ -213,14 +228,8 @@ by hand any more.
   with "Migration handler not found for entry".
 
 #### Known limitations
-- The camera is implemented but not verified end to end against a live
-  panel: it is built and unit tested, but a second SIP registration
-  would deregister the production panel, so real-hardware validation is
-  a scheduled session, not something to try casually.
 - There is no still image outside a call.
-- Talk-back works from the dashboard card only (the camera entity has
-  no two-way audio in Home Assistant), needs HTTPS, and has not been
-  tried against a live panel.
+- Audio flows from the panel only. There is no talk-back.
 - One Vimar system per Home Assistant installation.
 - The AV stream view is reachable by any authenticated Home Assistant
   user; entity permissions do not apply to an HTTP view.
