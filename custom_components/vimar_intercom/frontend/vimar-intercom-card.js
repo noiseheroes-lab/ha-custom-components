@@ -760,6 +760,539 @@ const STYLES = `
   }
 `;
 
+// ─── talk-back ───────────────────────────────────────────────────────
+//
+// The Talk button: the browser's microphone, played out of the entrance
+// panel. One self-contained block - its strings, styles, audio capture
+// and button - that the card touches in four places (`_build`,
+// `_render`, `disconnectedCallback` and the style tag), so the rest of
+// the card can change around it without conflicts.
+//
+// The audio goes over the websocket the frontend already holds, not a
+// new endpoint: `vimar_intercom/talk` (talk_api.py) answers with a
+// binary handler ID, and every 20 ms frame is sent as one binary message
+// with that ID as its first byte, which is how Assist streams microphone
+// audio. The integration refuses when there is no call; closing the
+// subscription or the websocket ends the stream.
+//
+// Frames are 16-bit little-endian mono PCM at 8 kHz, 160 samples: the
+// panel's own rate, so the server only has to encode µ-law. Resampling
+// happens here, in an AudioWorklet (a ScriptProcessor where there is
+// none): Firefox refuses to connect a microphone to an AudioContext
+// running at another rate than the device, so asking for an 8 kHz
+// context is not an option.
+//
+// While Talk is on, the stream's own audio is muted (ducked), and
+// restored after. The panel's microphone hears its own speaker, and the
+// visitor's audio reaches the browser seconds late through the stream,
+// so without ducking you hear your own voice come back after a delay -
+// an echo the browser's echo canceller cannot remove, since it never
+// played that audio through the call. Intercoms work this way too:
+// while you talk you do not hear the door.
+
+// Strings are merged into the card's dictionaries rather than written
+// into them, so this block stays in one place.
+const TALK_STRINGS = {
+  en: {
+    talk: "Hold to talk",
+    talk_starting: "Starting the microphone…",
+    talk_active: "Talking - tap to stop",
+    talk_active_hold: "Talking - release to stop",
+    talk_note: "Hold while you speak, or tap to keep talking",
+    talk_started: "Talking to the door",
+    talk_stopped: "Stopped talking",
+    talk_needs_https:
+      "Talking to the door needs Home Assistant over HTTPS, so the browser can use the microphone",
+    talk_denied: "Microphone access was denied",
+    talk_no_mic: "No microphone was found",
+    talk_failed: "Talk-back could not start: {error}",
+    talk_replaced: "Someone else is talking to the door now",
+    talk_no_call: "There is no call to talk into",
+    talk_no_audio: "This call carries no audio from Home Assistant",
+  },
+  it: {
+    talk: "Tieni premuto per parlare",
+    talk_starting: "Avvio del microfono…",
+    talk_active: "Stai parlando - tocca per smettere",
+    talk_active_hold: "Stai parlando - rilascia per smettere",
+    talk_note: "Tieni premuto mentre parli, o tocca per continuare a parlare",
+    talk_started: "Stai parlando alla porta",
+    talk_stopped: "Hai smesso di parlare",
+    talk_needs_https:
+      "Per parlare alla porta Home Assistant deve essere in HTTPS, così il browser può usare il microfono",
+    talk_denied: "L'accesso al microfono è stato negato",
+    talk_no_mic: "Nessun microfono trovato",
+    talk_failed: "Impossibile parlare alla porta: {error}",
+    talk_replaced: "Ora sta parlando alla porta qualcun altro",
+    talk_no_call: "Non c'è nessuna chiamata in cui parlare",
+    talk_no_audio: "Questa chiamata non porta audio da Home Assistant",
+  },
+};
+for (const lang of Object.keys(TALK_STRINGS)) Object.assign(STRINGS[lang], TALK_STRINGS[lang]);
+
+const TALK_COMMAND = `${DOMAIN}/talk`;
+// A press shorter than this is a tap, which keeps Talk on until the next
+// tap; a longer one is push-to-talk, and letting go stops.
+const TALK_HOLD_MS = 400;
+// Frames are dropped, not queued, when the socket is this far behind: a
+// late voice is worse than a gap. 16 KB is about half a second of audio.
+const TALK_MAX_BUFFERED = 16384;
+const TALK_ERRORS = { no_call: "talk_no_call", no_audio: "talk_no_audio" };
+
+const TALK_STYLES = `
+  .talk { margin: 12px 16px 0; display: flex; flex-direction: column; gap: 6px; }
+  .talk-btn {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    width: 100%; min-height: 52px; padding: 0 20px;
+    border-radius: 26px;
+    background: var(--vic-tile);
+    color: var(--primary-text-color);
+    font-weight: 600;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    /* A hold must not turn into a scroll. */
+    touch-action: none;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .talk-btn.starting { opacity: 0.75; }
+  .talk-btn.active {
+    background: var(--primary-color, #03a9f4);
+    color: var(--text-primary-color, #fff);
+  }
+  .talk-btn.active ha-icon { animation: vic-pulse 1.2s ease-in-out infinite; }
+  .talk-note {
+    font-size: 0.85rem; color: var(--secondary-text-color);
+    text-align: center;
+  }
+  .talk-hint {
+    display: flex; gap: 8px; align-items: flex-start;
+    font-size: 0.85rem; color: var(--secondary-text-color);
+  }
+  .talk-hint ha-icon { --mdc-icon-size: 20px; }
+  @media (prefers-reduced-motion: reduce) {
+    .talk-btn.active ha-icon { animation: none; }
+  }
+`;
+
+function talkSupported() {
+  return Boolean(
+    window.isSecureContext &&
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getUserMedia === "function" &&
+      (window.AudioContext || window.webkitAudioContext),
+  );
+}
+
+/** Every <video>/<audio> at or under `node`, through open shadow roots. */
+function talkMediaElements(node, found = [], depth = 0) {
+  if (!node || depth > 32) return found;
+  if (node.tagName === "VIDEO" || node.tagName === "AUDIO") found.push(node);
+  if (node.shadowRoot) {
+    for (const child of node.shadowRoot.children) talkMediaElements(child, found, depth + 1);
+  }
+  for (const child of node.children || []) talkMediaElements(child, found, depth + 1);
+  return found;
+}
+
+/**
+ * Microphone samples at the device rate in, 20 ms PCM frames at 8 kHz
+ * out. Self-contained - no outer names - because its source text is
+ * also what the AudioWorklet runs (see `_captureNode`).
+ *
+ * A 6th-order Butterworth low-pass at 3.2 kHz (three biquads) first,
+ * so that what cannot be carried at 8 kHz is removed instead of folding
+ * back into the speech band - 6 kHz would come back as 2 kHz - then
+ * linear interpolation at the output instants.
+ */
+class TalkResampler {
+  constructor(inRate, onFrame) {
+    this.step = inRate / 8000;
+    this.t = 1;
+    this.prev = 0;
+    this.onFrame = onFrame;
+    this.buf = new ArrayBuffer(320);
+    this.view = new DataView(this.buf);
+    this.n = 0;
+    this.stages = [];
+    if (inRate > 7000) {
+      const w0 = (2 * Math.PI * 3200) / inRate;
+      for (const q of [0.5176, 0.7071, 1.9319]) {
+        const alpha = Math.sin(w0) / (2 * q);
+        const cos = Math.cos(w0);
+        const a0 = 1 + alpha;
+        this.stages.push({
+          b0: (1 - cos) / 2 / a0, b1: (1 - cos) / a0, b2: (1 - cos) / 2 / a0,
+          a1: (-2 * cos) / a0, a2: (1 - alpha) / a0,
+          x1: 0, x2: 0, y1: 0, y2: 0,
+        });
+      }
+    }
+  }
+
+  process(input) {
+    for (let i = 0; i < input.length; i++) {
+      let x = input[i];
+      for (const s of this.stages) {
+        const y = s.b0 * x + s.b1 * s.x1 + s.b2 * s.x2 - s.a1 * s.y1 - s.a2 * s.y2;
+        s.x2 = s.x1; s.x1 = x; s.y2 = s.y1; s.y1 = y;
+        x = y;
+      }
+      while (this.t <= 1) {
+        this.emit(this.prev + (x - this.prev) * this.t);
+        this.t += this.step;
+      }
+      this.t -= 1;
+      this.prev = x;
+    }
+  }
+
+  emit(value) {
+    const v = Math.max(-1, Math.min(1, value));
+    this.view.setInt16(this.n * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    this.n += 1;
+    if (this.n === 160) {
+      this.onFrame(this.buf);
+      this.buf = new ArrayBuffer(320);
+      this.view = new DataView(this.buf);
+      this.n = 0;
+    }
+  }
+}
+
+const TALK_WORKLET = `${TalkResampler.toString()}
+class VimarTalkCapture extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.resampler = new TalkResampler(sampleRate, (buf) => this.port.postMessage(buf, [buf]));
+  }
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (channel) this.resampler.process(channel);
+    return true;
+  }
+}
+registerProcessor("vimar-talk-capture", VimarTalkCapture);
+`;
+
+class VimarTalkBack {
+  /**
+   * `el` is the card's talk section, which this owns. `host` gives the
+   * card's toast, live-region announcement and current stream element.
+   */
+  constructor(el, host) {
+    this._el = el;
+    this._host = host;
+    this._hass = null;
+    // idle | starting | talking
+    this._state = "idle";
+    this._shown = "";
+    this._lang = null;
+    this._gen = 0;
+    this._press = null;
+    this._handlerId = null;
+    this._socket = null;
+    this._unsub = null;
+    this._audio = null;
+    this._ducked = [];
+    el.addEventListener("pointerdown", (ev) => this._onPointerDown(ev));
+    el.addEventListener("pointerup", (ev) => this._onPointerUp(ev));
+    el.addEventListener("pointercancel", (ev) => this._onPointerUp(ev));
+    el.addEventListener("click", (ev) => this._onClick(ev));
+    el.addEventListener("contextmenu", (ev) => {
+      if (ev.target.closest && ev.target.closest(".talk-btn")) ev.preventDefault();
+    });
+  }
+
+  /** Called on every card render: show, hide or stop as the call goes. */
+  update(hass, watchingCall) {
+    this._hass = hass;
+    const supported = talkSupported();
+    const shown = !watchingCall ? "" : supported ? "button" : window.isSecureContext ? "" : "hint";
+    if (!watchingCall && this._state !== "idle") this.stop();
+    const lang = language(hass);
+    if (shown !== this._shown || lang !== this._lang) {
+      this._shown = shown;
+      this._lang = lang;
+      this._build();
+    }
+    this._paint();
+  }
+
+  _build() {
+    const hass = this._hass;
+    if (this._shown === "button") {
+      this._el.innerHTML = `
+        <button class="talk-btn" data-key="talk" aria-pressed="false">
+          ${icon("mdi:microphone")}<span class="talk-label"></span>
+        </button>
+        <div class="talk-note">${esc(t(hass, "talk_note"))}</div>`;
+    } else if (this._shown === "hint") {
+      this._el.innerHTML = `<div class="talk-hint">${icon("mdi:microphone-off")}<span>${esc(t(hass, "talk_needs_https"))}</span></div>`;
+    } else {
+      this._el.innerHTML = "";
+    }
+    this._el.hidden = !this._shown;
+  }
+
+  /** State changes touch attributes only: a held button is never replaced. */
+  _paint() {
+    const btn = this._el.querySelector(".talk-btn");
+    if (!btn) return;
+    const hass = this._hass;
+    const talking = this._state === "talking";
+    const key = this._state === "starting"
+      ? "talk_starting"
+      : talking
+        ? this._press && this._press.started ? "talk_active_hold" : "talk_active"
+        : "talk";
+    btn.classList.toggle("starting", this._state === "starting");
+    btn.classList.toggle("active", talking);
+    btn.setAttribute("aria-pressed", String(this._state !== "idle"));
+    const label = btn.querySelector(".talk-label");
+    const text = t(hass, key);
+    if (label.textContent !== text) label.textContent = text;
+    const note = this._el.querySelector(".talk-note");
+    if (note) note.hidden = this._state !== "idle";
+  }
+
+  // ── input ──
+
+  _onPointerDown(ev) {
+    const btn = ev.target.closest && ev.target.closest(".talk-btn");
+    if (!btn || (ev.button !== undefined && ev.button !== 0)) return;
+    ev.preventDefault();
+    try {
+      btn.setPointerCapture(ev.pointerId);
+    } catch (_err) {
+      // Capture is a nicety: pointerup still arrives on the button.
+    }
+    const started = this._state === "idle";
+    this._press = { at: Date.now(), started };
+    if (started) this._start();
+    this._paint();
+  }
+
+  _onPointerUp(_ev) {
+    const press = this._press;
+    this._press = null;
+    if (!press) return;
+    if (!press.started) {
+      // A tap while talking ends it.
+      this.stop();
+      return;
+    }
+    // Held, and live by now: push-to-talk, so letting go stops. A tap -
+    // or a press released while the microphone was still starting, as
+    // when the permission prompt took the pointer - keeps talking until
+    // the next tap.
+    if (Date.now() - press.at >= TALK_HOLD_MS && this._state === "talking") this.stop();
+    else this._paint();
+  }
+
+  _onClick(ev) {
+    const btn = ev.target.closest && ev.target.closest(".talk-btn");
+    // Pointer clicks were handled by the pointer events; `detail` 0 is
+    // Enter or Space, which toggles.
+    if (!btn || ev.detail !== 0) return;
+    if (this._state === "idle") this._start();
+    else this.stop();
+  }
+
+  // ── the stream ──
+
+  async _start() {
+    if (this._state !== "idle" || !this._hass) return;
+    const gen = ++this._gen;
+    const hass = this._hass;
+    this._state = "starting";
+    this._paint();
+
+    // Created inside the gesture, or browsers start it suspended.
+    let ctx;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      ctx = new Ctx();
+    } catch (err) {
+      this.stop();
+      this._host.toast(t(hass, "talk_failed", { error: errorText(err) }));
+      return;
+    }
+    this._audio = { ctx, mic: null, source: null, node: null };
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+
+    const [mic, sub] = await Promise.allSettled([
+      navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+        video: false,
+      }),
+      hass.connection.subscribeMessage(
+        (event) => this._onEvent(gen, event),
+        { type: TALK_COMMAND },
+        { resubscribe: false },
+      ),
+    ]);
+    if (mic.status === "fulfilled" && this._audio && gen === this._gen) this._audio.mic = mic.value;
+    if (sub.status === "fulfilled") {
+      if (gen === this._gen) this._unsub = sub.value;
+      else Promise.resolve().then(sub.value).catch(() => {});
+    }
+    if (gen !== this._gen) {
+      // Stopped while starting: release what arrived late.
+      if (mic.status === "fulfilled") mic.value.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    if (mic.status === "rejected" || sub.status === "rejected") {
+      this.stop();
+      this._host.toast(this._errorText(mic.status === "rejected" ? mic.reason : sub.reason));
+      return;
+    }
+    this._socket = hass.connection.socket;
+
+    try {
+      const source = ctx.createMediaStreamSource(mic.value);
+      const node = await this._captureNode(ctx, (buf) => this._send(buf));
+      if (gen !== this._gen) {
+        node.disconnect();
+        return;
+      }
+      source.connect(node);
+      // Silent (nothing is written to the output), but connected, or the
+      // node is never pulled and never runs.
+      node.connect(ctx.destination);
+      Object.assign(this._audio, { source, node });
+    } catch (err) {
+      if (gen !== this._gen) return;
+      this.stop();
+      this._host.toast(t(this._hass, "talk_failed", { error: errorText(err) }));
+      return;
+    }
+    this._state = "talking";
+    this._duck();
+    this._paint();
+    this._host.announce(t(this._hass, "talk_started"));
+  }
+
+  async _captureNode(ctx, onFrame) {
+    if (ctx.audioWorklet && window.AudioWorkletNode) {
+      const url = URL.createObjectURL(new Blob([TALK_WORKLET], { type: "text/javascript" }));
+      try {
+        await ctx.audioWorklet.addModule(url);
+        const node = new AudioWorkletNode(ctx, "vimar-talk-capture", {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          channelCount: 1,
+          channelCountMode: "explicit",
+        });
+        node.port.onmessage = (ev) => onFrame(ev.data);
+        return node;
+      } catch (_err) {
+        // A blocked blob: URL, or an old engine: fall through.
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+    // Deprecated but everywhere; runs on the main thread, which is fine
+    // for 8 kHz speech.
+    const node = ctx.createScriptProcessor(2048, 1, 1);
+    const resampler = new TalkResampler(ctx.sampleRate, onFrame);
+    node.onaudioprocess = (ev) => {
+      resampler.process(ev.inputBuffer.getChannelData(0));
+      ev.outputBuffer.getChannelData(0).fill(0);
+    };
+    return node;
+  }
+
+  _onEvent(gen, event) {
+    if (gen !== this._gen || !event) return;
+    if (event.type === "start") {
+      this._handlerId = event.handler_id;
+    } else if (event.type === "end") {
+      this.stop();
+      if (event.reason === "replaced") this._host.toast(t(this._hass, "talk_replaced"));
+    }
+  }
+
+  _send(buf) {
+    if (this._state !== "talking" || !this._handlerId) return;
+    const socket = this._hass && this._hass.connection && this._hass.connection.socket;
+    if (!socket || socket !== this._socket || socket.readyState !== 1) {
+      // The websocket reconnected: the subscription died with the old one.
+      this.stop();
+      return;
+    }
+    if (socket.bufferedAmount > TALK_MAX_BUFFERED) return;
+    const message = new Uint8Array(1 + buf.byteLength);
+    message[0] = this._handlerId;
+    message.set(new Uint8Array(buf), 1);
+    socket.send(message);
+  }
+
+  /** End talking, whatever state it is in. Safe to call any time. */
+  stop() {
+    this._gen += 1;
+    const was = this._state;
+    this._state = "idle";
+    this._handlerId = null;
+    this._socket = null;
+    if (this._unsub) {
+      const unsub = this._unsub;
+      this._unsub = null;
+      // Rejects when the socket is already gone, which ends it anyway.
+      Promise.resolve().then(unsub).catch(() => {});
+    }
+    const audio = this._audio;
+    this._audio = null;
+    if (audio) {
+      try {
+        if (audio.node) {
+          audio.node.disconnect();
+          if (audio.node.port) audio.node.port.onmessage = null;
+          audio.node.onaudioprocess = null;
+        }
+        if (audio.source) audio.source.disconnect();
+      } catch (_err) {
+        // Already disconnected.
+      }
+      if (audio.mic) audio.mic.getTracks().forEach((track) => track.stop());
+      audio.ctx.close().catch(() => {});
+    }
+    this._unduck();
+    this._paint();
+    if (was === "talking" && this._hass) this._host.announce(t(this._hass, "talk_stopped"));
+  }
+
+  _errorText(err) {
+    const hass = this._hass;
+    const name = err && err.name;
+    if (name === "NotAllowedError" || name === "SecurityError") return t(hass, "talk_denied");
+    if (name === "NotFoundError" || name === "OverconstrainedError") return t(hass, "talk_no_mic");
+    if (err && TALK_ERRORS[err.code]) return t(hass, TALK_ERRORS[err.code]);
+    return t(hass, "talk_failed", { error: errorText(err) });
+  }
+
+  // ── ducking ──
+
+  _duck() {
+    this._unduck();
+    const stream = this._host.streamEl();
+    for (const media of talkMediaElements(stream)) {
+      if (!media.muted) {
+        media.muted = true;
+        this._ducked.push(media);
+      }
+    }
+  }
+
+  _unduck() {
+    for (const media of this._ducked) media.muted = false;
+    this._ducked = [];
+  }
+}
+
 // ─── the card ────────────────────────────────────────────────────────
 
 class VimarIntercomCard extends HTMLElement {
@@ -857,6 +1390,8 @@ class VimarIntercomCard extends HTMLElement {
 
   disconnectedCallback() {
     this._stopTicker();
+    // The microphone never stays open behind a card nobody can see.
+    this._talk.stop();
     if (this._view !== "idle" && (this._origin === "call" || this._origin === "answer")) {
       clearTimeout(this._timers.leave);
       this._timers.leave = setTimeout(() => {
@@ -870,7 +1405,7 @@ class VimarIntercomCard extends HTMLElement {
   _build() {
     const root = this.shadowRoot;
     root.innerHTML = `
-      <style>${STYLES}</style>
+      <style>${STYLES}${TALK_STYLES}</style>
       <ha-card>
         <div class="header" hidden></div>
         <div class="message" hidden></div>
@@ -881,6 +1416,7 @@ class VimarIntercomCard extends HTMLElement {
         </div>
         <div class="chips-wrap" hidden></div>
         <div class="call" hidden></div>
+        <div class="talk" hidden></div>
         <div class="doors" hidden></div>
         <div class="actuators" hidden></div>
         <div class="footer" hidden></div>
@@ -896,6 +1432,7 @@ class VimarIntercomCard extends HTMLElement {
       overlay: q(".overlay"),
       chips: q(".chips-wrap"),
       call: q(".call"),
+      talk: q(".talk"),
       doors: q(".doors"),
       actuators: q(".actuators"),
       footer: q(".footer"),
@@ -908,6 +1445,11 @@ class VimarIntercomCard extends HTMLElement {
       if (ev.target.closest && ev.target.closest(".confirm")) ev.preventDefault();
     });
     this._onPointerEnd = () => this._endHold();
+    this._talk = new VimarTalkBack(this._els.talk, {
+      toast: (message) => this._toast(message),
+      announce: (text) => this._announce(text),
+      streamEl: () => this._streamEl,
+    });
   }
 
   /** Replace a section's DOM only when its markup changed; keep focus. */
@@ -1052,6 +1594,7 @@ class VimarIntercomCard extends HTMLElement {
       this._section("message", `${icon("mdi:alert-outline")}<span>${esc(t(hass, model.error))}</span>`);
       for (const name of ["chips", "call", "doors", "actuators", "footer"]) this._section(name, "");
       this._els.video.hidden = true;
+      this._talk.update(hass, false);
       return;
     }
     this._section("message", "");
@@ -1063,6 +1606,8 @@ class VimarIntercomCard extends HTMLElement {
     this._renderVideo();
     this._section("chips", this._chipsHtml());
     this._section("call", this._callHtml());
+    // Talk-back while a call is being watched here; see VimarTalkBack.
+    this._talk.update(hass, this._inCall() && this._view === "live");
     this._section("doors", this._doorsHtml());
     this._section("actuators", this._config.show_actuators === false ? "" : this._actuatorsHtml());
     this._section("footer", this._footerHtml());
