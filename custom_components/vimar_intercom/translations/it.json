@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Videocitofono Vimar",
-        "description": "Sul posto interno apri Impostazioni → Utenti, scegli un utente o creane uno e seleziona Genera QR. Scatta una foto o uno screenshot del codice QR e caricalo qui. Se invece hai il codice QR come testo, incollalo.\n\nCrea un utente dedicato a Home Assistant: ogni utente ha una propria identità SIP e, se la condividi con un telefono o con un altro sistema, i due possono scollegarsi a vicenda.\n\nHome Assistant legge e decifra il codice QR localmente, elimina subito l'immagine e conserva solo le credenziali in questa voce di configurazione.",
+        "description": "Sul posto interno apri Impostazioni → Rete e dispositivi → Associazione dispositivo mobile e scegli un posto libero: il posto interno associa fino a dieci dispositivi e mostra il codice QR del posto che scegli. Scatta una foto o uno screenshot del codice QR e caricalo qui. Se invece hai il codice QR come testo, incollalo.\n\nDai a Home Assistant un posto tutto suo, non quello del tuo telefono: ogni posto ha una propria identità SIP e, se la condividi con un telefono o con un altro sistema, i due possono scollegarsi a vicenda.\n\nHome Assistant legge e decifra il codice QR localmente, elimina subito l'immagine e conserva solo le credenziali in questa voce di configurazione.",
         "data": {
           "qr_image": "Immagine del codice QR",
           "qr_payload": "Oppure incolla il testo del codice QR"
@@ -15,7 +15,7 @@
       },
       "reconfigure": {
         "title": "Aggiorna il codice QR",
-        "description": "Sul posto interno apri Impostazioni → Utenti, scegli l'utente usato da Home Assistant e seleziona Genera QR. Carica una foto o uno screenshot del codice QR, oppure incollane il testo. L'identità del dispositivo generata in precedenza viene mantenuta, così il cloud Vimar continua a riconoscere questa installazione.",
+        "description": "Sul posto interno apri Impostazioni → Rete e dispositivi → Associazione dispositivo mobile e scegli il posto usato da Home Assistant: il posto interno mostra il suo codice QR. Carica una foto o uno screenshot del codice QR, oppure incollane il testo. L'identità del dispositivo generata in precedenza viene mantenuta, così il cloud Vimar continua a riconoscere questa installazione.",
         "data": {
           "qr_image": "Immagine del codice QR",
           "qr_payload": "Oppure incolla il testo del codice QR"
@@ -23,7 +23,7 @@
       }
     },
     "error": {
-      "invalid_qr": "Questo codice QR non è un codice Vimar, oppure è incompleto. Usa il codice QR generato in Impostazioni → Utenti sul posto interno; se hai incollato il testo, copia l'intera stringa, inclusi eventuali caratteri '=' finali.",
+      "invalid_qr": "Questo codice QR non è un codice Vimar, oppure è incompleto. Usa il codice QR mostrato dal posto interno in Impostazioni → Rete e dispositivi → Associazione dispositivo mobile; se hai incollato il testo, copia l'intera stringa, inclusi eventuali caratteri '=' finali.",
       "no_qr_input": "Carica un'immagine del codice QR oppure incollane il testo.",
       "qr_not_found": "Nell'immagine non è stato trovato nessun codice QR. Usa una foto nitida e scattata frontalmente, oppure uno screenshot con tutto il codice QR visibile, o incolla il testo.",
       "multiple_qr": "L'immagine contiene più di un codice QR. Ritagliala lasciando solo quello del posto interno e caricala di nuovo.",
@@ -107,7 +107,7 @@
     },
     "migration_required": {
       "title": "Il videocitofono Vimar va riconfigurato",
-      "description": "Questo Home Assistant usava Vimar Intercom 1.x e la versione 2 non può riutilizzarne la configurazione: le credenziali prima venivano scritte nel codice dell'integrazione e ora provengono da un codice QR generato dal posto interno, che Home Assistant non può recuperare al posto tuo. Il videocitofono non funzionerà finché non fai così: apri Impostazioni > Dispositivi e servizi, elimina la voce Vimar Intercom, poi aggiungi di nuovo l'integrazione e carica il codice QR generato sul posto interno (Impostazioni > Utenti > Genera QR). Quasi tutti gli ID delle entità cambiano: leggi il README dell'integrazione prima di riscrivere le tue automazioni."
+      "description": "Questo Home Assistant usava Vimar Intercom 1.x e la versione 2 non può riutilizzarne la configurazione: le credenziali prima venivano scritte nel codice dell'integrazione e ora provengono da un codice QR generato dal posto interno, che Home Assistant non può recuperare al posto tuo. Il videocitofono non funzionerà finché non fai così: apri Impostazioni > Dispositivi e servizi, elimina la voce Vimar Intercom, poi aggiungi di nuovo l'integrazione e carica il codice QR generato sul posto interno (Impostazioni > Rete e dispositivi > Associazione dispositivo mobile). Quasi tutti gli ID delle entità cambiano: leggi il README dell'integrazione prima di riscrivere le tue automazioni."
     }
   }
 }

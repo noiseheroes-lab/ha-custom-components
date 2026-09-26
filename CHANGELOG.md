@@ -37,9 +37,10 @@ by hand any more.
 - **The setup instructions pointed to a menu that does not exist.** They
   sent users to "Settings → System → Export configuration" in the Vimar
   View app, which only scans QR codes. The QR is generated on the indoor
-  unit, one per user, under Settings → Users → Generate QR, and the
-  dialog, the repair issue and the README now say so, recommending a
-  user dedicated to Home Assistant.
+  unit, under Settings → Network and devices → Mobile device pairing
+  (one slot per paired device, up to ten), and the dialog, the repair
+  issue and the README now say so, recommending a slot dedicated to
+  Home Assistant.
 - Reconnection is unbounded with jittered exponential backoff. Previously
   the client gave up after five attempts and stayed silent until Home
   Assistant restarted.

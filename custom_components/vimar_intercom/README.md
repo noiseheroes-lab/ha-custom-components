@@ -31,7 +31,7 @@ anywhere else.
 ## Requirements
 
 - Access to the indoor unit's settings, to generate a QR code for Home
-  Assistant (Settings → Users → Generate QR)
+  Assistant (Settings → Network and devices → Mobile device pairing)
 - A Home Assistant host that can reach `ipvdes.vimar.cloud` on TCP 7042
 - `ffmpeg`, bundled with Home Assistant OS and Home Assistant Container
 
@@ -46,9 +46,14 @@ anywhere else.
 
 ## Setup
 
-1. On the indoor unit, open **Settings → Users**, pick a user or create
-   one, and select **Generate QR**. This is the same QR code the Vimar
-   View app scans to pair a phone.
+1. On the indoor unit, open **Settings → Network and devices → Mobile
+   device pairing** and pick a **free slot**. The unit pairs up to ten
+   devices and shows a QR code for the slot you pick — the same QR code
+   the Vimar View app scans to pair a phone. Give Home Assistant a slot of
+   its own: each slot has its own SIP identity. (Menu names are
+   translated from the unit's Italian manual, *Impostazioni → Rete e
+   dispositivi → Associazione dispositivo mobile*; your firmware's
+   English labels may differ slightly.)
 2. Take a photo or a screenshot of it, and upload it in the setup
    dialog. If you have the QR as text instead, paste it in the second
    field; when both are filled, the image is used.
