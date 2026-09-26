@@ -111,9 +111,18 @@ JPEG.
 | `button.vimar_intercom_call_<panel>` | button | Call that panel |
 | `button.vimar_intercom_open_<panel>` | button | Open that panel's door |
 | `button.vimar_intercom_answer` / `_hang_up` | button | Answer or end a call |
+| `button.vimar_intercom_decline` | button | Refuse the ringing call (603: the rest of the house stops ringing too). Available only while a panel rings |
+| `button.vimar_intercom_next_camera` / `_previous_camera` | button | Step through the calling panel's cameras. Available only during a call whose panel has more than one |
 | `button.vimar_intercom_reconnect` | button | Rebuild the SIP connection |
 | `binary_sensor.vimar_intercom_sip_registration` | binary_sensor | Connectivity; on only while registered |
 | `binary_sensor.vimar_intercom_in_call` | binary_sensor | A call is up |
+| `binary_sensor.vimar_intercom_ringing` | binary_sensor | A panel is ringing Home Assistant; attributes `panel`, `panel_name` |
+| `switch.vimar_intercom_do_not_disturb` | switch | The apartment's do-not-disturb, as on the indoor unit |
+| `switch.vimar_intercom_answering_machine` | switch | The indoor unit's answering machine (video messages) |
+| `select.vimar_intercom_answering_machine_delay` | select | Seconds the unit rings before the answering machine picks up; the choices the unit offers |
+| `sensor.vimar_intercom_mailbox_usage` | sensor | How full the message mailbox is, in %; attributes `used`, `capacity` |
+| `sensor.vimar_intercom_unread_video_messages` | sensor | Unread video messages; attributes `total`, `messages` |
+| `sensor.vimar_intercom_missed_calls` | sensor | Missed calls since the count was cleared; attribute `recent` |
 
 Entities keep their IDs when the phonebook arrives. A panel's call and
 open buttons stay the same entities, renamed after the phonebook. The
@@ -125,6 +134,110 @@ its own lock, for the other entrance. If the phonebook has no such door,
 the generic lock stays as it was. Door actuators are locks because a
 door release is what Home Assistant's lock entity is for; `AUX` outputs
 drive anything from a light to a second gate, so they are plain buttons.
+
+## Native-app features
+
+What the Vimar View app offers besides the call itself is here too, built
+from the same messages the app exchanges with the indoor unit.
+
+- **Do not disturb** and the **answering machine** are settings of the
+  apartment, kept on the indoor unit. The switches show them as the unit
+  reports them, including changes made on the unit or from a phone, and
+  turning one on here turns it on for every device of the apartment. They
+  need the plant's phonebook, which names the address the change goes to,
+  and are unavailable until the unit has reported their state.
+- **Answering machine delay** changes how long the unit rings before the
+  answering machine takes the visitor. The unit confirms a change; if it
+  refuses one, the error it gave is shown.
+- **Video messages** are the recordings the answering machine keeps. The
+  sensor counts the unread ones and lists the newest 50 in `messages`:
+
+  ```yaml
+  messages:
+    - id: "12"
+      time: "2026-09-21T09:15:00+00:00"
+      caller_id: "55001"
+      caller_name: Front gate
+      duration: 12.5
+      read: false
+      type: video      # or audio
+  ```
+
+  Playing one (the `play_video_message` service, or the card) places a
+  call that the indoor unit answers with the recording, so it shows on
+  the camera like any call and ends when the message does. There is no
+  file to download: the app plays them the same way.
+- **Missed calls** counts the visitors nobody answered, whether the
+  indoor unit reports it or a ring here ended without anyone picking up.
+  `recent` lists the last 20 rings with how each ended: `missed`,
+  `answered` (here), `answered_elsewhere`, `declined`, or `unanswered`
+  (a ring interrupted by a restart, or one that arrived during a call and
+  that nothing reported on since). The log survives restarts.
+- **Ringing** is on from the moment a panel calls until the call is
+  answered here, declined, cancelled by the panel, or answered on another
+  device — the indoor unit says so, as it does to the app. When Home
+  Assistant answers, it tells the other devices the same way the app
+  does.
+- **Next camera / Previous camera** appear during a call from a panel
+  that has more than one camera, as in the app.
+
+### Services
+
+| Service | Data | Does |
+|---|---|---|
+| `vimar_intercom.play_video_message` | `message_id` | Play a message on the camera; marks it read |
+| `vimar_intercom.mark_video_message_read` | `message_id` | Mark a message read, for every device |
+| `vimar_intercom.delete_video_message` | `message_id` | Delete a message from the indoor unit |
+| `vimar_intercom.delete_all_video_messages` | — | Empty the mailbox |
+| `vimar_intercom.clear_missed_calls` | — | Reset the missed-calls count (the history stays) |
+
+`message_id` is the `id` in the video-messages sensor's `messages`. A
+failure — the intercom not connected, an unknown message — is raised
+with its reason.
+
+### Events
+
+`vimar_intercom_missed_call` fires once per missed visitor:
+
+```json
+{"panel": "55001", "panel_name": "Front gate",
+ "time": "2026-09-21T09:15:00+00:00", "entry_id": "<config entry id>"}
+```
+
+`vimar_intercom_video_message` fires when a new message arrives, with
+the message's fields (as in `messages` above) and `entry_id`.
+
+```yaml
+automation:
+  - alias: "Tell me about missed visitors"
+    triggers:
+      - trigger: event
+        event_type: vimar_intercom_missed_call
+    actions:
+      - action: notify.notify
+        data:
+          message: "Missed a visitor at {{ trigger.event.data.panel_name }}."
+
+  - alias: "New video message"
+    triggers:
+      - trigger: event
+        event_type: vimar_intercom_video_message
+    actions:
+      - action: notify.notify
+        data:
+          message: >-
+            {{ trigger.event.data.caller_name }} left a
+            {{ trigger.event.data.duration | round(0) }} s message.
+```
+
+### Diagnostics
+
+**Settings → Devices & services → Vimar Intercom → Download
+diagnostics** gives a file that is safe to attach to a public issue: the
+SIP password and identity, the device identity and push token, the
+panel's MAC and address, the apartment group and the panel names are
+redacted, and the rest is counts, flags and the settings the indoor unit
+reported.
 
 ## Dashboard card
 
@@ -160,13 +273,22 @@ What it does:
   Call button and shows the stream once the call is up. **Stop** ends a
   call the card placed or answered.
 - **When a panel rings**, a banner names it, with **Answer**,
-  **Dismiss** and **Open door**. The video does not start on its own:
+  **Decline** and **Open door**. The video does not start on its own:
   the panel sends no video until the call is answered, and opening the
   stream while it rings answers the call, so a wall tablet showing the
   card would otherwise take every visitor and stop the rest of the
-  house ringing. Answer starts the video. Dismiss only hides the banner
-  on this dashboard; the other devices keep ringing. During a call the
-  card shows its duration, **Hang up**, and Open door for that panel.
+  house ringing. Answer starts the video. Decline refuses the call for
+  the whole house; **Silence here** only hides the banner on this
+  dashboard, and the other devices keep ringing. The banner stays for as
+  long as the panel rings and goes as soon as anyone answers. During a
+  call the card shows its duration, **Hang up**, Open door for that
+  panel, and previous/next camera when the panel has more than one.
+- **Do not disturb** and **Answering machine** are two toggles under the
+  controls.
+- **Video messages** and **Missed calls** are two lists with their
+  counts, closed until tapped. A message plays on the stream with one
+  tap; mark it read, or delete it with a second tap within three
+  seconds. **Clear** resets the missed-calls count.
 - **Doors** are large buttons that need a confirmation: tap twice
   within three seconds, or press and hold. An opened door shows
   *Opened* for a moment.
@@ -179,16 +301,18 @@ The card follows your Home Assistant theme, light or dark, and is in
 English or Italian after your profile language. Errors, such as a door
 command with no reply, appear as a notification with the reason.
 
-The card is told when a panel rings, not when it stops ringing or
-another device answers, so an unanswered ring banner disappears after
-30 seconds. A call answered anywhere else removes it straight away.
+`hidden_entities` also takes the two switches and the two list sensors,
+to leave the settings row or a list out of the card.
 
 Every entity of the integration carries an `intercom_role` attribute
-(`camera`, `doorbell`, `registration`, `in_call`, `answer`, `hangup`,
-`reconnect`, `call`, `open`, `door`, `actuator`); call and open buttons
-also carry `panel` and `panel_name`, and the camera `default_panel` and
-`default_panel_name`. The card relies on them, and so can your own
-cards and templates.
+(`camera`, `doorbell`, `registration`, `in_call`, `ringing`, `answer`,
+`decline`, `hangup`, `reconnect`, `camera_next`, `camera_previous`,
+`call`, `open`, `door`, `actuator`, `dnd`, `voicemail`,
+`voicemail_timeout`, `mailbox_usage`, `video_messages`,
+`missed_calls`); call and open buttons also carry `panel` and
+`panel_name`, the ringing sensor `panel` and `panel_name` of the panel
+ringing, and the camera `default_panel` and `default_panel_name`. The
+card relies on them, and so can your own cards and templates.
 
 ## The `vimar_intercom_ring` event
 
@@ -311,6 +435,14 @@ phonebook door inherits the original door lock.
   a call to the panel. This is how Home Assistant views work rather than
   something this integration introduces, but it is worth knowing if you
   have non-admin users.
+- **The native-app features are built from the official app's protocol
+  but not yet verified against a live plant.** Do-not-disturb, the
+  answering machine, video messages, missed calls and the camera switch
+  send and read exactly what the Vimar View app's SDK does; a few details
+  the app does not show were inferred and are listed in ARCHITECTURE.md.
+  They need the plant's phonebook where the app does too: without it,
+  do-not-disturb and the answering machine cannot be switched, and a
+  message is played by its file name.
 - **Only one SIP registration exists per Vimar account.** Running a
   second client — a test instance, or the Vimar View app configured with
   the same credentials — will deregister this one.

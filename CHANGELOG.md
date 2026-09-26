@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased]
+
+### vimar_intercom — native-app parity
+
+#### Added
+- **Do not disturb** and **answering machine** switches, following the
+  indoor unit (its status reply and its notifications) and switching it
+  through the apartment intercom address from the phonebook, as the
+  Vimar View app does.
+- **Answering-machine delay** select, with the choices the unit offers;
+  a change is adopted only when the unit confirms it, and a refusal is
+  raised with the unit's error code.
+- **Video messages**: the unit's mailbox is read after every
+  registration and on every change notice; a sensor counts the unread
+  messages and lists them; services play, mark read, delete and delete
+  all; `vimar_intercom_video_message` fires for a new one. Playback is a
+  call to the message's extension, shown on the camera like any call.
+- **Mailbox usage** sensor, from the unit's `vm_level`.
+- **Missed calls** sensor with the last 20 rings and how each ended
+  (answered here, answered elsewhere, declined, missed), stored across
+  restarts; `vimar_intercom_missed_call` fires once per missed visitor;
+  `vimar_intercom.clear_missed_calls` resets the count.
+- **Ringing** binary sensor, on from the INVITE until the call is
+  answered, declined, cancelled or answered on another device.
+- **Decline** button (available while ringing) and **Next / Previous
+  camera** buttons (available during a call from a panel with several
+  cameras).
+- Answering a call now tells the other devices of the apartment
+  (`C;<call id>;ANSWERED`), as the app does.
+- A diagnostics download, redacted of every credential and identity.
+- The dashboard card uses all of it: Decline in the ringing banner with
+  "Silence here" beside it, the banner driven by the Ringing sensor
+  instead of a 30-second guess, do-not-disturb and answering-machine
+  toggles, video-message and missed-call lists, and camera switching
+  during a call.
+
+#### Changed
+- The SIP reader accepts MESSAGE bodies up to 3 MB (was 128 KB): the
+  unit sends its mailbox as one base64 SQLite file.
+- A system message that cannot be sent is logged with its kind only,
+  never its body.
+
 ## [2.0.0] — 2026-09-10
 
 ### vimar_intercom v2.0.0

@@ -24,7 +24,9 @@ can break the day Vimar changes something on their end.
 | `backoff.py` | The jittered exponential reconnect delay schedule |
 | `qr.py` | Reads the QR code from an uploaded image (pyzbar, imported lazily) and decrypts and parses the configuration payload the indoor unit generates |
 | `runtime.py` | `RuntimeConfig` — every value the integration needs, derived once from the config entry and the stored plant configuration; no Home Assistant import, fully unit testable |
-| `system_messages.py` | The indoor unit's system messages: GET_INIT_STATUS_REPLY and NEW_PHONEBOOK parsing, and a classifier for every line kind the SDK knows — no I/O, no Home Assistant |
+| `system_messages.py` | The indoor unit's system messages: every line kind the SDK knows classified, the ones acted on parsed (status reply, new phonebook, DND/VOICEMAIL, apartment-parameter replies, MISSED_CALL, CALL_INFO, C;ANSWERED), and the requests built — no I/O, no Home Assistant |
+| `voicemail.py` | The video-message mailbox: the base64 SQLite the unit sends read into messages, the read/delete commands, the playback extension — no I/O, no Home Assistant |
+| `call_log.py` | The local call log: one entry per ring and how it ended, the missed-call count, the grace period that tells "missed" from "answered elsewhere", its stored form — no clock, no Home Assistant |
 | `plant_config.py` | Phonebook SQLite bytes → frozen `PlantConfig` (panels, our apartment group, actuators, SYSTEM parameters), selected as the SDK's queries select them; its JSON-safe stored form — no Home Assistant |
 | `phonebook.py` | The phonebook download: URL, RFC 7616 digest auth, a bounded fetch over a duck-typed aiohttp session — no Home Assistant |
 | `discovery.py` | The indoor unit's mDNS announcement (`_eipvdes._tcp`, TXT `mac`/`proxy`/`domain`): parsing, MAC normalisation, matching it to an existing entry and to the QR read afterwards — no Home Assistant |
@@ -35,8 +37,10 @@ can break the day Vimar changes something on their end.
 | `camera.py` | Camera entity — the live stream and the keyframe-derived still |
 | `event.py` | Doorbell event entity, also the source of the `vimar_intercom_ring` bus event |
 | `lock.py` | Door locks: the generic one (the relay group from the QR) or the phonebook's door actuators |
-| `button.py` | Call, door, answer, hang-up and reconnect buttons, and the phonebook's other actuators |
-| `binary_sensor.py` | SIP registration and in-call sensors |
+| `button.py` | Call, door, answer, decline, hang-up, camera-switch and reconnect buttons, and the phonebook's other actuators |
+| `binary_sensor.py` | SIP registration, in-call and ringing sensors |
+| `switch.py`, `select.py`, `sensor.py` | Do-not-disturb and answering-machine switches, the answering-machine delay, mailbox usage, unread video messages and missed calls |
+| `diagnostics.py` | The diagnostics download, redacted of every secret and identity |
 | `dashboard_card.py`, `frontend/vimar-intercom-card.js` | The dashboard card: served from a static path and added to every frontend page once per run, from `async_setup`. The card is one self-contained ES module with no build step; it reads the entities through their `intercom_role`/`panel` attributes (`const.py`) and acts only through the entities' own services |
 | `const.py` | True constants — protocol values, config keys, defaults. Installation-specific values live in the config entry, not here |
 | `manifest.json`, `strings.json`, `translations/` | Integration metadata and UI strings |
@@ -76,7 +80,66 @@ MESSAGE to the actuator's GID with its command as the body and
 
 Incoming MESSAGEs are answered with 200 OK first and then handed to the
 hub whole; only the kinds of lines they held are logged. A MESSAGE with
-a `Panda` family other than `blue` is not read as a notification.
+a `Panda` family other than `blue` is not read as a notification; the
+one other family the hub reads is `grey` with `Koala: mailbox.db`, the
+video-message mailbox (see below).
+
+## Native-app features
+
+Everything the Vimar View app does besides the call runs over the same
+system messages as the phonebook sync, with the SDK's own receivers:
+the indoor unit ("PICG") at 60001, and the apartment intercom address
+("SGA", the phonebook SYSTEM value MAGIC_APT_INTERCOM). The hub keeps
+the state (`ApartmentState`, the ring, the mailbox, the call log) and
+tells the entities through one update callback.
+
+| Feature | Out | In |
+|---|---|---|
+| Do not disturb | `DND;ON\|OFF`, `Panda: blue`, to the SGA; adopted on the 200 OK | status `dnd`; `DND;ON\|OFF` |
+| Answering machine | `VOICEMAIL;ON\|OFF`, `Panda: blue`, to the SGA | status `voicemail`; `VOICEMAIL;ON\|OFF` |
+| Answering-machine delay | `SET_APT_PARAMS;{"MSGID","PARAM":"vm_timeout","VALUE"}`, `Panda: set`, to the PICG | `SET_APT_PARAMS_REPLY;{"MSGID","ERRCODE"}` (only ERR_NONE succeeds); `APT_PARAMS_CHANGED` |
+| Mailbox usage | — | status `vm_level` "<stored>/<capacity>" |
+| Video messages | `VM;GET_DB` to the PICG after the status and on every change notice; `VM;<ID>;READ\|DELETED;<ORIGTIME>;<CALLERID>`, `VM;ALL;DELETED` | a MESSAGE with `Panda: grey`, `Koala: mailbox.db` and the SQLite file in base64; `VM;VIDEO_MESSAGE_CHANGE;NEW\|UPDATE` |
+| Playback | a call to VM_PREFIX + the file name with its mailbox number removed, or the file name without a phonebook | the recording as the call's media |
+| Answered elsewhere | `C;<call id>;ANSWERED` to the SGA when Home Assistant answers | the same line from another device; a CANCEL with `Reason: SIP;cause=200` |
+| Missed calls | — | `MISSED_CALL;{"SIP_ID","TS"}` |
+| Camera switch | `CALL_SWITCH_SOURCE;{"SOURCE_TYPE":"VINN"\|"VINP"}`, `Panda: blue`, to 60002 | `CALL_INFO;{…,"VIDEO_SRC":1}` |
+
+The mailbox MESSAGE is the one large thing the SIP reader frames, so
+its body ceiling is 3 MB (a mailbox is a few kilobytes; `voicemail`
+refuses more than 2 MB decoded).
+
+Read from the decompiled SDK: every message string, receiver, `Panda`
+family and JSON key above; the MAILBOX columns and "FLAG R = read";
+the playback extension; VIDEO_SRC 1 as "switch available"; 60002 as the
+camera-switch address; ERR_NONE as success.
+
+Inferred, and to be settled against a live plant:
+
+- **The ring's call ID.** The SDK reads it with linphone's
+  `getCustomHeader("Call-ID")` on the INVITE, which returns the first
+  header of that name: the SIP Call-ID, unless the sender put its own
+  first. `C;<id>;ANSWERED` is sent with that first value, and the
+  notice from another device is matched against every Call-ID and
+  X-Call-ID the INVITE carried.
+- **What "missed" means locally.** A panel's CANCEL without cause 200
+  becomes missed after five seconds unless an answered notice arrives,
+  because the answering device's notice and the proxy's CANCEL race. A
+  plant that neither sends cause 200 nor an answered notice when the
+  indoor unit itself answers would count those calls as missed.
+- **Timestamp units.** `TS` and `ORIGTIME` are stored unconverted by
+  the SDK; a value above 10^11 is read as milliseconds.
+- **After read or delete** the unit is assumed to send
+  `VM;VIDEO_MESSAGE_CHANGE;UPDATE`; the hub updates its list at once and
+  asks for the mailbox again anyway.
+- **The used count of `vm_level`** is taken to be the number of stored
+  messages, and replaced by the mailbox's own count once it is read,
+  since the unit sends no new level when a message arrives.
+- **Switches are optimistic on the 200 OK**, as the app is; whether the
+  unit echoes the notification back to the sender is not known.
+
+GET_NICKS / NICK_CHANGE are not implemented: the PICG is assumed at
+60001, as for the phonebook sync.
 
 ## Connection state machine
 
@@ -224,11 +287,16 @@ Two choices follow from the hub rather than from taste. A ring does
 not start the video: opening the stream while a panel rings answers it
 (`_do_auto_call`), so a card that auto-played would pick up every
 visitor on every open dashboard. And the red button while ringing is
-Dismiss, which only hides the banner: there is no decline entity, Hang
-up does not refuse a pending INVITE, and a 603 would stop the rest of
-the house ringing. The frontend is told when a ring starts (the event
-entity's state) but not when it is cancelled, so the banner expires
-after 30 seconds, or as soon as `in_call` turns on.
+Decline, a 603 that stops the whole house ringing, with "Silence here"
+beside it for a wall tablet that should only stop showing the banner.
+The banner follows the Ringing binary sensor, which the hub keeps from
+the INVITE to its end; with that entity disabled the card falls back to
+the doorbell event and a 30-second window.
+
+The card's edits for the native-app features are localized: new
+sections (`settings`, `messages`, `missed`) rendered by their own
+methods, new cases in `resolveModel` and `_onClick`, and a `_syncRing`
+that reads the sensor first.
 
 ## Threat model
 
@@ -299,6 +367,14 @@ after 30 seconds, or as soon as `in_call` turns on.
   QR fields before it can reach a SIP URI or a MESSAGE body. Only this
   apartment's own group is kept from the phonebook, not the names of
   the neighbouring flats a block's phonebook lists.
+- Every value that goes into a system-message body from the wire — a
+  ring's call ID, a video message's ID, time and caller — is checked
+  before it is embedded (`valid_call_id`, plain numbers for the mailbox):
+  bodies are split on newlines and fields on `;`, so an unchecked value
+  could forge a whole notification. System-message bodies are never
+  logged above DEBUG, and at DEBUG only their kinds are. The call log
+  stores times, panels and outcomes, never a call ID; the diagnostics
+  download redacts every credential and identity.
 - The QR payload and the SIP password are excluded from logging by
   design (see `qr.py`); no module sets a logging level or attaches a
   handler — Home Assistant's own `logger:` configuration is the only
