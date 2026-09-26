@@ -29,20 +29,29 @@
  *   it (hub.py, `_do_auto_call`). A wall tablet showing this card would
  *   otherwise pick up every visitor, and the indoor unit would stop
  *   ringing for everybody else. Answer starts the video.
- * - The red button while ringing is Dismiss, not Decline. The integration
- *   has no decline action, and Hang up does not refuse a ringing call; the
- *   other devices of the house should keep ringing anyway. Dismiss only
- *   hides the banner here.
+ * - The red button while ringing is Decline, which refuses the call for
+ *   the whole house (a 603: the indoor unit and the phones stop ringing
+ *   too). "Silence here" next to it only hides the banner on this card
+ *   and leaves the rest of the house ringing, which is what a wall tablet
+ *   in a hallway usually wants.
+ *
+ * Whether a panel is ringing comes from the integration's Ringing sensor,
+ * which is on from the INVITE until the call is answered, declined,
+ * cancelled by the panel or answered on another device. Without it (the
+ * entity disabled) the card falls back to the doorbell event and a fixed
+ * window, since the event says when a ring starts but not when it ends.
  */
 
 const DOMAIN = "vimar_intercom";
 const CARD_TYPE = "vimar-intercom-card";
 const EDITOR_TYPE = "vimar-intercom-card-editor";
 
-// How long a ring counts as ringing. The frontend is told when a panel
-// rings, not when it gives up or another device answers, so a ring nobody
-// takes here expires on its own.
+// How long a ring counts as ringing when the Ringing sensor is not there
+// to say: the doorbell event says when a panel rings, not when it gives up
+// or another device answers, so such a ring expires on its own.
 const RING_WINDOW_MS = 30000;
+// How many video messages and missed calls the lists show.
+const LIST_MAX = 5;
 // A door opens on a second tap within this window, or on a hold.
 const CONFIRM_WINDOW_MS = 3000;
 const HOLD_MS = 600;
@@ -118,6 +127,33 @@ const STRINGS = {
       "A hidden door, control or panel button is left out of the card.",
     editor_unavailable:
       "The visual editor is not available. Use the code editor.",
+    decline: "Decline",
+    silence_here: "Silence here",
+    settings: "Settings",
+    dnd: "Do not disturb",
+    voicemail: "Answering machine",
+    missed_calls: "Missed calls",
+    no_missed_calls: "No recent calls",
+    clear: "Clear",
+    video_messages: "Video messages",
+    no_video_messages: "No video messages",
+    unread: "{count} unread",
+    play_message: "Play message from {name}",
+    playing: "Playing the message…",
+    mark_read: "Mark read",
+    delete: "Delete",
+    delete_named: "Delete message from {name}",
+    tap_again_delete: "Tap again to delete",
+    next_camera: "Next camera",
+    previous_camera: "Previous camera",
+    outcome_missed: "Missed",
+    outcome_answered: "Answered here",
+    outcome_answered_elsewhere: "Answered elsewhere",
+    outcome_declined: "Declined",
+    outcome_unanswered: "Not answered",
+    outcome_ringing: "Ringing",
+    show_list: "Show {name}",
+    hide_list: "Hide {name}",
   },
   it: {
     card_name: "Citofono Vimar",
@@ -175,6 +211,33 @@ const STRINGS = {
       "Una porta, un comando o un pulsante di pulsantiera nascosto non compare nella scheda.",
     editor_unavailable:
       "L'editor visuale non è disponibile. Usa l'editor di codice.",
+    decline: "Rifiuta",
+    silence_here: "Silenzia qui",
+    settings: "Impostazioni",
+    dnd: "Non disturbare",
+    voicemail: "Segreteria",
+    missed_calls: "Chiamate perse",
+    no_missed_calls: "Nessuna chiamata recente",
+    clear: "Azzera",
+    video_messages: "Videomessaggi",
+    no_video_messages: "Nessun videomessaggio",
+    unread: "{count} da vedere",
+    play_message: "Riproduci il messaggio di {name}",
+    playing: "Riproduzione del messaggio…",
+    mark_read: "Segna come visto",
+    delete: "Elimina",
+    delete_named: "Elimina il messaggio di {name}",
+    tap_again_delete: "Tocca di nuovo per eliminare",
+    next_camera: "Telecamera successiva",
+    previous_camera: "Telecamera precedente",
+    outcome_missed: "Persa",
+    outcome_answered: "Risposta qui",
+    outcome_answered_elsewhere: "Risposta altrove",
+    outcome_declined: "Rifiutata",
+    outcome_unanswered: "Senza risposta",
+    outcome_ringing: "In arrivo",
+    show_list: "Mostra {name}",
+    hide_list: "Nascondi {name}",
   },
 };
 
@@ -190,6 +253,14 @@ const ROLE_BY_TRANSLATION_KEY = {
   "button.hang_up": "hangup",
   "button.reconnect": "reconnect",
   "lock.door": "door",
+  "button.decline": "decline",
+  "button.camera_next": "camera_next",
+  "button.camera_previous": "camera_previous",
+  "binary_sensor.ringing": "ringing",
+  "switch.dnd": "dnd",
+  "switch.voicemail": "voicemail",
+  "sensor.missed_calls": "missed_calls",
+  "sensor.video_messages": "video_messages",
 };
 const ROLE_BY_DOMAIN = { camera: "camera", event: "doorbell", lock: "door" };
 const OPEN_LOCK_STATES = new Set(["unlocked", "unlocking", "open", "opening"]);
@@ -228,6 +299,17 @@ function errorText(err) {
   if (!err) return "";
   if (typeof err === "string") return err;
   return err.message || err.error || err.code || String(err);
+}
+
+/** A short local date and time, or "" for a value that is not one. */
+function formatTime(hass, iso) {
+  const when = Date.parse(iso);
+  if (Number.isNaN(when)) return "";
+  try {
+    return new Date(when).toLocaleString(language(hass), { dateStyle: "short", timeStyle: "short" });
+  } catch (_err) {
+    return new Date(when).toLocaleString();
+  }
 }
 
 function formatDuration(ms) {
@@ -296,6 +378,14 @@ function resolveModel(hass, config) {
     answer: null,
     hangup: null,
     reconnect: null,
+    decline: null,
+    ringing: null,
+    cameraNext: null,
+    cameraPrevious: null,
+    dnd: null,
+    voicemail: null,
+    missedCalls: null,
+    videoMessages: null,
     defaultPanel: null,
     panels: [],
     doors: [],
@@ -343,6 +433,28 @@ function resolveModel(hass, config) {
       case "reconnect":
         model.reconnect = entityId;
         break;
+      case "decline":
+        model.decline = entityId;
+        break;
+      case "ringing":
+        model.ringing = entityId;
+        break;
+      case "camera_next":
+        model.cameraNext = entityId;
+        break;
+      case "camera_previous":
+        model.cameraPrevious = entityId;
+        break;
+      case "dnd":
+      case "voicemail":
+        if (!hidden.has(entityId)) model[role] = entityId;
+        break;
+      case "missed_calls":
+        if (!hidden.has(entityId)) model.missedCalls = entityId;
+        break;
+      case "video_messages":
+        if (!hidden.has(entityId)) model.videoMessages = entityId;
+        break;
       case "call":
       case "open": {
         if (attrs.panel == null || hidden.has(entityId)) break;
@@ -383,6 +495,9 @@ function hideableEntities(hass, config) {
   const model = resolveModel(hass, { ...config, hidden_entities: [] });
   if (model.error) return [];
   const ids = [...model.doors.map((d) => d.id), ...model.actuators.map((a) => a.id)];
+  for (const id of [model.dnd, model.voicemail, model.missedCalls, model.videoMessages]) {
+    if (id) ids.push(id);
+  }
   for (const panel of model.panelByExt.values()) {
     if (panel.call) ids.push(panel.call);
     if (panel.open) ids.push(panel.open);
@@ -745,6 +860,61 @@ const STYLES = `
   }
   .link:hover { background: color-mix(in srgb, var(--primary-color) 10%, transparent); }
 
+  .silence { display: flex; justify-content: center; margin-top: 8px; }
+
+  /* Settings row */
+  .settings-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 16px 16px 0; }
+  .toggle {
+    display: inline-flex; align-items: center; gap: 8px;
+    min-height: 44px; padding: 0 16px 0 12px;
+    border-radius: 22px;
+    border: 1px solid var(--divider-color, rgba(127, 127, 127, 0.3));
+    color: var(--primary-text-color);
+  }
+  .toggle ha-icon { --mdc-icon-size: 20px; color: var(--secondary-text-color); }
+  .toggle[aria-pressed="true"] {
+    background: var(--primary-color); border-color: var(--primary-color);
+    color: var(--text-primary-color, #fff);
+  }
+  .toggle[aria-pressed="true"] ha-icon { color: inherit; }
+
+  /* Video messages and missed calls */
+  .inbox-head {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    min-height: 44px; padding: 0; text-align: left;
+  }
+  .inbox-head .section-title { margin: 0; flex: 1; }
+  .count {
+    min-width: 22px; height: 22px; padding: 0 7px; border-radius: 11px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--vic-danger); color: #fff;
+    font-size: 0.8rem; font-weight: 600;
+  }
+  .count.zero { background: var(--vic-tile); color: var(--secondary-text-color); }
+  .list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .item {
+    display: flex; align-items: center; gap: 10px;
+    min-height: 52px; padding: 4px 4px 4px 12px;
+    border-radius: var(--vic-radius);
+    background: var(--vic-tile);
+    color: var(--primary-text-color);
+  }
+  .item .text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .item .label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .sub { font-size: 0.8rem; color: var(--secondary-text-color); }
+  .item.unread .label::before {
+    content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--vic-danger); margin-right: 6px; vertical-align: middle;
+  }
+  .icon-btn {
+    width: 44px; height: 44px; border-radius: 50%; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--primary-text-color);
+  }
+  .icon-btn:hover { background: color-mix(in srgb, var(--primary-color) 10%, transparent); }
+  .icon-btn.armed { background: var(--vic-danger); color: #fff; }
+  .empty { font-size: 0.9rem; color: var(--secondary-text-color); padding: 4px 0; }
+
   @keyframes vic-spin { to { transform: rotate(360deg); } }
   @keyframes vic-countdown { from { transform: scaleX(1); } to { transform: scaleX(0); } }
   @keyframes vic-pulse { 50% { opacity: 0.35; } }
@@ -795,6 +965,8 @@ class VimarIntercomCard extends HTMLElement {
     this._timers = {};
     this._posterSrc = null;
     this._posterOk = false;
+    // Which of the two lists (messages, missed) the user has opened.
+    this._expanded = new Set();
     this._build();
   }
 
@@ -857,7 +1029,7 @@ class VimarIntercomCard extends HTMLElement {
 
   disconnectedCallback() {
     this._stopTicker();
-    if (this._view !== "idle" && (this._origin === "call" || this._origin === "answer")) {
+    if (this._view !== "idle" && ["call", "answer", "play"].includes(this._origin)) {
       clearTimeout(this._timers.leave);
       this._timers.leave = setTimeout(() => {
         if (!this.isConnected) this._hangUp();
@@ -883,6 +1055,9 @@ class VimarIntercomCard extends HTMLElement {
         <div class="call" hidden></div>
         <div class="doors" hidden></div>
         <div class="actuators" hidden></div>
+        <div class="settings" hidden></div>
+        <div class="messages" hidden></div>
+        <div class="missed" hidden></div>
         <div class="footer" hidden></div>
         <div class="sr" role="status" aria-live="polite"></div>
       </ha-card>`;
@@ -898,6 +1073,9 @@ class VimarIntercomCard extends HTMLElement {
       call: q(".call"),
       doors: q(".doors"),
       actuators: q(".actuators"),
+      settings: q(".settings"),
+      messages: q(".messages"),
+      missed: q(".missed"),
       footer: q(".footer"),
       sr: q(".sr"),
     };
@@ -964,7 +1142,7 @@ class VimarIntercomCard extends HTMLElement {
 
   _ringActive() {
     const r = this._ring;
-    return Boolean(r && !r.dismissed && Date.now() - r.at < RING_WINDOW_MS);
+    return Boolean(r && !r.dismissed && (r.sensor || Date.now() - r.at < RING_WINDOW_MS));
   }
 
   _reset() {
@@ -981,6 +1159,32 @@ class VimarIntercomCard extends HTMLElement {
   }
 
   _syncRing() {
+    const sensor = this._state(this._model.ringing);
+    const useSensor = Boolean(sensor && (sensor.state === "on" || sensor.state === "off"));
+    this._syncRingEvent(useSensor);
+    if (useSensor) this._syncRingSensor(sensor);
+  }
+
+  /**
+   * The Ringing sensor owns the banner: on from the INVITE until the ring
+   * is over, whoever ended it. A ring already dismissed here stays
+   * dismissed until the next one.
+   */
+  _syncRingSensor(sensor) {
+    const first = this._ringSensorSeen === undefined;
+    this._ringSensorSeen = true;
+    const r = this._ring;
+    if (sensor.state !== "on") {
+      if (r && r.sensor) this._ring = null;
+      return;
+    }
+    const panel = sensor.attributes.panel != null ? String(sensor.attributes.panel) : null;
+    if (r && r.sensor && r.panel === panel) return;
+    this._ring = { panel, at: Date.now(), dismissed: false, duringCall: false, sensor: true };
+    if (!first) this._announce(t(this._hass, "ringing", { panel: this._panelName(panel) || "" }));
+  }
+
+  _syncRingEvent(useSensor) {
     const s = this._state(this._model.doorbell);
     const id = s && s.attributes.event_type === "ring" && !Number.isNaN(Date.parse(s.state)) ? s.state : null;
     if (id === this._ringId) return;
@@ -988,13 +1192,18 @@ class VimarIntercomCard extends HTMLElement {
     this._ringId = id;
     clearTimeout(this._timers.ring);
     if (!id) {
-      this._ring = null;
+      // The sensor's ring is the sensor's to end.
+      if (!useSensor || (this._ring && !this._ring.sensor)) this._ring = null;
       return;
     }
     // On the first look the event's own timestamp is all there is; after
     // that, the moment the card saw it change, which no clock skew between
     // browser and server can put in the past.
     const at = first ? Date.parse(id) : Date.now();
+    // With the sensor, the event only matters for a visitor who rang
+    // during a call: the sensor stays off for those (the integration
+    // answers them busy), and the call bar notes them.
+    if (useSensor && !this._inCall()) return;
     this._ring = {
       panel: s.attributes.panel != null ? String(s.attributes.panel) : null,
       at,
@@ -1050,7 +1259,9 @@ class VimarIntercomCard extends HTMLElement {
     this._section("header", this._config.title ? esc(this._config.title) : "");
     if (model.error) {
       this._section("message", `${icon("mdi:alert-outline")}<span>${esc(t(hass, model.error))}</span>`);
-      for (const name of ["chips", "call", "doors", "actuators", "footer"]) this._section(name, "");
+      for (const name of ["chips", "call", "doors", "actuators", "settings", "messages", "missed", "footer"]) {
+        this._section(name, "");
+      }
       this._els.video.hidden = true;
       return;
     }
@@ -1065,6 +1276,9 @@ class VimarIntercomCard extends HTMLElement {
     this._section("call", this._callHtml());
     this._section("doors", this._doorsHtml());
     this._section("actuators", this._config.show_actuators === false ? "" : this._actuatorsHtml());
+    this._section("settings", this._settingsHtml());
+    this._section("messages", this._messagesHtml());
+    this._section("missed", this._missedHtml());
     this._section("footer", this._footerHtml());
     if (this._streamEl) this._streamEl.hass = hass;
     this._syncTicker();
@@ -1112,9 +1326,11 @@ class VimarIntercomCard extends HTMLElement {
       const stop = `<button class="corner" data-action="stop" data-key="stop" aria-label="${esc(t(hass, "stop"))}" title="${esc(t(hass, "stop"))}">${icon("mdi:stop")}</button>`;
       const panelName = this._panelName(this._activePanel);
       if (this._view === "connecting") {
-        const text = this._origin === "call" && panelName
-          ? t(hass, "calling", { panel: panelName })
-          : t(hass, "connecting");
+        const text = this._origin === "play"
+          ? t(hass, "playing")
+          : this._origin === "call" && panelName
+            ? t(hass, "calling", { panel: panelName })
+            : t(hass, "connecting");
         html = `<div class="center"><div class="spinner" role="progressbar" aria-label="${esc(text)}"></div><div class="note">${esc(text)}</div></div>${stop}`;
       } else {
         const live = panelName ? `${t(hass, "live")} · ${panelName}` : t(hass, "live");
@@ -1186,17 +1402,28 @@ class VimarIntercomCard extends HTMLElement {
         ? `<button class="action" data-action="answer" data-key="answer" aria-label="${esc(t(hass, "answer"))}" ${this._answering ? "disabled" : ""}>
              <span class="disc success">${icon("mdi:phone")}</span><span>${esc(t(hass, "answer"))}</span></button>`
         : "";
+      // Decline refuses the call for the whole house; without the entity
+      // (disabled) the red button falls back to hiding the banner.
+      const declineState = this._state(model.decline);
+      const canDecline = declineState && declineState.state !== "unavailable";
+      const red = canDecline
+        ? `<button class="action" data-action="decline" data-key="decline" aria-label="${esc(t(hass, "decline"))}" ${this._pending.has("decline") ? "disabled" : ""}>
+             <span class="disc danger">${icon("mdi:phone-hangup")}</span><span>${esc(t(hass, "decline"))}</span></button>`
+        : `<button class="action" data-action="dismiss" data-key="dismiss" aria-label="${esc(t(hass, "dismiss"))}">
+             <span class="disc danger">${icon("mdi:close")}</span><span>${esc(t(hass, "dismiss"))}</span></button>`;
+      const silence = canDecline
+        ? `<div class="silence"><button class="link" data-action="dismiss" data-key="dismiss" aria-label="${esc(t(hass, "silence_here"))}">${icon("mdi:bell-off-outline")}<span>${esc(t(hass, "silence_here"))}</span></button></div>`
+        : "";
       return `<div class="ring" role="alert">
         <div class="ring-head">
           <span class="bell">${icon("mdi:bell-ring")}</span>
           <div><div class="ring-title">${esc(title)}</div><div class="ring-sub">${esc(t(hass, "ringing_hint"))}</div></div>
         </div>
         <div class="actions">
-          <button class="action" data-action="dismiss" data-key="dismiss" aria-label="${esc(t(hass, "dismiss"))}">
-            <span class="disc danger">${icon("mdi:close")}</span><span>${esc(t(hass, "dismiss"))}</span></button>
+          ${red}
           ${open ? this._confirmButton(`open:${open.entity}`, open, "round") : ""}
           ${answer}
-        </div></div>`;
+        </div>${silence}</div>`;
     }
 
     if (inCall) {
@@ -1214,10 +1441,26 @@ class VimarIntercomCard extends HTMLElement {
           <div class="incall-title"><span class="dot live"></span><span>${esc(title)}</span></div>
           <div class="timer"></div>${busyRing}
         </div>
-        <div class="incall-actions">${open ? this._confirmButton(`open:${open.entity}`, open, "pill") : ""}${hangup}</div>
+        <div class="incall-actions">${this._cameraSwitchHtml()}${open ? this._confirmButton(`open:${open.entity}`, open, "pill") : ""}${hangup}</div>
       </div>`;
     }
     return "";
+  }
+
+  /** Previous/next camera, while the calling panel says it has others. */
+  _cameraSwitchHtml() {
+    const hass = this._hass;
+    const model = this._model;
+    const pill = (id, glyph, key) => {
+      const s = this._state(id);
+      if (!s || s.state === "unavailable") return "";
+      const label = t(hass, key);
+      const pending = this._pending.has(id);
+      return `<button class="pill neutral" data-action="actuator" data-entity="${esc(id)}" data-key="${esc(id)}"
+        aria-label="${esc(label)}" title="${esc(label)}" ${pending ? "disabled" : ""}>${icon(glyph)}</button>`;
+    };
+    return pill(model.cameraPrevious, "mdi:chevron-left", "previous_camera")
+      + pill(model.cameraNext, "mdi:chevron-right", "next_camera");
   }
 
   _doorsHtml() {
@@ -1273,6 +1516,104 @@ class VimarIntercomCard extends HTMLElement {
           ${icon(done ? "mdi:check" : a.icon)}<span>${esc(a.name)}</span></button>`;
     }).join("");
     return `<div class="section"><h3 class="section-title">${esc(t(hass, "controls"))}</h3><div class="acts">${buttons}</div></div>`;
+  }
+
+  /** Do not disturb and the answering machine, as two toggles. */
+  _settingsHtml() {
+    const hass = this._hass;
+    const model = this._model;
+    const toggle = (id, key, onIcon, offIcon) => {
+      const s = this._state(id);
+      if (!s || (s.state !== "on" && s.state !== "off")) return "";
+      const on = s.state === "on";
+      const pending = this._pending.has(id);
+      return `<button class="toggle" data-action="toggle" data-entity="${esc(id)}" data-key="${esc(id)}"
+        aria-pressed="${on ? "true" : "false"}" aria-label="${esc(t(hass, key))}" ${pending ? "disabled" : ""}>
+        ${icon(on ? onIcon : offIcon)}<span>${esc(t(hass, key))}</span></button>`;
+    };
+    const html = toggle(model.dnd, "dnd", "mdi:bell-off", "mdi:bell-outline")
+      + toggle(model.voicemail, "voicemail", "mdi:voicemail", "mdi:voicemail");
+    return html
+      ? `<div class="settings-row" role="group" aria-label="${esc(t(hass, "settings"))}">${html}</div>`
+      : "";
+  }
+
+  /** A list heading that opens and closes it, with its count. */
+  _listHead(key, title, count) {
+    const hass = this._hass;
+    const open = this._expanded.has(key);
+    const label = t(hass, open ? "hide_list" : "show_list", { name: title });
+    return `<button class="inbox-head" data-action="expand" data-list="${esc(key)}" data-key="head-${esc(key)}"
+        aria-expanded="${open ? "true" : "false"}" aria-label="${esc(label)}">
+        <span class="section-title">${esc(title)}</span>
+        <span class="count ${count ? "" : "zero"}">${esc(count)}</span>
+        ${icon(open ? "mdi:chevron-up" : "mdi:chevron-down")}</button>`;
+  }
+
+  _messagesHtml() {
+    const hass = this._hass;
+    const s = this._state(this._model.videoMessages);
+    if (!s || s.state === "unavailable" || s.state === "unknown") return "";
+    const unread = Number(s.state) || 0;
+    const title = t(hass, "video_messages");
+    const head = this._listHead("messages", title, unread);
+    if (!this._expanded.has("messages")) return `<div class="section">${head}</div>`;
+    const messages = (s.attributes.messages || []).slice(0, LIST_MAX);
+    if (!messages.length) {
+      return `<div class="section">${head}<div class="empty">${esc(t(hass, "no_video_messages"))}</div></div>`;
+    }
+    const offline = this._registered() === false;
+    const items = messages.map((m) => {
+      const id = String(m.id);
+      const name = m.caller_name || m.caller_id || "";
+      const when = formatTime(hass, m.time);
+      const secs = m.duration != null ? ` · ${formatDuration(Number(m.duration) * 1000)}` : "";
+      const delKey = `del:${id}`;
+      const armed = this._armed.has(delKey);
+      const pending = this._pending.has(`msg:${id}`);
+      const disabled = offline || pending ? "disabled" : "";
+      const markRead = m.read ? "" : `<button class="icon-btn" data-action="mark-read" data-message="${esc(id)}" data-key="read-${esc(id)}"
+          aria-label="${esc(t(hass, "mark_read"))}" title="${esc(t(hass, "mark_read"))}" ${disabled}>${icon("mdi:email-open-outline")}</button>`;
+      const delLabel = armed ? t(hass, "tap_again_delete") : t(hass, "delete_named", { name });
+      return `<li class="item ${m.read ? "" : "unread"}">
+        <button class="icon-btn" data-action="play-message" data-message="${esc(id)}" data-key="play-${esc(id)}"
+          aria-label="${esc(t(hass, "play_message", { name }))}" title="${esc(t(hass, "play_message", { name }))}" ${disabled}>
+          ${icon(m.type === "audio" ? "mdi:play-circle-outline" : "mdi:play-circle")}</button>
+        <span class="text"><span class="label">${esc(name)}</span><span class="sub">${esc(when + secs)}</span></span>
+        ${markRead}
+        <button class="icon-btn ${armed ? "armed" : ""}" data-action="delete-message" data-message="${esc(id)}" data-key="${esc(delKey)}"
+          aria-label="${esc(delLabel)}" title="${esc(delLabel)}" ${disabled}>${icon("mdi:delete-outline")}</button>
+      </li>`;
+    }).join("");
+    return `<div class="section">${head}<ul class="list">${items}</ul></div>`;
+  }
+
+  _missedHtml() {
+    const hass = this._hass;
+    const s = this._state(this._model.missedCalls);
+    if (!s || s.state === "unavailable" || s.state === "unknown") return "";
+    const count = Number(s.state) || 0;
+    const title = t(hass, "missed_calls");
+    const head = this._listHead("missed", title, count);
+    if (!this._expanded.has("missed")) return `<div class="section">${head}</div>`;
+    const recent = (s.attributes.recent || []).slice(0, LIST_MAX);
+    const clear = count
+      ? `<button class="link" data-action="clear-missed" data-key="clear-missed" aria-label="${esc(`${title}: ${t(hass, "clear")}`)}"
+          ${this._pending.has("clear-missed") ? "disabled" : ""}>${icon("mdi:notification-clear-all")}<span>${esc(t(hass, "clear"))}</span></button>`
+      : "";
+    if (!recent.length) {
+      return `<div class="section">${head}<div class="empty">${esc(t(hass, "no_missed_calls"))}</div></div>`;
+    }
+    const items = recent.map((c) => {
+      const missed = c.outcome === "missed";
+      const glyph = missed ? "mdi:phone-missed" : c.outcome === "answered" ? "mdi:phone-check" : "mdi:phone-outline";
+      const outcome = t(hass, `outcome_${c.outcome}`);
+      return `<li class="item ${missed ? "unread" : ""}">
+        ${icon(glyph)}
+        <span class="text"><span class="label">${esc(c.name || c.panel || "")}</span>
+        <span class="sub">${esc(`${formatTime(hass, c.time)} · ${outcome}`)}</span></span></li>`;
+    }).join("");
+    return `<div class="section">${head}<ul class="list">${items}</ul>${clear}</div>`;
   }
 
   _footerHtml() {
@@ -1353,6 +1694,27 @@ class VimarIntercomCard extends HTMLElement {
       case "dismiss":
         if (this._ring) this._ring.dismissed = true;
         this._render();
+        break;
+      case "decline":
+        this._decline();
+        break;
+      case "toggle":
+        this._toggle(el.dataset.entity);
+        break;
+      case "expand":
+        this._expandToggle(el.dataset.list);
+        break;
+      case "play-message":
+        this._playMessage(el.dataset.message);
+        break;
+      case "mark-read":
+        this._messageService("mark_video_message_read", el.dataset.message, t(this._hass, "mark_read"));
+        break;
+      case "delete-message":
+        this._deleteTap(el.dataset.message);
+        break;
+      case "clear-missed":
+        this._clearMissed();
         break;
       case "hangup":
         this._hangUp();
@@ -1474,6 +1836,110 @@ class VimarIntercomCard extends HTMLElement {
     this._render();
   }
 
+  async _decline() {
+    const id = this._model.decline;
+    if (!id || this._pending.has("decline")) return;
+    this._pending.add("decline");
+    this._render();
+    const ok = await this._callService("button", "press", id, t(this._hass, "decline"));
+    this._pending.delete("decline");
+    if (ok && this._ring) this._ring.dismissed = true;
+    this._render();
+  }
+
+  async _toggle(entityId) {
+    const s = this._state(entityId);
+    if (!s || this._pending.has(entityId)) return;
+    const name = entityName(this._hass, entityId, deviceName(this._hass, this._model.deviceId));
+    this._pending.add(entityId);
+    this._render();
+    await this._callService("switch", s.state === "on" ? "turn_off" : "turn_on", entityId, name);
+    this._pending.delete(entityId);
+    this._render();
+  }
+
+  _expandToggle(key) {
+    if (this._expanded.has(key)) this._expanded.delete(key);
+    else this._expanded.add(key);
+    this._render();
+  }
+
+  async _messageService(service, id, label) {
+    const key = `msg:${id}`;
+    if (!id || this._pending.has(key)) return false;
+    this._pending.add(key);
+    this._render();
+    const ok = await this._callService(DOMAIN, service, null, label, { message_id: id });
+    this._pending.delete(key);
+    this._render();
+    return ok;
+  }
+
+  /** Delete needs a second tap within the confirm window, like a door. */
+  _deleteTap(id) {
+    const key = `del:${id}`;
+    if (this._armed.has(key)) {
+      this._disarm(key);
+      this._messageService("delete_video_message", id, t(this._hass, "delete"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      this._armed.delete(key);
+      this._render();
+    }, CONFIRM_WINDOW_MS);
+    this._armed.set(key, { timer, at: Date.now() });
+    this._announce(t(this._hass, "tap_again_delete"));
+    this._render();
+  }
+
+  async _clearMissed() {
+    if (this._pending.has("clear-missed")) return;
+    this._pending.add("clear-missed");
+    this._render();
+    await this._callService(DOMAIN, "clear_missed_calls", null, t(this._hass, "missed_calls"));
+    this._pending.delete("clear-missed");
+    this._render();
+  }
+
+  /**
+   * Play a video message. The integration places a call that plays it
+   * back, and the stream shows that call like any other; stopping the
+   * video hangs it up.
+   */
+  async _playMessage(id) {
+    const model = this._model;
+    if (!id || !model.camera) {
+      if (id) this._messageService("play_video_message", id, t(this._hass, "video_messages"));
+      return;
+    }
+    const gen = ++this._gen;
+    if (this._inCall()) {
+      this._unmount();
+      this._sawCall = false;
+      this._setView("connecting");
+      await this._callService("button", "press", model.hangup, t(this._hass, "hang_up"));
+      await this._waitFor(() => !this._inCall(), HANGUP_WAIT_MS);
+      if (gen !== this._gen) return;
+    }
+    this._origin = "play";
+    this._activePanel = null;
+    this._setView("connecting");
+    const ok = await this._messageService("play_video_message", id, t(this._hass, "video_messages"));
+    if (gen !== this._gen) return;
+    if (!ok) {
+      this._toIdle();
+      return;
+    }
+    const up = await this._waitFor(() => this._inCall(), CALL_SETUP_MS);
+    if (gen !== this._gen) return;
+    if (!up) {
+      this._toast(t(this._hass, "call_failed_generic"));
+      this._toIdle();
+      return;
+    }
+    this._mount("live");
+  }
+
   _flash(key, ms) {
     clearTimeout(this._feedback.get(key));
     this._feedback.set(key, setTimeout(() => {
@@ -1495,10 +1961,11 @@ class VimarIntercomCard extends HTMLElement {
     fire(this, "hass-notification", { message });
   }
 
-  async _callService(domain, service, entityId, label) {
+  async _callService(domain, service, entityId, label, data) {
     try {
       // notifyOnError false: the card shows its own, labelled, toast.
-      await this._hass.callService(domain, service, { entity_id: entityId }, undefined, false);
+      const payload = entityId ? { entity_id: entityId, ...(data || {}) } : { ...(data || {}) };
+      await this._hass.callService(domain, service, payload, undefined, false);
       return true;
     } catch (err) {
       const text = errorText(err);
@@ -1684,7 +2151,7 @@ class VimarIntercomCard extends HTMLElement {
     const origin = this._origin;
     const connecting = this._view === "connecting";
     this._toIdle();
-    if ((origin === "call" || origin === "answer") && (this._inCall() || connecting) && this._model.hangup) {
+    if (["call", "answer", "play"].includes(origin) && (this._inCall() || connecting) && this._model.hangup) {
       this._callService("button", "press", this._model.hangup, t(this._hass, "hang_up"));
     }
   }
