@@ -382,7 +382,7 @@ async def _connect_targets() -> list[locate.Target]:
 
 
 async def connect():
-    global reader, writer, lock
+    global reader, writer, lock, MY_IP
     loop = asyncio.get_running_loop()
     ctx = await loop.run_in_executor(None, _create_ssl_context)
     targets = await _connect_targets()
@@ -399,6 +399,14 @@ async def connect():
     target, (reader, writer) = await locate.open_first(
         targets, _open, timeout=C.SIP_CONNECT_TIMEOUT, domain=CFG.sni)
     lock = asyncio.Lock()
+    # The address this connection actually leaves from is the one Via,
+    # Contact and the SDP must carry. Guessing it once at startup through
+    # a DNS lookup failed whenever DNS was not ready yet, and left the
+    # client advertising 0.0.0.0 for the life of the entry. The SDP says
+    # IN IP4, so an IPv6 source keeps the previous value.
+    sockname = writer.get_extra_info("sockname")
+    if sockname and "." in sockname[0] and ":" not in sockname[0]:
+        MY_IP = sockname[0]
     _LOGGER.info("SIP TLS connection established with %s", target)
 
 
@@ -442,16 +450,30 @@ async def connection_supervisor() -> None:
     try:
         while True:
             connected_at: float | None = None
+            reader_task: asyncio.Task | None = None
             try:
                 await connect()
+                # The reader has to be running before the first REGISTER.
+                # It is the only thing that reads the socket and hands each
+                # response to the transaction waiting for it; started after
+                # do_register, as it once was, the registrar's answer sat
+                # unread in the socket buffer, every REGISTER timed out and
+                # was reported as refused, and no installation could ever
+                # register.
+                reader_task = asyncio.create_task(_reader_loop())
                 if not await do_register():
                     raise ConnectionError("registration was refused")
                 connected_at = time.monotonic()
-                await _reader_loop()
+                await reader_task
                 raise ConnectionError("connection closed by the server")
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - any failure means retry
+                # Stop the dead connection's reader before backing off, or
+                # it would keep dispatching messages from a connection this
+                # supervisor has already given up on.
+                await _stop_reader(reader_task)
+                reader_task = None
                 _clear_registration()
                 await _abandon_call()
                 if (connected_at is not None
@@ -469,6 +491,9 @@ async def connection_supervisor() -> None:
                     "SIP connection unavailable (%s); retrying in %.0fs "
                     "(attempt %d)", err, delay, attempt)
                 await asyncio.sleep(delay)
+            finally:
+                # Cancellation skips the handler above; this covers it.
+                await _stop_reader(reader_task)
     finally:
         # The supervisor only ever exits via cancellation (hub.async_stop
         # tearing the task down for HA unload). This must clear the full
@@ -481,6 +506,28 @@ async def connection_supervisor() -> None:
         # is closed, since neither hub.async_stop() nor __init__.py clears
         # it themselves.
         _clear_registration()
+
+
+async def _stop_reader(task: asyncio.Task | None) -> None:
+    """Stop a connection's reader and wait until it has really stopped.
+
+    Awaited rather than fire-and-forget, so the old reader is gone before
+    the next connect() replaces the socket, and whatever exception it
+    ended with is retrieved instead of reported by asyncio as never
+    retrieved. The supervisor's own cancellation is never swallowed.
+    """
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    except Exception:  # noqa: BLE001 - the connection is over either way
+        pass
 
 
 async def _reader_loop() -> None:

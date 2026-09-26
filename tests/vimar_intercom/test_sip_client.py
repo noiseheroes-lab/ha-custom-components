@@ -710,8 +710,14 @@ VIMAR_SERVERS = {r.target for r in VIMAR_SRV}
 
 
 class _RecordingWriter:
-    def __init__(self):
+    def __init__(self, sockname=None):
         self.sent = b""
+        self._sockname = sockname
+
+    def get_extra_info(self, name, default=None):
+        # A real StreamWriter always has this; connect() reads the local
+        # address the connection leaves from through it.
+        return self._sockname if name == "sockname" else default
 
     def write(self, data):
         self.sent += data
@@ -733,18 +739,17 @@ def dialled(monkeypatch):
     Hosts listed in `dialled.dead` never answer, like the blackholed
     port that stalled the supervisor.
     """
-    attempts = []
-    dead: set[str] = set()
+    state = SimpleNamespace(attempts=[], dead=set(), sockname=None)
 
     async def _open_connection(host, port, **kwargs):
-        attempts.append({"host": host, "port": port, **kwargs})
-        if host in dead:
+        state.attempts.append({"host": host, "port": port, **kwargs})
+        if host in state.dead:
             await asyncio.Event().wait()
-        return object(), _RecordingWriter()
+        return object(), _RecordingWriter(sockname=state.sockname)
 
     monkeypatch.setattr(asyncio, "open_connection", _open_connection)
     monkeypatch.setattr(sip, "MY_IP", "192.0.2.5")
-    return SimpleNamespace(attempts=attempts, dead=dead)
+    return state
 
 
 def _srv_answers(monkeypatch, records):
@@ -894,3 +899,126 @@ def test_connecting_never_logs_a_credential(monkeypatch, dialled, caplog):
     assert "examplepassword" not in caplog.text
     assert config.sip_ha1 not in caplog.text
     assert "established with flexiprod" in caplog.text
+
+
+# ─── the reader must be listening before the first REGISTER ──────────
+
+def test_the_reader_is_running_before_the_first_register(monkeypatch):
+    """The live failure no simulated test caught.
+
+    The supervisor used to call do_register before starting the reader,
+    and the reader is the only thing that hands a response to the
+    transaction waiting for it. The registrar's 401 sat unread in the
+    socket, every REGISTER timed out as "refused", and no installation
+    could ever register.
+    """
+    reader_started = asyncio.Event()
+    seen = {}
+
+    async def _connect():
+        return None
+
+    async def _reader_loop():
+        reader_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            seen["reader_cancelled"] = True
+            raise
+
+    async def _do_register():
+        try:
+            await asyncio.wait_for(reader_started.wait(), 1)
+        except TimeoutError:
+            seen["reader_was_running"] = False
+            return False
+        seen["reader_was_running"] = True
+        return True
+
+    monkeypatch.setattr(sip, "connect", _connect)
+    monkeypatch.setattr(sip, "_reader_loop", _reader_loop)
+    monkeypatch.setattr(sip, "do_register", _do_register)
+    monkeypatch.setattr(sip, "reconnect_delay", lambda _attempt: 0)
+
+    async def scenario():
+        task = asyncio.create_task(sip.connection_supervisor())
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if "reader_was_running" in seen:
+                break
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    run(scenario())
+
+    assert seen.get("reader_was_running") is True
+    # Shutting the supervisor down takes the connection's reader with it.
+    assert seen.get("reader_cancelled") is True
+
+
+def test_a_refused_registration_stops_the_reader_before_backing_off(
+        monkeypatch):
+    """A connection given up on must not keep dispatching messages."""
+    readers = []
+    registers = []
+
+    async def _connect():
+        return None
+
+    async def _reader_loop():
+        state = {"cancelled": False}
+        readers.append(state)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    async def _do_register():
+        registers.append([dict(r) for r in readers])
+        await asyncio.sleep(0)
+        return False
+
+    monkeypatch.setattr(sip, "connect", _connect)
+    monkeypatch.setattr(sip, "_reader_loop", _reader_loop)
+    monkeypatch.setattr(sip, "do_register", _do_register)
+    monkeypatch.setattr(sip, "reconnect_delay", lambda _attempt: 0)
+
+    async def scenario():
+        task = asyncio.create_task(sip.connection_supervisor())
+        for _ in range(500):
+            await asyncio.sleep(0)
+            if len(registers) >= 2:
+                break
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    run(scenario())
+
+    assert len(registers) >= 2
+    # When the second attempt registers, the first attempt's reader is
+    # already stopped.
+    assert registers[1][0]["cancelled"] is True
+
+
+def test_the_local_address_comes_from_the_connection(monkeypatch, dialled):
+    """Guessed once through DNS at startup, it could stay 0.0.0.0 forever."""
+    _srv_answers(monkeypatch, VIMAR_SRV)
+    monkeypatch.setattr(sip, "CFG", _cloud_config())
+    monkeypatch.setattr(sip, "MY_IP", "0.0.0.0")
+    dialled.sockname = ("192.0.2.77", 51234)
+
+    run(sip.connect())
+
+    assert sip.MY_IP == "192.0.2.77"
+
+
+def test_an_ipv6_source_keeps_the_previous_local_address(monkeypatch, dialled):
+    """The SDP says IN IP4; an IPv6 source address would make it lie."""
+    _srv_answers(monkeypatch, VIMAR_SRV)
+    monkeypatch.setattr(sip, "CFG", _cloud_config())
+    dialled.sockname = ("2001:db8::7", 51234, 0, 0)
+
+    run(sip.connect())
+
+    assert sip.MY_IP == "192.0.2.5"
