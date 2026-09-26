@@ -36,6 +36,7 @@ from .phonebook import download_phonebook, phonebook_url
 from .plant_config import PlantConfig, parse_phonebook
 from .runtime import RuntimeConfig, build_runtime_config
 from .system_messages import InitStatus
+from .talk_api import async_register_talk_api
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,12 +57,14 @@ CALL_SETUP_TIMEOUT = 15.0
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Serve the dashboard card, once per Home Assistant run.
+    """Serve the dashboard card and its talk-back command, once per run.
 
     Here rather than in `async_setup_entry`, which runs again on every
-    reload; see `dashboard_card`.
+    reload; see `dashboard_card`. The command resolves the hub per
+    request, so it outlives reloads the way the AV view does.
     """
     await async_register_card(hass)
+    async_register_talk_api(hass, _resolve_hub)
     return True
 
 

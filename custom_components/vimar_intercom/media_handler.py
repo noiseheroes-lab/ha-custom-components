@@ -10,6 +10,7 @@ import tempfile
 
 from .runtime import RuntimeConfig
 from .srtp import SRTPContext
+from .talkback import SILENCE_FRAME, TalkbackSource
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -574,8 +575,12 @@ local_audio_key: str | None = None
 
 # G.711 µ-law silence: 20 ms at 8 kHz is 160 samples, and 0xFF is the
 # µ-law code for zero amplitude.
-SILENCE_PAYLOAD = b"\xff" * 160
+SILENCE_PAYLOAD = SILENCE_FRAME
 SILENCE_INTERVAL = 0.020
+# What each 20 ms packet to the panel carries: the talk-back voice when
+# someone is talking from the dashboard card, silence otherwise. One for
+# the life of the process, like the transports; a call only resets it.
+talkback = TalkbackSource()
 _av_sdp_path: str | None = None
 _av_consumer = None
 # One asyncio.Queue per attached AV viewer. The pipeline is started when
@@ -746,6 +751,9 @@ async def setup_media(remote_sdp):
     if _silence_task:
         _silence_task.cancel()
         _silence_task = None
+    # A new call starts with nobody talking and nothing queued.
+    talkback.end_call()
+    talkback.reset_stats()
     if audio_proto and audio_proto.remote_addr and local_audio_key:
         _silence_task = asyncio.create_task(
             _send_silence(SRTPContext(local_audio_key)))
@@ -760,14 +768,17 @@ async def stop_media():
     if _silence_task:
         _silence_task.cancel()
         _silence_task = None
+    # Whoever was talking is told the call is over, and stops sending.
+    talkback.end_call()
 
     # The one and only place the media layer reports what it saw: one
     # DEBUG line for a whole call, instead of a line per packet.
     if audio_proto or video_proto:
         _LOGGER.debug(
-            "Call media summary: %s | %s",
+            "Call media summary: %s | %s | %s",
             audio_proto.stats() if audio_proto else "audio absent",
-            video_proto.stats() if video_proto else "video absent")
+            video_proto.stats() if video_proto else "video absent",
+            talkback.stats())
 
     if audio_proto:
         audio_proto.remote_addr = None
@@ -816,6 +827,7 @@ def close_transports():
     if _stun_task:
         _stun_task.cancel()
         _stun_task = None
+    talkback.end_call()
 
     detached = _detach_av_pipeline()
     if detached[0] is not None:
@@ -846,12 +858,15 @@ def close_transports():
 # ─── STUN keepalive ─────────────────────────────────────────────────
 
 async def _send_silence(srtp_tx: SRTPContext) -> None:
-    """Send the panel a steady stream of silent audio for the whole call.
+    """Send the panel a steady stream of audio for the whole call.
 
-    Home Assistant has nothing to say to the panel, but a call that
-    carries no media from this side is ended by the far end after about
-    ten seconds, which cut every auto-on view short. Silence at the
-    normal packet rate is what a phone with its microphone muted sends.
+    A call that carries no media from this side is ended by the far end
+    after about ten seconds, which cut every auto-on view short. So a
+    packet goes out every 20 ms whether or not anyone is talking: each
+    tick takes the next frame from `talkback`, which is the voice from
+    the dashboard card's Talk button when there is one and silence —
+    what a phone with its microphone muted sends — otherwise. The name
+    is from before talk-back; the clock is the same one.
     """
     ssrc = struct.unpack("!I", os.urandom(4))[0]
     seq = struct.unpack("!H", os.urandom(2))[0]
@@ -864,17 +879,23 @@ async def _send_silence(srtp_tx: SRTPContext) -> None:
             if proto is None or proto.transport is None or not proto.remote_addr:
                 return
             header = struct.pack("!BBHII", 0x80, 0, seq, timestamp, ssrc)
+            payload = talkback.next_payload()
             try:
                 proto.transport.sendto(
-                    srtp_tx.protect(header + SILENCE_PAYLOAD), proto.remote_addr)
+                    srtp_tx.protect(header + payload), proto.remote_addr)
             except OSError:
                 pass
             seq = (seq + 1) & 0xFFFF
-            timestamp = (timestamp + len(SILENCE_PAYLOAD)) & 0xFFFFFFFF
+            timestamp = (timestamp + len(payload)) & 0xFFFFFFFF
             next_at += SILENCE_INTERVAL
             await asyncio.sleep(max(0.0, next_at - loop.time()))
     except asyncio.CancelledError:
         pass
+
+
+def audio_sending() -> bool:
+    """True while the 20 ms sender is running, so a voice can be heard."""
+    return _silence_task is not None and not _silence_task.done()
 
 
 async def _stun_keepalive():
