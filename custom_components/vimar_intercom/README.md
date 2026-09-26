@@ -64,6 +64,19 @@ anywhere else.
 3. Confirm the summary. Done — no panel IP, port or credential needs
    typing.
 
+Once registered, the integration asks the indoor unit for the plant's
+*phonebook* — the configuration the installer loaded, which the Vimar
+cloud publishes for the apps — and creates the entrance panels, door
+locks and other actuators it lists, with the names set on the indoor
+unit, just as the Vimar View app shows them. Nothing needs configuring.
+It checks again on every reconnection and when the installer changes
+the plant, rebuilds the entities if something changed (never in the
+middle of a call), and removes the ones that no longer exist. The last
+good copy is kept, so the entities are there even when the cloud is
+not. Where no phonebook can be had — plant types that do not publish
+one, or the cloud unreachable at first setup — the panel list and door
+command in the options are used, as before.
+
 **Create a dedicated user for Home Assistant.** Each user has its own SIP
 identity; sharing one with a phone or another system risks the two
 knocking each other offline (see above).
@@ -85,13 +98,26 @@ JPEG.
 |---|---|---|
 | `camera.vimar_intercom_intercom` | camera | Opening the stream places a call to the panel, or answers one that is ringing. Stills come from the call in progress; outside a call there is none |
 | `event.vimar_intercom_doorbell` | event | Event type `ring`, attribute `panel` |
-| `lock.vimar_intercom_door` | lock | Unlock opens the main entrance; re-locks itself. Needs no configuration — it addresses the relay group from your QR code |
+| `lock.vimar_intercom_door` | lock | Unlock opens the main entrance; re-locks itself. Needs no configuration — it addresses the relay group from your QR code. With a phonebook it takes the installer's name for that door (see below) |
+| `lock.vimar_intercom_<name>` | lock | One per door actuator in the phonebook (commands `OPEN_…`) |
+| `button.vimar_intercom_<name>` | button | One per other actuator in the phonebook (`AUX…` outputs, lights) |
 | `button.vimar_intercom_call_<panel>` | button | Call that panel |
 | `button.vimar_intercom_open_<panel>` | button | Open that panel's door |
 | `button.vimar_intercom_answer` / `_hang_up` | button | Answer or end a call |
 | `button.vimar_intercom_reconnect` | button | Rebuild the SIP connection |
 | `binary_sensor.vimar_intercom_sip_registration` | binary_sensor | Connectivity; on only while registered |
 | `binary_sensor.vimar_intercom_in_call` | binary_sensor | A call is up |
+
+Entities keep their IDs when the phonebook arrives. A panel's call and
+open buttons stay the same entities, renamed after the phonebook. The
+door lock becomes the phonebook door that is the same door — the
+configured door command (`OPEN_2F` by default) on the panel your
+apartment auto-switches to — and from then on always opens that door,
+also during a call from another panel; use that panel's open button, or
+its own lock, for the other entrance. If the phonebook has no such door,
+the generic lock stays as it was. Door actuators are locks because a
+door release is what Home Assistant's lock entity is for; `AUX` outputs
+drive anything from a light to a second gate, so they are plain buttons.
 
 ## The `vimar_intercom_ring` event
 
@@ -153,6 +179,10 @@ Answering takes the call, exactly as pressing Answer in the Home
 Assistant UI would: the panel stops ringing elsewhere in the house.
 
 ## Options
+
+With a phonebook, panels, locks and actuators come from it and the first
+two options below are fallbacks; the door command still decides which
+phonebook door inherits the original door lock.
 
 - **Panel addresses** — `address:Name` pairs, comma separated (for
   example `55001:Street Gate, 55002:Building Door`). The address is the
@@ -270,6 +300,11 @@ look like bugs:
   panel's door button. A failure is now reported as an error on the
   action, with the reason, rather than only written to the log — so an
   automation can catch it and the UI shows it.
+- **Panels or actuators missing, or still the ones from the options** —
+  the phonebook could not be loaded; the log says why at WARNING. The
+  indoor unit is asked at address 60001, which is where 2-wire V2 and
+  cloud-connected plants have it; other plant types may not answer, and
+  then the options are used.
 - **"No reply from the intercom. The door may have opened anyway"** —
   the command went out and nothing came back within the timeout. The
   integration deliberately does not resend it: a command that reached
@@ -289,7 +324,8 @@ look like bugs:
       custom_components.vimar_intercom: debug
   ```
 
-  DEBUG includes protocol traces. Do not leave it on.
+  DEBUG includes protocol traces. Do not leave it on. The password of
+  the phonebook download is never logged, at any level.
 
 ## How it works, honestly
 

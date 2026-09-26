@@ -13,7 +13,10 @@ from homeassistant.components.http import KEY_HASS, HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 
 from . import media_handler as media
 from .const import (
@@ -21,9 +24,15 @@ from .const import (
     DOMAIN,
     ISSUE_MIGRATION_REQUIRED,
     ISSUE_REGISTRATION_DOWN,
+    PLANT_STORAGE_KEY,
+    PLANT_STORAGE_VERSION,
 )
+from .entity_plan import EntityPlan, plan_entities
 from .hub import VimarIntercomHub
+from .phonebook import download_phonebook, phonebook_url
+from .plant_config import PlantConfig, parse_phonebook
 from .runtime import RuntimeConfig, build_runtime_config
+from .system_messages import InitStatus
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,7 +60,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "Reinstall the integration through HACS: the connection to "
             "the intercom cannot be verified without it.")
 
-    cfg = build_runtime_config(entry.data, entry.options)
+    # The last plant configuration the phonebook produced, so the
+    # entities exist — with the installer's names — from the first
+    # second, even with the cloud unreachable. Without one the options
+    # decide, exactly as before the phonebook was read at all.
+    store = _plant_store(hass, entry.entry_id)
+    plant = await _async_load_plant(store)
+    cfg = build_runtime_config(entry.data, entry.options, plant)
+    plan = plan_entities(cfg, plant)
     hub = VimarIntercomHub(cfg)
 
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -68,6 +84,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     hub.set_hass(hass, entry.entry_id)
+    # Before the hub starts: its first registration asks for the status.
+    # A changed configuration reloads the entry rather than adding and
+    # removing entities in place: the plan, the runtime config the SIP
+    # layer holds (default panel, panel names on ring events) and the
+    # registry cleanup below are then all derived once, from one plant,
+    # the same way a restart derives them. It happens on the first
+    # download and when the installer changes the plant — rarely enough
+    # that the few seconds of re-registration do not matter — and the
+    # hub holds it back while a call is up.
+    hub.set_plant_sync(
+        plant,
+        partial(_async_fetch_plant, hass, cfg),
+        partial(_async_save_plant, store),
+        partial(hass.config_entries.async_schedule_reload, entry.entry_id),
+    )
     try:
         await hub.async_start()
     except OSError as err:
@@ -80,7 +111,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             f"Could not open the RTP ports "
             f"{cfg.rtp_audio_port}/{cfg.rtp_video_port}: {err}") from err
 
-    domain_data[entry.entry_id] = {"hub": hub}
+    domain_data[entry.entry_id] = {"hub": hub, "plan": plan}
+    _remove_stale_entities(hass, entry, plan)
 
     # Register the view once per Home Assistant, not once per setup.
     # `HomeAssistantView.register` adds an unnamed aiohttp route, so
@@ -93,6 +125,77 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
+
+def _plant_store(hass: HomeAssistant, entry_id: str) -> Store:
+    """The per-entry store of the last good plant configuration."""
+    return Store(hass, PLANT_STORAGE_VERSION,
+                 PLANT_STORAGE_KEY.format(entry_id=entry_id))
+
+
+async def _async_load_plant(store: Store) -> PlantConfig | None:
+    """The stored plant configuration, or None if there is no usable one."""
+    data = await store.async_load()
+    if data is None:
+        return None
+    try:
+        return PlantConfig.from_dict(data)
+    except ValueError as err:
+        _LOGGER.warning(
+            "Ignoring the stored plant configuration (%s); the panels from "
+            "the integration options are used until the phonebook is "
+            "downloaded again", err)
+        return None
+
+
+async def _async_save_plant(
+    store: Store, _previous: PlantConfig | None, plant: PlantConfig
+) -> None:
+    """Persist a new plant configuration. It never contains the token."""
+    await store.async_save(plant.to_dict())
+
+
+async def _async_fetch_plant(
+    hass: HomeAssistant, cfg: RuntimeConfig, status: InitStatus, group: str
+) -> PlantConfig:
+    """Download the phonebook `status` names and parse it off the loop.
+
+    `status.token` is the download password. It goes into the digest
+    computation and nowhere else.
+    """
+    assert status.rubrica_ver is not None and status.token is not None
+    url = phonebook_url(cfg.cloud_proxy, cfg.sip_domain, status.rubrica_ver)
+    data = await download_phonebook(
+        async_get_clientsession(hass), url, cfg.sip_domain, status.token)
+    return await hass.async_add_executor_job(
+        partial(parse_phonebook, data, group=group,
+                version=status.rubrica_ver))
+
+
+def _remove_stale_entities(
+    hass: HomeAssistant, entry: ConfigEntry, plan: EntityPlan
+) -> None:
+    """Remove the registry entries of panels and actuators that are gone.
+
+    Runs before the platforms add their entities, so it never races
+    them. Only the plant-dependent families are considered (see
+    `entity_plan.DYNAMIC_PREFIXES`); the camera, the sensors and the
+    other fixed entities are never touched.
+    """
+    registry = er.async_get(hass)
+    by_unique_id = {
+        e.unique_id: e.entity_id
+        for e in er.async_entries_for_config_entry(registry, entry.entry_id)
+    }
+    for unique_id in plan.stale_unique_ids(entry.entry_id, by_unique_id):
+        _LOGGER.info("Removing %s: the plant no longer has it",
+                     by_unique_id[unique_id])
+        registry.async_remove(by_unique_id[unique_id])
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the stored plant configuration along with the entry."""
+    await _plant_store(hass, entry.entry_id).async_remove()
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

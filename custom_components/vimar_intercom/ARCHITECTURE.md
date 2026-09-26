@@ -16,24 +16,65 @@ can break the day Vimar changes something on their end.
 
 | Module | Responsibility |
 |---|---|
-| `__init__.py` | Entry setup/teardown, wires the hub to Home Assistant, registers the AV stream HTTP view |
+| `__init__.py` | Entry setup/teardown, wires the hub to Home Assistant, stores the plant configuration and removes stale entities, registers the AV stream HTTP view |
 | `hub.py` | Orchestrates SIP registration, calls, door control and media lifecycle; the only module that talks to both `sip_client` and Home Assistant |
 | `sip_client.py` | The SIP stack itself: connection, digest auth, REGISTER/INVITE/BYE/MESSAGE, transaction correlation, reconnection |
 | `sip_parser.py` | Pure text handling: header parsing, transaction keys, registration expiry parsing — no I/O, no Home Assistant |
 | `sip_locate.py` | Where the SIP socket goes: RFC 3263 SRV lookup of the cloud proxy domain (via `aiodns`, a Home Assistant core requirement), RFC 2782 ordering, and trying each server in turn under a connect timeout — no Home Assistant |
 | `backoff.py` | The jittered exponential reconnect delay schedule |
 | `qr.py` | Reads the QR code from an uploaded image (pyzbar, imported lazily) and decrypts and parses the configuration payload the indoor unit generates |
-| `runtime.py` | `RuntimeConfig` — every value the integration needs, derived once from the config entry; no Home Assistant import, fully unit testable |
+| `runtime.py` | `RuntimeConfig` — every value the integration needs, derived once from the config entry and the stored plant configuration; no Home Assistant import, fully unit testable |
+| `system_messages.py` | The indoor unit's system messages: GET_INIT_STATUS_REPLY and NEW_PHONEBOOK parsing, and a classifier for every line kind the SDK knows — no I/O, no Home Assistant |
+| `plant_config.py` | Phonebook SQLite bytes → frozen `PlantConfig` (panels, our apartment group, actuators, SYSTEM parameters), selected as the SDK's queries select them; its JSON-safe stored form — no Home Assistant |
+| `phonebook.py` | The phonebook download: URL, RFC 7616 digest auth, a bounded fetch over a duck-typed aiohttp session — no Home Assistant |
+| `entity_plan.py` | Which plant-dependent entities exist and under which unique IDs, and which registry entries are stale — no Home Assistant |
 | `srtp.py` | SRTP (RFC 3711) encrypt/decrypt for the audio and video RTP streams |
 | `media_handler.py` | RTP/SRTP transport for audio and video, H.264 depacketisation, the video registry, the AV ffmpeg process |
 | `config_flow.py` | Config, reconfigure and options flows — QR image upload or paste in, panel list and door command out |
 | `camera.py` | Camera entity — the live stream and the keyframe-derived still |
 | `event.py` | Doorbell event entity, also the source of the `vimar_intercom_ring` bus event |
-| `lock.py` | Door lock entity (opens the relay group from the QR) |
-| `button.py` | Call, door, answer, hang-up and reconnect buttons |
+| `lock.py` | Door locks: the generic one (the relay group from the QR) or the phonebook's door actuators |
+| `button.py` | Call, door, answer, hang-up and reconnect buttons, and the phonebook's other actuators |
 | `binary_sensor.py` | SIP registration and in-call sensors |
 | `const.py` | True constants — protocol values, config keys, defaults. Installation-specific values live in the config entry, not here |
 | `manifest.json`, `strings.json`, `translations/` | Integration metadata and UI strings |
+
+## Plant configuration
+
+After every fresh registration the hub sends `GET_INIT_STATUS` (a SIP
+MESSAGE with `Panda: blue`) to the indoor unit at `60001` — its address
+on 2-wire V2, cloud-only and VGIP plants, per the SDK. The unit answers
+with a MESSAGE of its own, `GET_INIT_STATUS_REPLY;[{"PARAM":…,"VALUE":…}]`,
+naming the phonebook version (the MD5 of the file) and a download
+token. If the version differs from the stored one, the phonebook is
+fetched from `https://<cloud proxy>/phonebook/domains/<domain>/<version>`
+with HTTP digest auth (the SIP domain and the token), checked against
+its MD5, parsed in the executor, and saved with
+`homeassistant.helpers.storage.Store` — without the token, which lives
+in memory only and is never logged. A `NEW_PHONEBOOK;<version>;<gid>`
+notification starts the same sync.
+
+The entry is reloaded when the new configuration changes the entities,
+not when only something else in the phonebook changed, and never during
+a call: the hub waits for it to end. Reloading rather than adding and
+removing entities in place keeps one derivation path — the stored
+plant, the runtime config the SIP layer holds, the entity plan and the
+registry cleanup are all built at setup, from the same plant, exactly
+as after a restart. `entity_plan.py` decides the entities and the
+unique IDs (a panel keeps `call_<ext>`/`door_<ext>`, the phonebook door
+that is the old lock's door inherits `<entry>_lock`, other actuators are
+`actuator_<target>_<command>`); setup removes the registry entries of
+those families the plan no longer lists, before the platforms add
+theirs. With no phonebook — no answer, no version, a failed download —
+the options are used, exactly as before.
+
+Actuators are triggered through `hub.async_door(target, command)`: a
+MESSAGE to the actuator's GID with its command as the body and
+`Panda: command`, which is the SDK's `sysMsgActuatorAction`.
+
+Incoming MESSAGEs are answered with 200 OK first and then handed to the
+hub whole; only the kinds of lines they held are logged. A MESSAGE with
+a `Panda` family other than `blue` is not read as a notification.
 
 ## Connection state machine
 
@@ -210,6 +251,16 @@ something to try casually.
   is how Home Assistant works rather than something introduced here, but
   fetching the view places a call to the entrance panel, so it is worth
   knowing about.
+- The phonebook download is authenticated with a token the indoor unit
+  hands out in its status reply. It is kept in memory only, never
+  persisted and never logged; a Basic challenge is refused rather than
+  answered with it, and redirects are not followed. The downloaded
+  phonebook is accepted only if its MD5 is the version the indoor unit
+  announced, and every extension and command read from it — or from
+  the stored copy — is checked against the same strict patterns as the
+  QR fields before it can reach a SIP URI or a MESSAGE body. Only this
+  apartment's own group is kept from the phonebook, not the names of
+  the neighbouring flats a block's phonebook lists.
 - The QR payload and the SIP password are excluded from logging by
   design (see `qr.py`); no module sets a logging level or attaches a
   handler — Home Assistant's own `logger:` configuration is the only

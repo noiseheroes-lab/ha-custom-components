@@ -13,6 +13,14 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, MANUFACTURER, MODEL
+from .entity_plan import ButtonPlan
+
+# The phonebook's actuator icons, as Home Assistant icons.
+_ACTUATOR_ICONS = {
+    "DOOR": "mdi:gate-open",
+    "LIGHT": "mdi:lightbulb-on-outline",
+    "SWITCH": "mdi:electric-switch",
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,16 +30,20 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up one call and one door button per configured panel."""
-    hub = hass.data[DOMAIN][entry.entry_id]["hub"]
+    """Set up the fixed buttons, a call and a door button per panel, and
+    a button per non-door actuator of the phonebook."""
+    data = hass.data[DOMAIN][entry.entry_id]
+    hub, plan = data["hub"], data["plan"]
     entities: list[ButtonEntity] = [
         VimarAnswerButton(hub, entry.entry_id),
         VimarHangupButton(hub, entry.entry_id),
         VimarReconnectButton(hub, entry.entry_id),
     ]
-    for panel in hub.config.panels:
+    for panel in plan.panels:
         entities.append(VimarCallButton(hub, entry.entry_id, panel))
         entities.append(VimarDoorButton(hub, entry.entry_id, panel))
+    for actuator in plan.actuator_buttons:
+        entities.append(VimarActuatorButton(hub, entry.entry_id, actuator))
     async_add_entities(entities)
 
 
@@ -98,6 +110,32 @@ class VimarDoorButton(VimarButtonBase):
         ok, msg = await self._hub.async_door(target=self._panel.address)
         if not ok:
             _LOGGER.error("Opening %s failed: %s", self._panel.address, msg)
+            raise HomeAssistantError(msg)
+
+
+class VimarActuatorButton(VimarButtonBase):
+    """Trigger one actuator of the plant: an AUX output, a light, a relay.
+
+    Pressing it sends the actuator's command to its target with
+    `Panda: command`, which is all the official app does for it too.
+    """
+
+    _attr_icon = "mdi:gesture-tap-button"
+
+    def __init__(self, hub, entry_id: str, plan: ButtonPlan) -> None:
+        """Remember what this button sends, and to whom."""
+        super().__init__(hub, entry_id, plan.unique_suffix)
+        self._plan = plan
+        self._attr_name = plan.name
+        if plan.icon in _ACTUATOR_ICONS:
+            self._attr_icon = _ACTUATOR_ICONS[plan.icon]
+
+    async def async_press(self) -> None:
+        """Send the command."""
+        ok, msg = await self._hub.async_door(
+            target=self._plan.target, command=self._plan.command)
+        if not ok:
+            _LOGGER.error("%s failed: %s", self._plan.name, msg)
             raise HomeAssistantError(msg)
 
 

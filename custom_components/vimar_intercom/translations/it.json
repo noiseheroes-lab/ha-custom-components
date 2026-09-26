@@ -43,7 +43,7 @@
     "step": {
       "init": {
         "title": "Opzioni Videocitofono Vimar",
-        "description": "Gli indirizzi dei posti esterni sono gli interni SIP dei tuoi posti esterni, separati da virgola. Aggiungi ':Nome' per assegnare un'etichetta, ad esempio '55001:Cancello, 55002:Portone'.",
+        "description": "Posti esterni, serrature e gli altri attuatori vengono rilevati automaticamente dalla rubrica pubblicata dal posto interno, con i nomi impostati su di esso; in quel caso qui non serve cambiare nulla. L'elenco dei posti esterni e il comando di apertura qui sotto si usano solo quando la rubrica non può essere scaricata (alcuni tipi di impianto, oppure il cloud Vimar irraggiungibile alla prima configurazione). Gli indirizzi dei posti esterni sono gli interni SIP dei tuoi posti esterni, separati da virgola. Aggiungi ':Nome' per assegnare un'etichetta, ad esempio '55001:Cancello, 55002:Portone'. Il comando di apertura stabilisce anche quale porta della rubrica mantiene l'entità della serratura originale.",
         "data": {
           "panels": "Indirizzi dei posti esterni",
           "door_command": "Comando di apertura porta",

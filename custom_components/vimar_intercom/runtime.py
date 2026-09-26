@@ -13,7 +13,7 @@ import secrets
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .const import (
     CONF_CLOUD_PROXY,
@@ -42,6 +42,9 @@ from .const import (
     DEFAULT_SIP_PORT,
     USER_AGENT,
 )
+
+if TYPE_CHECKING:
+    from .plant_config import PlantConfig
 
 DEVICE_ID_DIGITS = 15
 VIDEO_PORT_OFFSET = 2000
@@ -104,6 +107,15 @@ class RuntimeConfig:
     def panel_uri(self, address: str) -> str:
         """SIP URI for a panel extension."""
         return f"sip:{address}@{self.sip_domain}"
+
+    @property
+    def cloud_proxy(self) -> str:
+        """The cloud proxy name from the QR.
+
+        The SIP connection's TLS SNI and Route always name it, whichever
+        server SRV picks, and the phonebook is downloaded from it.
+        """
+        return self.sni
 
     @property
     def door_uri(self) -> str:
@@ -261,10 +273,29 @@ def _door_command_of(options: Mapping[str, Any]) -> str:
     return command
 
 
+def _panels_of(
+    options: Mapping[str, Any], plant: PlantConfig | None
+) -> tuple[PanelConfig, ...]:
+    """The phonebook's entrance panels, or the options' list without one.
+
+    The phonebook is what the installer configured, with the names set
+    on the indoor unit, so it wins whenever it lists any panel. The
+    options remain the answer for plants whose phonebook cannot be
+    fetched — another plant type, or a first setup with the cloud down.
+    The phonebook's order puts the group's auto panel first, which makes
+    it the default target of a call, as it is on the indoor unit.
+    """
+    if plant is not None and plant.panels:
+        return tuple(PanelConfig(p.address, p.name) for p in plant.panels)
+    return parse_panels(options.get(CONF_PANELS) or DEFAULT_PANELS)
+
+
 def build_runtime_config(
-    data: Mapping[str, Any], options: Mapping[str, Any]
+    data: Mapping[str, Any],
+    options: Mapping[str, Any],
+    plant: PlantConfig | None = None,
 ) -> RuntimeConfig:
-    """Combine entry data and options into an immutable RuntimeConfig."""
+    """Combine entry data, options and the phonebook into a RuntimeConfig."""
     cloud_proxy = data.get(CONF_CLOUD_PROXY) or DEFAULT_CLOUD_PROXY
     local_proxy = data.get(CONF_LOCAL_PROXY, "")
     prefer_local = bool(options.get(CONF_PREFER_LOCAL, False)) and bool(local_proxy)
@@ -306,7 +337,7 @@ def build_runtime_config(
         device_id=data[CONF_DEVICE_ID],
         device_uuid=data[CONF_DEVICE_UUID],
         push_token=data[CONF_PUSH_TOKEN],
-        panels=parse_panels(options.get(CONF_PANELS) or DEFAULT_PANELS),
+        panels=_panels_of(options, plant),
         door_command=_door_command_of(options),
         rtp_audio_port=rtp_base,
         rtp_video_port=rtp_base + VIDEO_PORT_OFFSET,

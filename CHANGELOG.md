@@ -24,6 +24,15 @@ by hand any more.
   photos are refused with a request for a screenshot or a JPEG, since
   nothing in Home Assistant can open them; an image holding two
   different QR codes is refused rather than guessed at.
+- **Entrance panels, door locks and actuators are discovered from the
+  plant's phonebook**, with the names set on the indoor unit, the way
+  the Vimar View app shows them. After registering, the integration asks
+  the indoor unit for its status, downloads the phonebook from the Vimar
+  cloud when its version changed, keeps the last good copy, rebuilds the
+  entities when the installer changes the plant (never during a call)
+  and removes the ones that are gone. Existing panel buttons and the
+  door lock keep their unique IDs. Without a phonebook the options are
+  used as before.
 - `vimar_intercom_ring` event on the Home Assistant bus, carrying the
   panel address and name.
 - Reconnect button and a repair issue raised when registration has been

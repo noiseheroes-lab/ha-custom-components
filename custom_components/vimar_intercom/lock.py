@@ -13,6 +13,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, MANUFACTURER, MODEL
+from .entity_plan import LockPlan
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,15 +23,19 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create the door lock.
+    """Create the door locks the entity plan lists.
 
-    One entity, addressing the relay group from the QR. That is the door
-    a Vimar system has by default, and it works without the user
-    configuring anything. Plants with a second entrance reach it through
-    the per-panel door buttons.
+    Without a phonebook that is one lock, addressing the relay group
+    from the QR: the door a Vimar system has by default, working without
+    the user configuring anything. With one, every door actuator the
+    installer set up is a lock under its own name, and the one that is
+    the same door as the old lock keeps its unique ID (see
+    `entity_plan`).
     """
-    hub = hass.data[DOMAIN][entry.entry_id]["hub"]
-    async_add_entities([VimarIntercomLock(hub, entry.entry_id)])
+    data = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities(
+        VimarIntercomLock(data["hub"], entry.entry_id, lock)
+        for lock in data["plan"].locks)
 
 
 def _device_info(entry_id: str) -> DeviceInfo:
@@ -49,15 +54,24 @@ class VimarIntercomLock(LockEntity):
     Unlocking sends the SIP door command to the panel, which pulses its
     relay. The physical release re-locks itself after a few seconds, so
     the entity returns to locked after the same delay.
+
+    The generic lock (no phonebook, or no phonebook actuator that is the
+    same door) leaves target and command to the hub, which picks
+    OPEN_CURRENT during a call. A phonebook lock always sends its own
+    command to its own target: it is named after one door, and must not
+    open another one because somebody else happens to be calling.
     """
 
     _attr_has_entity_name = True
     _attr_translation_key = "door"
     _attr_icon = "mdi:door-closed-lock"
 
-    def __init__(self, hub, entry_id: str) -> None:
+    def __init__(self, hub, entry_id: str, plan: LockPlan) -> None:
         self._hub = hub
-        self._attr_unique_id = f"{entry_id}_lock"
+        self._plan = plan
+        self._attr_unique_id = f"{entry_id}_{plan.unique_suffix}"
+        if plan.name is not None:
+            self._attr_name = plan.name
         self._is_locked = True
         self._relock_task: asyncio.Task | None = None
         self._attr_device_info = _device_info(entry_id)
@@ -84,7 +98,8 @@ class VimarIntercomLock(LockEntity):
         nothing happen, and having no way to tell a slow door from a
         dead connection. Raising also lets an automation catch it.
         """
-        ok, msg = await self._hub.async_door()
+        ok, msg = await self._hub.async_door(
+            target=self._plan.target, command=self._plan.command)
         if not ok:
             _LOGGER.error("Door open failed: %s", msg)
             raise HomeAssistantError(msg)

@@ -43,7 +43,7 @@
     "step": {
       "init": {
         "title": "Vimar Intercom options",
-        "description": "Panel addresses are the SIP extensions of your entrance panels, comma separated. Add ':Name' to label one, for example '55001:Street Gate, 55002:Building Door'.",
+        "description": "Entrance panels, door locks and the other actuators are discovered automatically from the phonebook the indoor unit publishes, with the names set on it; nothing here needs changing then. The panel list and the door command below are used only when the phonebook cannot be downloaded (some plant types, or the Vimar cloud unreachable at first setup). Panel addresses are the SIP extensions of your entrance panels, comma separated. Add ':Name' to label one, for example '55001:Street Gate, 55002:Building Door'. The door command also picks which phonebook door keeps the original door lock's entity.",
         "data": {
           "panels": "Panel addresses",
           "door_command": "Door open command",

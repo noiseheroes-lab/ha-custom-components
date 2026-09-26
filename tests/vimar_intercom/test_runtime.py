@@ -269,3 +269,21 @@ def test_a_changed_port_overrides_srv():
         runtime.entry_data_from_qr(QR_FIELDS), {"sip_port": 5061})
     assert cfg.proxy_port == 5061
     assert cfg.proxy_port_override == 5061
+
+
+# ─── the phonebook's panels replace the options' ─────────────────────
+
+def test_phonebook_panels_win_over_the_options():
+    from custom_components.vimar_intercom import plant_config as pc
+    plant = pc.PlantConfig(
+        version="x", group=pc.Group("21", "21", "55002"),
+        panels=(pc.Panel("55002", "Main"), pc.Panel("55001", "Side")),
+        actuators=())
+    cfg = runtime.build_runtime_config(
+        runtime.entry_data_from_qr({"ID": "60901", "PWD": "p",
+                                    "CDOMAIN": "example.invalid"}),
+        {"panels": "55001:From options"}, plant)
+    assert [(p.address, p.name) for p in cfg.panels] == [
+        ("55002", "Main"), ("55001", "Side")]
+    assert cfg.default_panel.address == "55002"
+    assert cfg.cloud_proxy == "ipvdes.vimar.cloud"
