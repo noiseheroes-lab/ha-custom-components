@@ -42,7 +42,8 @@ async def broadcast(msg_type, msg):
 # ─── RTP Protocols ──────────────────────────────────────────────────
 
 class RTPAudioProtocol(asyncio.DatagramProtocol):
-    """Audio SRTP: decrypt, then forward the plain RTP to the AV ffmpeg port.
+    """Audio SRTP: decrypt, hand the payload to any audio listeners, then
+    forward the plain RTP to the AV ffmpeg port.
 
     Nothing on the receive path logs. `datagram_received` runs 50 times a
     second for the whole of a call, and a log statement there — at any
@@ -57,6 +58,7 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         self.pkt_count = 0
         self.srtp_fail = 0
         self.rx_errors = 0
+        self.listener_errors = 0
         self.srtp_rx: SRTPContext | None = None
         # Forward decrypted RTP to the local port ffmpeg reads audio from.
         self.ffmpeg_av_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -101,6 +103,9 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
         hlen = 12 + cc * 4
         if len(rtp) <= hlen:
             return
+        # Listeners first, so a dead forwarding socket cannot starve them.
+        if _audio_listeners:
+            self.listener_errors += _notify_audio_listeners(rtp)
         # Forward decrypted RTP to AV ffmpeg port
         self.ffmpeg_av_sock.sendto(rtp, ('127.0.0.1', cfg.av_audio_port))
         self.pkt_count += 1
@@ -108,7 +113,8 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
     def stats(self) -> str:
         """One-line summary of what this protocol saw during the call."""
         return (f"audio pkts={self.pkt_count} srtp_fail={self.srtp_fail} "
-                f"rx_errors={self.rx_errors}")
+                f"rx_errors={self.rx_errors} "
+                f"listener_errors={self.listener_errors}")
 
     def close(self) -> None:
         """Release the forwarding socket."""
@@ -122,6 +128,68 @@ class RTPAudioProtocol(asyncio.DatagramProtocol):
             return
         stun = struct.pack('!HHI', 0x0001, 0, 0x2112A442) + os.urandom(12)
         self.transport.sendto(stun, self.remote_addr)
+
+
+# ─── Audio listeners ────────────────────────────────────────────────
+#
+# Another component can listen to the panel's audio during a call: each
+# listener is called with the payload of every PCMU packet the panel
+# sends, decrypted — G.711 µ-law, 8 kHz mono, one byte per sample,
+# normally 160 bytes (20 ms) at a time. It is called synchronously on the
+# event loop, from the receive path, 50 times a second: it must be quick
+# and must not block. What it raises is counted in the per-call media
+# summary and otherwise ignored, so one broken listener can neither stop
+# the others nor the AV pipeline, nor flood the log.
+
+_audio_listeners: list = []
+
+
+def add_audio_listener(listener) -> None:
+    """Call `listener(payload: bytes)` with each audio packet of a call.
+
+    Adding the same listener twice has no further effect. Listeners
+    outlive calls and config entry reloads; remove them when done.
+    """
+    if listener not in _audio_listeners:
+        _audio_listeners.append(listener)
+
+
+def remove_audio_listener(listener) -> None:
+    """Stop calling a listener; removing an unknown one is not an error."""
+    if listener in _audio_listeners:
+        _audio_listeners.remove(listener)
+
+
+def rtp_payload(rtp: bytes) -> bytes:
+    """The payload of a plain RTP packet, without header, CSRCs,
+    extension or padding; empty if the packet is malformed."""
+    if len(rtp) < 12:
+        return b""
+    start = 12 + (rtp[0] & 0x0F) * 4
+    if rtp[0] & 0x10:  # header extension
+        if len(rtp) < start + 4:
+            return b""
+        start += 4 + struct.unpack_from("!H", rtp, start + 2)[0] * 4
+    end = len(rtp)
+    if rtp[0] & 0x20 and end > start:  # padding, its length in the last byte
+        end -= rtp[-1]
+    if end <= start:
+        return b""
+    return rtp[start:end]
+
+
+def _notify_audio_listeners(rtp: bytes) -> int:
+    """Hand one packet's payload to every listener; return the failures."""
+    payload = rtp_payload(rtp)
+    if not payload:
+        return 0
+    failures = 0
+    for listener in list(_audio_listeners):
+        try:
+            listener(payload)
+        except Exception:  # noqa: BLE001 - counted, reported once per call
+            failures += 1
+    return failures
 
 
 ANNEX_B_START = b"\x00\x00\x00\x01"
@@ -722,6 +790,7 @@ async def setup_media(remote_sdp):
         audio_proto.pkt_count = 0
         audio_proto.srtp_fail = 0
         audio_proto.rx_errors = 0
+        audio_proto.listener_errors = 0
         if remote_audio_key:
             audio_proto.srtp_rx = SRTPContext(remote_audio_key)
         audio_proto.send_stun()
@@ -785,6 +854,7 @@ async def stop_media():
         audio_proto.pkt_count = 0
         audio_proto.srtp_fail = 0
         audio_proto.rx_errors = 0
+        audio_proto.listener_errors = 0
         audio_proto.srtp_rx = None
     if video_proto:
         video_proto.remote_addr = None

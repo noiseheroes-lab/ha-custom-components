@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.1] — 2026-09-26
+
+### vimar_intercom
+
+#### Added
+- **Audio listeners**: `media_handler.add_audio_listener(cb)` and
+  `remove_audio_listener(cb)` let another component listen to the
+  panel's audio during a call. Each listener gets the decrypted PCMU
+  payload of every packet (G.711 µ-law, 8 kHz mono, normally 20 ms).
+  A listener that raises is counted in the per-call media summary
+  (`listener_errors`) and skipped; the others and the AV stream carry
+  on, and nothing is logged per packet.
+
 ## [2.1.0] — 2026-09-26
 
 ### vimar_intercom — native-app parity

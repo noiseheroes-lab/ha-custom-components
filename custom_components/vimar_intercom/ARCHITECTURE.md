@@ -217,13 +217,23 @@ on separate ports (`RTPAudioProtocol`, `RTPVideoProtocol` in
 
 - **Audio** is decrypted and the plain RTP forwarded to a local UDP port,
   where ffmpeg picks it up and remuxes it into the MPEG-TS served by the
-  `/api/vimar_intercom/av` HTTP view. Nothing else consumes it: there is
-  no decode to PCM and no buffer, because nothing would read one; the
-  talk-back path (below) goes the other way and never touches the
-  panel's audio. ffmpeg runs with `-c copy` —
-  never `-c:v libx264` or any other transcode — because the reference
-  deployment is a fanless two-core machine that a live re-encode would
-  saturate.
+  `/api/vimar_intercom/av` HTTP view. The integration itself does not
+  decode it to PCM or buffer it; the talk-back path (below) goes the
+  other way and never touches the panel's audio. ffmpeg runs with
+  `-c copy` — never `-c:v libx264` or any other transcode — because the
+  reference deployment is a fanless two-core machine that a live
+  re-encode would saturate.
+- **Audio listeners** let another component hear the panel too:
+  `media_handler.add_audio_listener(cb)` has `cb(payload)` called with
+  the decrypted PCMU payload of every audio packet of a call (G.711
+  µ-law, 8 kHz mono, normally 160 bytes, 20 ms), and
+  `remove_audio_listener(cb)` stops it. Listeners run synchronously on
+  the event loop from the receive path, before the forward to ffmpeg,
+  so they must be quick. What one raises is counted as
+  `listener_errors` in the per-call media summary and otherwise
+  ignored: a broken listener stops neither the others nor the AV
+  pipeline, and never writes a log line per packet. Listeners outlive
+  calls and entry reloads; the component that added one removes it.
 - **Video** is decrypted, depacketised from RTP H.264 (FU-A and STAP-A)
   into Annex-B NAL units, and handed to `VideoStreamRegistry`
   (`media_handler.py`), which fans them out to consumers. It caches the

@@ -1232,3 +1232,147 @@ def test_a_talker_is_heard_in_the_packets_and_the_call_end_stops_it(
         assert not source.talking
     finally:
         audio.close()
+
+
+# ─── audio listeners ─────────────────────────────────────────────────
+
+@pytest.fixture
+def listeners(monkeypatch):
+    """Give each test an empty listener list of its own."""
+    monkeypatch.setattr(media, "_audio_listeners", [])
+    return media._audio_listeners
+
+
+def test_a_listener_hears_each_decrypted_pcmu_payload(cfg, listeners):
+    heard = []
+    media.add_audio_listener(heard.append)
+    proto = media.RTPAudioProtocol()
+    try:
+        for seq in range(3):
+            proto.datagram_received(
+                rtp_packet(seq, bytes([seq]) * 160, payload_type=0),
+                ("192.0.2.10", 5004))
+    finally:
+        proto.close()
+    assert heard == [bytes([seq]) * 160 for seq in range(3)]
+    # The AV pipeline still gets every packet.
+    assert proto.pkt_count == 3
+
+
+def test_a_listener_hears_nothing_but_pcmu(cfg, listeners):
+    heard = []
+    media.add_audio_listener(heard.append)
+    proto = media.RTPAudioProtocol()
+    try:
+        proto.datagram_received(
+            rtp_packet(1, b"\x00" * 160, payload_type=8), ("192.0.2.10", 5004))
+        proto.datagram_received(b"\x00\x01\x00\x00" * 5, ("192.0.2.10", 5004))
+    finally:
+        proto.close()
+    assert heard == []
+
+
+def test_a_listener_hears_what_was_decrypted(cfg, listeners):
+    heard = []
+    media.add_audio_listener(heard.append)
+
+    class _Decrypts:
+        def unprotect(self, _data):
+            return rtp_packet(7, b"\x55" * 160, payload_type=0)
+
+    proto = media.RTPAudioProtocol()
+    proto.srtp_rx = _Decrypts()
+    try:
+        proto.datagram_received(
+            rtp_packet(7, b"\xaa" * 170, payload_type=0), ("192.0.2.10", 5004))
+    finally:
+        proto.close()
+    assert heard == [b"\x55" * 160]
+
+
+def test_a_failing_listener_stops_neither_the_others_nor_the_pipeline(
+        cfg, listeners, caplog):
+    def broken(_payload):
+        raise ValueError("boom")
+
+    heard = []
+    media.add_audio_listener(broken)
+    media.add_audio_listener(heard.append)
+    proto = media.RTPAudioProtocol()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            for seq in range(50):
+                proto.datagram_received(
+                    rtp_packet(seq, b"\x00" * 160, payload_type=0),
+                    ("192.0.2.10", 5004))
+    finally:
+        proto.close()
+    assert len(heard) == 50
+    assert proto.pkt_count == 50
+    assert proto.listener_errors == 50
+    assert "listener_errors=50" in proto.stats()
+    assert caplog.records == []
+
+
+def test_a_dead_forwarding_socket_does_not_starve_listeners(cfg, listeners):
+    heard = []
+    media.add_audio_listener(heard.append)
+    proto = media.RTPAudioProtocol()
+    proto.close()  # sendto raises from now on
+    proto.datagram_received(
+        rtp_packet(1, b"\x00" * 160, payload_type=0), ("192.0.2.10", 5004))
+    assert heard == [b"\x00" * 160]
+
+
+def test_adding_twice_and_removing_unknown_listeners(listeners):
+    def listener(_payload):
+        pass
+
+    media.add_audio_listener(listener)
+    media.add_audio_listener(listener)
+    assert listeners == [listener]
+    media.remove_audio_listener(listener)
+    media.remove_audio_listener(listener)
+    assert listeners == []
+
+
+def test_a_listener_may_remove_itself_while_being_called(cfg, listeners):
+    heard = []
+
+    def once(payload):
+        heard.append(payload)
+        media.remove_audio_listener(once)
+
+    media.add_audio_listener(once)
+    proto = media.RTPAudioProtocol()
+    try:
+        for seq in range(3):
+            proto.datagram_received(
+                rtp_packet(seq, b"\x01" * 160, payload_type=0),
+                ("192.0.2.10", 5004))
+    finally:
+        proto.close()
+    assert heard == [b"\x01" * 160]
+
+
+@pytest.mark.parametrize(
+    ("packet", "expected"),
+    [
+        # Plain header.
+        (bytes([0x80, 0]) + b"\x00" * 10 + b"abc", b"abc"),
+        # Two CSRCs.
+        (bytes([0x82, 0]) + b"\x00" * 10 + b"\x11" * 8 + b"abc", b"abc"),
+        # A one-word header extension.
+        (bytes([0x90, 0]) + b"\x00" * 10 + b"\xbe\xde\x00\x01" + b"\x22" * 4
+         + b"abc", b"abc"),
+        # Two bytes of padding, the count in the last byte.
+        (bytes([0xA0, 0]) + b"\x00" * 10 + b"abc" + b"\x00\x02", b"abc"),
+        # Malformed: too short, an extension past the end, padding
+        # longer than the payload.
+        (b"\x80\x00", b""),
+        (bytes([0x90, 0]) + b"\x00" * 10 + b"\xbe\xde", b""),
+        (bytes([0xA0, 0]) + b"\x00" * 10 + b"a\x09", b""),
+    ],
+)
+def test_rtp_payload(packet, expected):
+    assert media.rtp_payload(packet) == expected
