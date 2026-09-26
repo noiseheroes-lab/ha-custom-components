@@ -5,12 +5,25 @@
 ### vimar_intercom v2.0.0
 
 **Breaking:** credentials no longer live in `const.py`. Upgrading from 1.x
-requires removing the existing entry and adding the integration again,
-pasting the QR payload from the Vimar View app. Nothing needs to be
-edited by hand any more.
+requires removing the existing entry and adding the integration again
+with the QR code the indoor unit generates. Nothing needs to be edited
+by hand any more.
 
 #### Added
 - QR-based config flow, with reconfigure and options flows.
+- **Setup and reconfigure accept a photo or screenshot of the QR code**,
+  as well as its text. The indoor unit only shows the QR on screen, so
+  asking for pasted text left most people stuck. The image is read with
+  `pyzbar`, which is not a new dependency: Home Assistant core's own
+  `qrcode` integration requires `pyzbar==0.1.9` and `Pillow`, and the
+  official image ships both with the native `libzbar`. The manifest
+  declares `pyzbar>=0.1.9`, a lower bound so it can never conflict with
+  core's pin, and `file_upload` as a dependency. The upload is deleted
+  as soon as it has been read. If a Home Assistant Core install lacks
+  `libzbar`, the form says so and the text paste still works. HEIC
+  photos are refused with a request for a screenshot or a JPEG, since
+  nothing in Home Assistant can open them; an image holding two
+  different QR codes is refused rather than guessed at.
 - `vimar_intercom_ring` event on the Home Assistant bus, carrying the
   panel address and name.
 - Reconnect button and a repair issue raised when registration has been
@@ -21,6 +34,12 @@ edited by hand any more.
   running in CI.
 
 #### Fixed
+- **The setup instructions pointed to a menu that does not exist.** They
+  sent users to "Settings → System → Export configuration" in the Vimar
+  View app, which only scans QR codes. The QR is generated on the indoor
+  unit, one per user, under Settings → Users → Generate QR, and the
+  dialog, the repair issue and the README now say so, recommending a
+  user dedicated to Home Assistant.
 - Reconnection is unbounded with jittered exponential backoff. Previously
   the client gave up after five attempts and stayed silent until Home
   Assistant restarted.

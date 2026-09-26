@@ -40,7 +40,7 @@ Read energy consumption data from the **Daikin Madoka BRC1H** smart thermostat v
 
 > **Status: v2 is not released.** It is a rewrite of the 1.x integration and has not been through a release. Read the [integration README](custom_components/vimar_intercom/README.md) before installing it.
 
-Integrate **Vimar Elvox** video door entry systems into Home Assistant. Configure by pasting the QR code from the Vimar View app: doorbell events, door release, call control, and a camera.
+Integrate **Vimar Elvox** video door entry systems into Home Assistant. Configure with a photo of the QR code the indoor unit generates: doorbell events, door release, call control, and a camera.
 
 Developed against a Vimar Elvox Tab 5S Plus (40515/40517) on a 2-wire Due Fili Plus system. Other panels speak the same protocol and may work, but are untested.
 

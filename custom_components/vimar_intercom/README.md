@@ -30,9 +30,8 @@ anywhere else.
 
 ## Requirements
 
-- The Vimar View app, already paired with your panel
-- The QR configuration payload it can export (Settings → System → Export
-  configuration)
+- Access to the indoor unit's settings, to generate a QR code for Home
+  Assistant (Settings → Users → Generate QR)
 - A Home Assistant host that can reach `ipvdes.vimar.cloud` on TCP 7042
 - `ffmpeg`, bundled with Home Assistant OS and Home Assistant Container
 
@@ -47,8 +46,29 @@ anywhere else.
 
 ## Setup
 
-Paste the QR payload from the Vimar View app. Confirm the summary. Done —
-no panel IP, port or credential needs typing.
+1. On the indoor unit, open **Settings → Users**, pick a user or create
+   one, and select **Generate QR**. This is the same QR code the Vimar
+   View app scans to pair a phone.
+2. Take a photo or a screenshot of it, and upload it in the setup
+   dialog. If you have the QR as text instead, paste it in the second
+   field; when both are filled, the image is used.
+3. Confirm the summary. Done — no panel IP, port or credential needs
+   typing.
+
+**Create a dedicated user for Home Assistant.** Each user has its own SIP
+identity; sharing one with a phone or another system risks the two
+knocking each other offline (see above).
+
+The image is decoded on your Home Assistant, deleted as soon as it has
+been read, and never logged: it *is* the credentials. The path above is
+from a Tab 5S Plus; other indoor units may name the menu differently.
+
+Reading the image needs `pyzbar` and the native `libzbar`. Home Assistant
+OS and Container ship both, for core's own QR code integration. On a
+Home Assistant Core install without `libzbar` the dialog says the reader
+is unavailable, and pasting the text still works. iPhone photos in HEIC
+format cannot be opened: upload a screenshot, or export the photo as
+JPEG.
 
 ## Entities
 
@@ -185,9 +205,9 @@ Assistant UI would: the panel stops ringing elsewhere in the house.
 ## Upgrading from 1.x
 
 This is not an upgrade path, it is a reinstall. There is no migration:
-remove the 1.x config entry and add the integration again, pasting the
-QR payload from the Vimar View app. Two things will otherwise look like
-bugs:
+remove the 1.x config entry and add the integration again with the QR
+code generated on the indoor unit (see Setup). Two things will otherwise
+look like bugs:
 
 - **Nearly every entity ID changes, not just the per-panel buttons.**
   1.x entities carried no device-name prefix and used Italian names —
@@ -205,12 +225,16 @@ bugs:
 
 ## Troubleshooting
 
-- **"That does not look like a Vimar QR payload"** — as well as a
-  payload that will not decrypt, this now covers one that decrypts to
+- **"That QR code is not a Vimar one, or it is incomplete"** — as well
+  as a payload that will not decrypt, this covers one that decrypts to
   values the integration will not put on the wire: the SIP user and the
   relay group must be alphanumeric, and the domain and the proxy
-  addresses must be host names or IP addresses. Only paste a payload
-  your own Vimar View app produced.
+  addresses must be host names or IP addresses. The same checks apply
+  whether the QR came from an image or from pasted text. Only use a QR
+  code your own indoor unit generated.
+- **"No QR code was found in that image"** — use a sharp, straight-on
+  photo or a screenshot with the whole QR code in view, or paste the
+  text.
 - **Registration stays off** — check the host can reach the proxy shown
   in the sensor's attributes; press the Reconnect button. The integration
   retries forever, so a repair issue after five minutes means the panel

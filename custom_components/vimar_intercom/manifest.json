@@ -7,6 +7,7 @@
   "config_flow": true,
   "dependencies": [
     "ffmpeg",
+    "file_upload",
     "http",
     "stream"
   ],
@@ -14,7 +15,9 @@
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/noiseheroes-lab/ha-custom-components/issues",
-  "requirements": [],
+  "requirements": [
+    "pyzbar>=0.1.9"
+  ],
   "single_config_entry": true,
   "version": "2.0.0"
 }

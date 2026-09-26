@@ -3,9 +3,10 @@
     "step": {
       "user": {
         "title": "Vimar Intercom",
-        "description": "Open the Vimar View app, go to Settings → System → Export configuration, and scan or copy the QR code it shows. Paste the whole payload below.\n\nThe payload is encrypted; Home Assistant decrypts it locally and stores the credentials in this config entry.",
+        "description": "On the indoor unit, open Settings → Users, pick a user or create one, and select Generate QR. Take a photo or a screenshot of the QR code and upload it here. If you have the QR code as text instead, paste it.\n\nCreate a dedicated user for Home Assistant: each user has its own SIP identity, and sharing one with a phone or another system can knock both offline.\n\nHome Assistant reads and decrypts the QR code locally, deletes the image straight away, and keeps only the credentials in this config entry.",
         "data": {
-          "qr_payload": "QR code payload"
+          "qr_image": "QR code image",
+          "qr_payload": "Or paste the QR code text"
         }
       },
       "confirm": {
@@ -14,14 +15,22 @@
       },
       "reconfigure": {
         "title": "Update the QR code",
-        "description": "Paste a fresh QR payload from the Vimar View app. The existing device identity is kept so the Vimar cloud still recognises this installation.",
+        "description": "On the indoor unit, open Settings → Users, pick the user Home Assistant uses, and select Generate QR. Upload a photo or a screenshot of the QR code, or paste its text. The existing device identity is kept so the Vimar cloud still recognises this installation.",
         "data": {
-          "qr_payload": "QR code payload"
+          "qr_image": "QR code image",
+          "qr_payload": "Or paste the QR code text"
         }
       }
     },
     "error": {
-      "invalid_qr": "That does not look like a Vimar QR payload. Copy the whole string, including any trailing '=' characters."
+      "invalid_qr": "That QR code is not a Vimar one, or it is incomplete. Use the QR code generated under Settings → Users on the indoor unit; if you pasted text, copy the whole string, including any trailing '=' characters.",
+      "no_qr_input": "Upload an image of the QR code, or paste its text.",
+      "qr_not_found": "No QR code was found in that image. Use a sharp, straight-on photo or a screenshot with the whole QR code in view, or paste the text instead.",
+      "multiple_qr": "That image contains more than one QR code. Crop it to the one from the indoor unit and upload it again.",
+      "image_unreadable": "That image could not be read. Upload it again as a PNG or JPEG, or paste the text instead.",
+      "image_heic": "That is a HEIC photo, which Home Assistant cannot open. Take a screenshot of the QR code, or export the photo as JPEG, and upload that instead.",
+      "image_too_large": "That image is too large. Upload a screenshot or a smaller photo of the QR code.",
+      "qr_reader_unavailable": "This Home Assistant installation cannot read QR images: the zbar library is missing. Paste the QR code text instead."
     },
     "abort": {
       "already_configured": "This intercom is already set up.",
@@ -98,7 +107,7 @@
     },
     "migration_required": {
       "title": "Vimar Intercom must be set up again",
-      "description": "This Home Assistant was using Vimar Intercom 1.x, and version 2 cannot reuse its configuration: the credentials used to be edited into the integration's source and now come from the QR code the Vimar View app exports, which Home Assistant cannot fetch for you. The intercom will not work until you do this: go to Settings > Devices & services, delete the Vimar Intercom entry, then add the integration again and paste the QR payload from the Vimar View app (Settings > System > Export configuration). Most entity IDs change; see the integration's README before rewriting your automations."
+      "description": "This Home Assistant was using Vimar Intercom 1.x, and version 2 cannot reuse its configuration: the credentials used to be edited into the integration's source and now come from a QR code the indoor unit generates, which Home Assistant cannot fetch for you. The intercom will not work until you do this: go to Settings > Devices & services, delete the Vimar Intercom entry, then add the integration again and upload the QR code generated on the indoor unit (Settings > Users > Generate QR). Most entity IDs change; see the integration's README before rewriting your automations."
     }
   }
 }

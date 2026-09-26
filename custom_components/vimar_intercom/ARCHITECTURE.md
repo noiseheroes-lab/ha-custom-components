@@ -20,11 +20,11 @@ can break the day Vimar changes something on their end.
 | `sip_client.py` | The SIP stack itself: connection, digest auth, REGISTER/INVITE/BYE/MESSAGE, transaction correlation, reconnection |
 | `sip_parser.py` | Pure text handling: header parsing, transaction keys, registration expiry parsing — no I/O, no Home Assistant |
 | `backoff.py` | The jittered exponential reconnect delay schedule |
-| `qr.py` | Decrypts and parses the QR configuration payload exported by the Vimar View app |
+| `qr.py` | Reads the QR code from an uploaded image (pyzbar, imported lazily) and decrypts and parses the configuration payload the indoor unit generates |
 | `runtime.py` | `RuntimeConfig` — every value the integration needs, derived once from the config entry; no Home Assistant import, fully unit testable |
 | `srtp.py` | SRTP (RFC 3711) encrypt/decrypt for the audio and video RTP streams |
 | `media_handler.py` | RTP/SRTP transport for audio and video, H.264 depacketisation, the video registry, the AV ffmpeg process |
-| `config_flow.py` | Config, reconfigure and options flows — QR paste in, panel list and door command out |
+| `config_flow.py` | Config, reconfigure and options flows — QR image upload or paste in, panel list and door command out |
 | `camera.py` | Camera entity — the live stream and the keyframe-derived still |
 | `event.py` | Doorbell event entity, also the source of the `vimar_intercom_ring` bus event |
 | `lock.py` | Door lock entity (opens the relay group from the QR) |

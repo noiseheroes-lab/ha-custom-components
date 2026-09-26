@@ -7,13 +7,14 @@ from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.components.file_upload import process_uploaded_file
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 
 from .const import (
@@ -34,30 +35,101 @@ from .const import (
     DEFAULT_SIP_PORT,
     DOMAIN,
 )
-from .qr import decode_qr
+from .qr import (
+    MAX_IMAGE_BYTES,
+    QRImageUnreadableError,
+    QRInputError,
+    choose_qr_input,
+    decode_qr,
+    read_qr_image,
+)
 from .runtime import entry_data_from_qr, parse_panels, valid_door_command
 
 _LOGGER = logging.getLogger(__name__)
 
 CONF_QR_PAYLOAD = "qr_payload"
+CONF_QR_IMAGE = "qr_image"
 
-def _qr_schema(payload: str = "") -> vol.Schema:
-    """The QR form, pre-filled with what the user last pasted.
+_QR_SCHEMA = vol.Schema({
+    # Most people hold the QR as a picture, not as text: the indoor unit
+    # only shows it on screen. Both fields are optional in the schema and
+    # choose_qr_input decides which one counts.
+    vol.Optional(CONF_QR_IMAGE): selector.FileSelector(
+        selector.FileSelectorConfig(accept="image/*")
+    ),
+    vol.Optional(CONF_QR_PAYLOAD): selector.TextSelector(
+        selector.TextSelectorConfig(multiline=True)
+    ),
+})
+
+
+def _read_uploaded_qr(hass: HomeAssistant, file_id: str) -> str:
+    """Read an uploaded QR image and return the text it encodes.
+
+    Runs in the executor, as process_uploaded_file requires, so that its
+    teardown does not run on the loop either. Leaving the `with` deletes
+    the upload: the image is the credentials, and nothing needs it once
+    its bytes are in memory. Pillow and zbar work on those bytes after
+    the file is gone.
+    """
+    try:
+        with process_uploaded_file(hass, file_id) as path, path.open("rb") as fh:
+            # One byte over the limit is enough for read_qr_image to refuse
+            # it, without pulling the rest of a huge upload into memory.
+            data = fh.read(MAX_IMAGE_BYTES + 1)
+    except (ValueError, OSError) as err:
+        # ValueError: the id is unknown, for example after a restart
+        # or a second submit of the same upload.
+        raise QRImageUnreadableError from err
+    return read_qr_image(data)
+
+
+def _qr_form_schema(flow: ConfigFlow, user_input: dict[str, Any] | None) -> vol.Schema:
+    """The QR form, with the text the user last pasted suggested back.
 
     Rebuilding it empty on `invalid_qr` threw away a long base64 blob the
-    user had to find in the app and paste again to see the same error.
+    user had to find and paste again to see the same error. It is a
+    suggestion, not a default: a default would be put back by the schema
+    when the user clears the field, and a stale paste would then be
+    decoded instead of the "nothing given" error. The image cannot be
+    offered back; its upload is deleted as soon as it has been read.
     """
-    field = (vol.Required(CONF_QR_PAYLOAD, default=payload) if payload
-             else vol.Required(CONF_QR_PAYLOAD))
-    return vol.Schema({
-        field: selector.TextSelector(
-            selector.TextSelectorConfig(multiline=True)
-        ),
-    })
+    pasted = (user_input or {}).get(CONF_QR_PAYLOAD)
+    return flow.add_suggested_values_to_schema(
+        _QR_SCHEMA, {CONF_QR_PAYLOAD: pasted} if pasted else None)
+
+
+async def _async_entry_data_from_form(
+    hass: HomeAssistant, user_input: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Turn the QR form into entry data, or into the error key to show.
+
+    Whichever field is used, the text goes through the same decode_qr
+    and entry_data_from_qr as a paste always has, so a QR read from an
+    image gets every check a pasted one does.
+    """
+    try:
+        source, value = choose_qr_input(
+            user_input.get(CONF_QR_IMAGE), user_input.get(CONF_QR_PAYLOAD))
+        if source == "image":
+            value = await hass.async_add_executor_job(
+                _read_uploaded_qr, hass, value)
+        # `entry_data_from_qr` validates too, and raises the same
+        # ValueError QRDecodeError already is, so both the decoding and
+        # the field checks fail the same way here.
+        return entry_data_from_qr(decode_qr(value)), None
+    except QRInputError as err:
+        # The class name only: the exception chain may hold Pillow's
+        # view of the image.
+        _LOGGER.debug("QR input rejected: %s", type(err).__name__)
+        return None, err.error_key
+    except ValueError as err:
+        _LOGGER.debug("QR payload rejected: %s", err)
+        return None, "invalid_qr"
 
 
 class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Set up the integration from the QR code shown by the Vimar app."""
+    """Set up the integration from the QR code the indoor unit generates."""
 
     VERSION = 2
 
@@ -68,18 +140,13 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Ask for the QR payload and decode it."""
+        """Ask for the QR code, as an image or as text, and decode it."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            try:
-                # `entry_data_from_qr` validates too, and raises the same
-                # ValueError QRDecodeError already is, so both the
-                # decoding and the field checks fail the same way here.
-                data = entry_data_from_qr(decode_qr(user_input[CONF_QR_PAYLOAD]))
-            except ValueError as err:
-                _LOGGER.debug("QR payload rejected: %s", err)
-                errors["base"] = "invalid_qr"
+            data, error = await _async_entry_data_from_form(self.hass, user_input)
+            if data is None:
+                errors["base"] = error or "invalid_qr"
             else:
                 await self.async_set_unique_id(
                     data[CONF_MAC] or data[CONF_SIP_USER])
@@ -89,7 +156,7 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=_qr_schema((user_input or {}).get(CONF_QR_PAYLOAD, "")),
+            data_schema=_qr_form_schema(self, user_input),
             errors=errors)
 
     async def async_step_confirm(
@@ -116,11 +183,9 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
         entry = self._get_reconfigure_entry()
 
         if user_input is not None:
-            try:
-                data = entry_data_from_qr(decode_qr(user_input[CONF_QR_PAYLOAD]))
-            except ValueError as err:
-                _LOGGER.debug("QR payload rejected: %s", err)
-                errors["base"] = "invalid_qr"
+            data, error = await _async_entry_data_from_form(self.hass, user_input)
+            if data is None:
+                errors["base"] = error or "invalid_qr"
             else:
                 # Keep the identity generated at first setup: the Vimar
                 # cloud tracks the registration by it.
@@ -133,7 +198,7 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="reconfigure",
-            data_schema=_qr_schema((user_input or {}).get(CONF_QR_PAYLOAD, "")),
+            data_schema=_qr_form_schema(self, user_input),
             errors=errors)
 
     @staticmethod
