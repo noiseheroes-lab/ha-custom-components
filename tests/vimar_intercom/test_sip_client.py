@@ -1223,3 +1223,46 @@ def test_a_system_message_body_is_never_logged_when_unregistered(
         "sip:21@example.invalid", "C;secret-call-id;ANSWERED"))
     assert ok is False
     assert "secret-call-id" not in caplog.text
+
+
+# ─── the dialog's route set ──────────────────────────────────────────
+
+_RELAYED_2XX = (
+    "SIP/2.0 200 OK\r\n"
+    "Record-Route: <sip:127.0.0.1;r2=on;lr=on;ftag=abc>\r\n"
+    "Record-Route: <sip:10.0.0.3;r2=on;lr=on;ftag=abc>, <sip:10.0.0.3:5092;lr>\r\n"
+    "Record-Route: <sips:198.51.100.7:40000;lr>\r\n"
+    "Record-Route: <sips:203.0.113.9:7042;lr;fs-rport=7042>\r\n"
+    "Contact: <sip:60002@127.0.0.1:6095>;+sip.instance=\"<urn:uuid:x>\"\r\n"
+    "Content-Length: 0\r\n\r\n")
+
+
+def test_record_route_entries_keep_their_order_and_split_on_commas():
+    assert sip.record_route_entries(_RELAYED_2XX) == [
+        "<sip:127.0.0.1;r2=on;lr=on;ftag=abc>",
+        "<sip:10.0.0.3;r2=on;lr=on;ftag=abc>",
+        "<sip:10.0.0.3:5092;lr>",
+        "<sips:198.51.100.7:40000;lr>",
+        "<sips:203.0.113.9:7042;lr;fs-rport=7042>",
+    ]
+
+
+def test_requests_inside_a_call_retrace_the_recorded_route(monkeypatch):
+    """With only the static route, the keyframe requests and the BYE
+    reached the cloud proxy and went no further."""
+    monkeypatch.setattr(sip, "CFG", SimpleNamespace(route="proxy.example.invalid"))
+    assert sip._route_lines() == "Route: <sip:proxy.example.invalid;transport=tls;lr>\r\n"
+
+    sip.call_state["route_set"] = tuple(
+        reversed(sip.record_route_entries(_RELAYED_2XX)))
+    lines = sip._route_lines().split("\r\n")[:-1]
+    assert lines[0] == "Route: <sips:203.0.113.9:7042;lr;fs-rport=7042>"
+    assert lines[-1] == "Route: <sip:127.0.0.1;r2=on;lr=on;ftag=abc>"
+    assert len(lines) == 5
+
+
+def test_contact_uri_drops_the_parameters():
+    assert sip._contact_uri(
+        '<sip:60002@127.0.0.1:6095>;+sip.instance="<urn:uuid:x>"'
+    ) == "sip:60002@127.0.0.1:6095"
+    assert sip._contact_uri("sip:1@example.invalid;transport=tls") == "sip:1@example.invalid"

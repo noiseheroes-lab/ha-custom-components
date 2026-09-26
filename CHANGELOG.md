@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.1.2] — 2026-09-26
+
+### vimar_intercom
+
+#### Fixed
+- **Video took four to five seconds to appear, and hanging up took
+  five.** A call to a panel is relayed through several hops the cloud
+  lists in Record-Route, and requests inside the call carried only the
+  static route to the cloud proxy, where they stopped: the keyframe
+  requests never reached the panel, and every BYE sat out its timeout.
+  Requests inside a call now follow the dialog's route set (RFC 3261
+  §12), and an answered incoming call echoes the Record-Route in its
+  200 OK. Video now starts about half a second after the call connects,
+  and a hang-up completes at once.
+- **Keyframe requests are authenticated.** The cloud proxy challenges
+  an INFO like any other request; the 407 is now answered.
+- A call's result is no longer held back by its first keyframe request.
+
 ## [2.1.1] — 2026-09-26
 
 ### vimar_intercom

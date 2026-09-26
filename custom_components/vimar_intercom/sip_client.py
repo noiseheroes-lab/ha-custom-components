@@ -86,6 +86,9 @@ _state_change_callback = None
 call_state = {
     "call_id": None, "from_tag": None, "to_tag": None,
     "remote_contact": None, "remote_sdp": None, "original_target": None,
+    # The dialog's route set (RFC 3261 §12.1): the Route headers every
+    # request inside the call must carry. Empty outside a call.
+    "route_set": (),
 }
 
 # Set when a hang-up arrives while `do_call` still owns the dialog, and
@@ -136,11 +139,11 @@ def reset_state() -> None:
     hangup_requested = False
     call_state.update(call_id=None, from_tag=None, to_tag=None,
                       remote_contact=None, remote_sdp=None,
-                      original_target=None)
+                      original_target=None, route_set=())
     pending_incoming.update(
         active=False, cid=None, from_hdr=None, to_hdr=None, cseq=None,
         via_block=None, my_tag=None, caller_uri=None, caller_tag=None,
-        call_ids=(),
+        call_ids=(), record_route=(), contact=None,
         body=None)
     pending_transactions.clear()
 
@@ -237,6 +240,51 @@ def _next_cseq():
     global cseq_counter
     cseq_counter += 1
     return cseq_counter
+
+
+def record_route_entries(raw: str) -> list[str]:
+    """Every Record-Route entry of a message, in the order it carries them.
+
+    One header may hold several comma-separated entries; a comma inside
+    `<...>` belongs to the URI and does not split.
+    """
+    entries: list[str] = []
+    for value in header_values(raw, "record-route"):
+        depth, start = 0, 0
+        for pos, char in enumerate(value):
+            if char == "<":
+                depth += 1
+            elif char == ">":
+                depth -= 1
+            elif char == "," and depth == 0:
+                entries.append(value[start:pos].strip())
+                start = pos + 1
+        entries.append(value[start:].strip())
+    return [entry for entry in entries if entry]
+
+
+def _route_lines() -> str:
+    """The Route headers for a request inside the current call.
+
+    The cloud relays a call to the panel through several hops and names
+    them in Record-Route. A request inside the call has to retrace them:
+    with only the static route to the cloud proxy, the keyframe requests
+    and the BYE reached the proxy and went no further, so video waited
+    for the panel's own next keyframe and every hang-up sat out its
+    five-second timeout. Outside a dialog, or when the far end recorded
+    no route, the static route is still right.
+    """
+    route_set = call_state.get("route_set") or ()
+    if not route_set:
+        return f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
+    return "".join(f"Route: {entry}\r\n" for entry in route_set)
+
+
+def _contact_uri(value: str) -> str:
+    """The URI of a Contact header value, without its parameters."""
+    if "<" in value and ">" in value:
+        return value[value.index("<") + 1:value.index(">")]
+    return value.split(";", 1)[0].strip()
 
 
 def _content_length(body: str) -> int:
@@ -1015,9 +1063,10 @@ async def do_call(target=None):
             to_hdr = f"<{target_uri}>"
             if to_tag:
                 to_hdr += f";tag={to_tag}"
-            return (f"ACK {target_uri} SIP/2.0\r\n"
+            ack_uri = call_state.get("remote_contact") or target_uri
+            return (f"ACK {ack_uri} SIP/2.0\r\n"
                     f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
-                    f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
+                    f"{_route_lines()}"
                     f"Max-Forwards: 70\r\n"
                     f"To: {to_hdr}\r\n"
                     f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
@@ -1066,11 +1115,12 @@ async def do_call(target=None):
 
             if 200 <= msg.code < 300:
                 call_state["to_tag"] = ttag
-                raw_contact = msg.headers.get("contact", "")
-                if "<" in raw_contact and ">" in raw_contact:
-                    call_state["remote_contact"] = raw_contact[raw_contact.index("<")+1:raw_contact.index(">")]
-                else:
-                    call_state["remote_contact"] = raw_contact
+                call_state["remote_contact"] = _contact_uri(
+                    msg.headers.get("contact", ""))
+                # The caller's route set is the Record-Route of the 2xx,
+                # reversed (RFC 3261 §12.1.2).
+                call_state["route_set"] = tuple(
+                    reversed(record_route_entries(raw)))
                 await send(_ack(ttag, cur_seq))
 
                 if hangup_requested:
@@ -1093,9 +1143,10 @@ async def do_call(target=None):
 
                 _set_in_call(True)
                 _set_calling(False)
+                # The hub starts its keyframe requests on call_started.
+                # Awaiting one here held the call's result back for as
+                # long as the INFO and its authentication took.
                 await broadcast("call_started", "Connected")
-                # Request keyframe immediately — no delay
-                await send_keyframe_request()
                 return True, "Connected"
 
             if msg.code >= 300:
@@ -1115,28 +1166,53 @@ async def do_call(target=None):
 
 
 async def send_keyframe_request():
-    """Send SIP INFO picture_fast_update to get a video keyframe (SPS/PPS)."""
+    """Ask the panel for a keyframe with a SIP INFO picture_fast_update.
+
+    The cloud proxy challenges an INFO like any other request, so a 407
+    is answered with credentials, as a MESSAGE is. Unanswered, the
+    request never reached the panel and the video waited for the panel's
+    own next keyframe.
+    """
     if not in_call or not call_state["call_id"]:
         return
     info_target = call_state.get("remote_contact") or CFG.panel_uri(CFG.default_panel.address)
     to_uri = call_state.get("original_target") or CFG.panel_uri(CFG.default_panel.address)
-    seq = _next_cseq()
+    cid = call_state["call_id"]
     body = ('<?xml version="1.0" encoding="utf-8" ?>'
             '<media_control><vc_primitive><to_encoder>'
             '<picture_fast_update></picture_fast_update>'
             '</to_encoder></vc_primitive></media_control>')
-    msg = (
-        f"INFO {info_target} SIP/2.0\r\n"
-        f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={_gen()};rport\r\n"
-        f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
-        f"Max-Forwards: 70\r\n"
-        f"To: <{to_uri}>;tag={call_state['to_tag']}\r\n"
-        f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={call_state['from_tag']}\r\n"
-        f"Call-ID: {call_state['call_id']}\r\n"
-        f"CSeq: {seq} INFO\r\n"
-        f"Content-Type: application/media_control+xml\r\n"
-        f"Content-Length: {_content_length(body)}\r\n\r\n{body}")
-    await send(msg)
+
+    def _info(branch, seq, auth=None, auth_header="Proxy-Authorization"):
+        m = (f"INFO {info_target} SIP/2.0\r\n"
+             f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
+             f"{_route_lines()}"
+             f"Max-Forwards: 70\r\n"
+             f"To: <{to_uri}>;tag={call_state['to_tag']}\r\n"
+             f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={call_state['from_tag']}\r\n"
+             f"Call-ID: {cid}\r\n"
+             f"CSeq: {seq} INFO\r\n")
+        if auth:
+            m += f"{auth_header}: {auth}\r\n"
+        m += (f"Content-Type: application/media_control+xml\r\n"
+              f"Content-Length: {_content_length(body)}\r\n\r\n{body}")
+        return m
+
+    branch, seq = _gen(), _next_cseq()
+    key = _open_transaction(branch, seq, "INFO", cid)
+    await send(_info(branch, seq))
+    for raw in await _wait_final(key, cid, seq, "INFO", timeout=3):
+        msg = parse_message(raw)
+        if msg.code in (401, 407):
+            ch, auth_header = _challenge_of(msg)
+            if not ch:
+                return
+            branch2, seq2 = _gen(), _next_cseq()
+            key2 = _open_transaction(branch2, seq2, "INFO", cid)
+            await send(_info(branch2, seq2,
+                             auth=_make_auth("INFO", info_target, ch),
+                             auth_header=auth_header))
+            await _wait_final(key2, cid, seq2, "INFO", timeout=3)
     _LOGGER.debug("Sent INFO picture_fast_update (keyframe request)")
 
 
@@ -1156,7 +1232,7 @@ async def _end_call_locally() -> None:
     _set_hangup_requested(False)
     call_state.update(call_id=None, from_tag=None, to_tag=None,
                       remote_contact=None, remote_sdp=None,
-                      original_target=None)
+                      original_target=None, route_set=())
     try:
         await media.stop_media()
     except Exception:  # noqa: BLE001 - teardown must still reach the broadcast
@@ -1244,7 +1320,7 @@ async def do_hangup():
     seq = _next_cseq()
     bye = (f"BYE {target_uri} SIP/2.0\r\n"
            f"Via: SIP/2.0/TLS {MY_IP}:{C.SIP_LOCAL_PORT};branch={branch};rport\r\n"
-           f"Route: <sip:{CFG.route};transport=tls;lr>\r\n"
+           f"{_route_lines()}"
            f"Max-Forwards: 70\r\n"
            f"To: {to_hdr}\r\n"
            f"From: <sip:{CFG.sip_user}@{CFG.sip_domain}>;tag={ftag}\r\n"
@@ -1269,6 +1345,7 @@ pending_incoming = {
     "active": False, "cid": None, "from_hdr": None, "to_hdr": None,
     "cseq": None, "via_block": None, "my_tag": None,
     "caller_uri": None, "caller_tag": None, "body": None, "call_ids": (),
+    "record_route": (), "contact": None,
 }
 
 
@@ -1302,6 +1379,8 @@ async def handle_incoming_invite(raw):
         cseq=cseq, via_block=via_block, my_tag=my_tag,
         caller_uri=caller_uri, caller_tag=caller_tag, body=msg.body,
         call_ids=call_ids,
+        record_route=tuple(record_route_entries(raw)),
+        contact=_contact_uri(msg.headers.get("contact", "")) or None,
     )
 
     await send(
@@ -1325,7 +1404,10 @@ async def do_answer_incoming():
         f"SIP/2.0 200 OK\r\n"
         f"{p['via_block']}To: {p['to_hdr']};tag={p['my_tag']}\r\nFrom: {p['from_hdr']}\r\n"
         f"Call-ID: {p['cid']}\r\nCSeq: {p['cseq']}\r\n"
-        f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>\r\n"
+        # A 2xx copies the request's Record-Route (RFC 3261 §12.1.1), so
+        # the hops that relayed the call stay in the dialog.
+        + "".join(f"Record-Route: {entry}\r\n" for entry in p["record_route"])
+        + f"Contact: <sip:{CFG.sip_user}@{MY_IP}:{C.SIP_LOCAL_PORT};transport=tls>\r\n"
         f"Content-Type: application/sdp\r\n"
         f"Content-Length: {_content_length(sdp)}\r\n\r\n{sdp}")
 
@@ -1333,7 +1415,13 @@ async def do_answer_incoming():
     call_state["call_id"] = p["cid"]
     call_state["from_tag"] = p["my_tag"]
     call_state["to_tag"] = p["caller_tag"]
-    call_state["remote_contact"] = p["caller_uri"]
+    # Requests inside the call go to the caller's Contact along the
+    # Record-Route of its INVITE, in order (RFC 3261 §12.1.1). The From
+    # URI was used before, with the static route, and a BYE sent that
+    # way was never answered.
+    call_state["remote_contact"] = p["contact"] or p["caller_uri"]
+    call_state["route_set"] = tuple(p["record_route"])
+    call_state["original_target"] = p["caller_uri"]
 
     if p["body"]:
         remote = parse_sdp(p["body"])
@@ -1342,9 +1430,8 @@ async def do_answer_incoming():
         await media.setup_media(remote)
 
     pending_incoming["active"] = False
+    # The hub starts its keyframe requests on call_started.
     await broadcast("call_started", "Call established")
-    # Request keyframe for video
-    await send_keyframe_request()
     return True, "Answered"
 
 
