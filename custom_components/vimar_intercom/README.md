@@ -77,6 +77,13 @@ not. Where no phonebook can be had — plant types that do not publish
 one, or the cloud unreachable at first setup — the panel list and door
 command in the options are used, as before.
 
+If the indoor unit is on the same network, Home Assistant discovers it
+(it announces itself over mDNS as `_eipvdes._tcp`) and offers to set it
+up; confirming leads to the same QR step, since the announcement carries
+no credentials. The QR code must be the discovered unit's own — one from
+another unit is refused. For a unit already set up, a discovery only
+refreshes its local address, which takes effect at the next restart.
+
 **Create a dedicated user for Home Assistant.** Each user has its own SIP
 identity; sharing one with a phone or another system risks the two
 knocking each other offline (see above).

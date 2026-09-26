@@ -27,10 +27,11 @@ can break the day Vimar changes something on their end.
 | `system_messages.py` | The indoor unit's system messages: GET_INIT_STATUS_REPLY and NEW_PHONEBOOK parsing, and a classifier for every line kind the SDK knows — no I/O, no Home Assistant |
 | `plant_config.py` | Phonebook SQLite bytes → frozen `PlantConfig` (panels, our apartment group, actuators, SYSTEM parameters), selected as the SDK's queries select them; its JSON-safe stored form — no Home Assistant |
 | `phonebook.py` | The phonebook download: URL, RFC 7616 digest auth, a bounded fetch over a duck-typed aiohttp session — no Home Assistant |
+| `discovery.py` | The indoor unit's mDNS announcement (`_eipvdes._tcp`, TXT `mac`/`proxy`/`domain`): parsing, MAC normalisation, matching it to an existing entry and to the QR read afterwards — no Home Assistant |
 | `entity_plan.py` | Which plant-dependent entities exist and under which unique IDs, and which registry entries are stale — no Home Assistant |
 | `srtp.py` | SRTP (RFC 3711) encrypt/decrypt for the audio and video RTP streams |
 | `media_handler.py` | RTP/SRTP transport for audio and video, H.264 depacketisation, the video registry, the AV ffmpeg process |
-| `config_flow.py` | Config, reconfigure and options flows — QR image upload or paste in, panel list and door command out |
+| `config_flow.py` | Config (manual or from zeroconf discovery), reconfigure and options flows — QR image upload or paste in, panel list and door command out |
 | `camera.py` | Camera entity — the live stream and the keyframe-derived still |
 | `event.py` | Doorbell event entity, also the source of the `vimar_intercom_ring` bus event |
 | `lock.py` | Door locks: the generic one (the relay group from the QR) or the phonebook's door actuators |

@@ -16,11 +16,13 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
 from .const import (
     CONF_DEVICE_ID,
     CONF_DEVICE_UUID,
     CONF_DOOR_COMMAND,
+    CONF_LOCAL_PROXY,
     CONF_MAC,
     CONF_PANELS,
     CONF_PREFER_LOCAL,
@@ -34,6 +36,12 @@ from .const import (
     DEFAULT_RTP_PORT_BASE,
     DEFAULT_SIP_PORT,
     DOMAIN,
+)
+from .discovery import (
+    DiscoveredUnit,
+    configured_unique_id,
+    parse_discovery,
+    qr_matches_discovery,
 )
 from .qr import (
     MAX_IMAGE_BYTES,
@@ -136,6 +144,64 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialise the flow state."""
         self._entry_data: dict[str, Any] | None = None
+        # Set when the flow started from a zeroconf announcement.
+        self._discovered: DiscoveredUnit | None = None
+
+    async def async_step_zeroconf(
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
+        """An indoor unit announced itself on the local network.
+
+        The announcement names the unit (its MAC) and where it is; it
+        carries no credentials, so the flow goes on to the QR step once
+        the user confirms. See `discovery.py` for the TXT keys.
+
+        For a unit that is already set up, the address it announces
+        replaces the stored local proxy — the app does the same with
+        it — but without a reload. mDNS is unauthenticated, and a host
+        on the LAN that kept re-announcing the unit with changing
+        addresses must not be able to make the integration reload, and
+        drop its registration, over and over. The address is only used
+        with "Prefer the panel on the local network", where the TLS
+        certificate is still verified against the cloud proxy's name,
+        so a forged address can make that connection fail but not
+        intercept it. The new value takes effect at the next reload.
+        """
+        try:
+            unit = parse_discovery(
+                discovery_info.properties, str(discovery_info.ip_address),
+                discovery_info.name)
+        except ValueError as err:
+            _LOGGER.debug("Ignoring a Vimar announcement: %s", err)
+            return self.async_abort(reason="invalid_discovery_info")
+
+        existing = configured_unique_id(
+            unit.mac,
+            (entry.unique_id for entry in self._async_current_entries()))
+        await self.async_set_unique_id(existing or unit.mac)
+        self._abort_if_unique_id_configured(
+            updates={CONF_LOCAL_PROXY: unit.host}, reload_on_update=False)
+
+        self._discovered = unit
+        self.context["title_placeholders"] = {
+            "name": unit.name, "host": unit.host}
+        return await self.async_step_zeroconf_confirm()
+
+    async def async_step_zeroconf_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask before setting up a discovered unit, then ask for its QR."""
+        assert self._discovered is not None
+        if user_input is not None:
+            return await self.async_step_user()
+        return self.async_show_form(
+            step_id="zeroconf_confirm",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "name": self._discovered.name,
+                "host": self._discovered.host,
+            },
+        )
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -147,6 +213,14 @@ class VimarIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
             data, error = await _async_entry_data_from_form(self.hass, user_input)
             if data is None:
                 errors["base"] = error or "invalid_qr"
+            elif (self._discovered is not None
+                  and not qr_matches_discovery(
+                      self._discovered.mac, data[CONF_MAC])):
+                # The unit that was discovered is not the one this QR
+                # belongs to. Setting it up anyway would give an entry
+                # whose name and address say one unit and whose
+                # credentials are another's.
+                return self.async_abort(reason="discovery_mismatch")
             else:
                 await self.async_set_unique_id(
                     data[CONF_MAC] or data[CONF_SIP_USER])

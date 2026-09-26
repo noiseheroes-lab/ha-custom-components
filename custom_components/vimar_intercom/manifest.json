@@ -19,5 +19,8 @@
     "pyzbar>=0.1.9"
   ],
   "single_config_entry": true,
-  "version": "2.0.0"
+  "version": "2.0.0",
+  "zeroconf": [
+    "_eipvdes._tcp.local."
+  ]
 }

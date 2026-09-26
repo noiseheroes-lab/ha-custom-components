@@ -176,6 +176,20 @@ def valid_sip_token(value: str) -> bool:
     return bool(_SIP_TOKEN_RE.match(value or ""))
 
 
+def valid_host(value: str) -> bool:
+    """True if `value` is a hostname or an IP address, by the QR's rules."""
+    try:
+        _checked_host(value, "host")
+    except ValueError:
+        return False
+    return True
+
+
+def valid_mac(value: str) -> bool:
+    """True if `value` is a MAC address as the Vimar app writes it."""
+    return bool(value) and bool(_MAC_RE.match(value))
+
+
 def _checked_token(value: str, field: str) -> str:
     """Return `value` if it is safe in a SIP URI's user part."""
     if not _SIP_TOKEN_RE.match(value):

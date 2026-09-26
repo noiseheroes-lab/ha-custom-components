@@ -1,5 +1,6 @@
 {
   "config": {
+    "flow_title": "{name} ({host})",
     "step": {
       "user": {
         "title": "Vimar Intercom",
@@ -20,6 +21,10 @@
           "qr_image": "QR code image",
           "qr_payload": "Or paste the QR code text"
         }
+      },
+      "zeroconf_confirm": {
+        "title": "Vimar indoor unit found",
+        "description": "Home Assistant found the Vimar indoor unit **{name}** at {host} on your network. Select Submit to set it up: the next step asks for the QR code the unit shows under Settings → Network and devices → Mobile device pairing, which holds the credentials the network announcement does not."
       }
     },
     "error": {
@@ -36,7 +41,9 @@
       "already_configured": "This intercom is already set up.",
       "single_instance_allowed": "Only one Vimar intercom can be set up.",
       "wrong_panel": "That QR code belongs to a different panel. Remove the existing entry first.",
-      "reconfigure_successful": "The credentials were updated."
+      "reconfigure_successful": "The credentials were updated.",
+      "invalid_discovery_info": "The Vimar indoor unit on your network announced itself without a valid MAC address, so it cannot be set up from the announcement. Add the integration manually with its QR code.",
+      "discovery_mismatch": "That QR code belongs to a different indoor unit than the one that was discovered. Use the QR code shown by the discovered unit, or add the integration manually."
     }
   },
   "options": {

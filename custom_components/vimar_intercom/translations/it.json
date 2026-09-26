@@ -1,5 +1,6 @@
 {
   "config": {
+    "flow_title": "{name} ({host})",
     "step": {
       "user": {
         "title": "Videocitofono Vimar",
@@ -20,6 +21,10 @@
           "qr_image": "Immagine del codice QR",
           "qr_payload": "Oppure incolla il testo del codice QR"
         }
+      },
+      "zeroconf_confirm": {
+        "title": "Posto interno Vimar trovato",
+        "description": "Home Assistant ha trovato il posto interno Vimar **{name}** all'indirizzo {host} sulla tua rete. Seleziona Invia per configurarlo: il passo successivo chiede il codice QR che il posto interno mostra in Impostazioni → Rete e dispositivi → Associazione dispositivo mobile, che contiene le credenziali che l'annuncio di rete non trasmette."
       }
     },
     "error": {
@@ -36,7 +41,9 @@
       "already_configured": "Questo videocitofono è già configurato.",
       "single_instance_allowed": "È possibile configurare un solo videocitofono Vimar.",
       "wrong_panel": "Questo codice QR appartiene a un altro posto esterno. Rimuovi prima la voce esistente.",
-      "reconfigure_successful": "Credenziali aggiornate."
+      "reconfigure_successful": "Credenziali aggiornate.",
+      "invalid_discovery_info": "Il posto interno Vimar sulla tua rete si è annunciato senza un indirizzo MAC valido, quindi non può essere configurato dall'annuncio. Aggiungi l'integrazione manualmente con il suo codice QR.",
+      "discovery_mismatch": "Quel codice QR appartiene a un posto interno diverso da quello rilevato. Usa il codice QR mostrato dal posto interno rilevato, oppure aggiungi l'integrazione manualmente."
     }
   },
   "options": {
